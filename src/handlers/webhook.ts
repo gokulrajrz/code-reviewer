@@ -2,7 +2,8 @@ import type { Env } from '../types/env';
 import type { PullRequestWebhookPayload } from '../types/github';
 import { REVIEWABLE_ACTIONS } from '../config/constants';
 import { verifyWebhookSignature } from '../lib/security';
-import { setCommitStatus } from '../lib/github';
+import { getInstallationToken } from '../lib/github-auth';
+import { createCheckRun } from '../lib/github';
 
 /**
  * Core webhook handler — called for every POST / request.
@@ -11,8 +12,10 @@ import { setCommitStatus } from '../lib/github';
  * 1. Read body once (needed for both signature check and parsing)
  * 2. Verify HMAC-SHA256 signature
  * 3. Check X-GitHub-Event header and payload action
- * 4. Instead of processing here, we immediately push to Cloudflare Queues
- * 5. Return 202 immediately so GitHub doesn't time out
+ * 4. Get a GitHub App installation token
+ * 5. Create a Check Run (skipped for ignored branches, in_progress for allowed)
+ * 6. Push to Cloudflare Queues for background LLM processing
+ * 7. Return 202 immediately so GitHub doesn't time out
  */
 export async function handlePRWebhook(
     request: Request,
@@ -60,21 +63,23 @@ export async function handlePRWebhook(
     }
 
     const { pull_request: pr, repository } = payload;
+    const headSha = pr.head.sha;
 
-    // 5. Filter by allowed target branches (if configured)
+    // 5. Get GitHub App installation token
+    const token = await getInstallationToken(env);
+
+    // 6. Filter by allowed target branches (if configured)
     if (env.ALLOWED_TARGET_BRANCHES) {
         const allowedBranches = env.ALLOWED_TARGET_BRANCHES.split(',').map(b => b.trim());
         if (!allowedBranches.includes(pr.base.ref)) {
             console.log(`[code-reviewer] Ignored PR #${pr.number} — target branch "${pr.base.ref}" is not in ALLOWED_TARGET_BRANCHES`);
 
-            // Emit a "success" status immediately so we don't block the merge
-            await setCommitStatus(
-                repository.full_name,
-                pr.head.sha,
-                'success',
-                'AI Code Review: Skipped (branch ignored)',
-                env.GITHUB_TOKEN
-            );
+            // Create a completed Check Run with "skipped" conclusion (grey badge!)
+            await createCheckRun(repository.full_name, headSha, token, {
+                status: 'completed',
+                conclusion: 'skipped',
+                summary: `Review skipped — target branch \`${pr.base.ref}\` is not in the allowed list (\`${env.ALLOWED_TARGET_BRANCHES}\`).`,
+            });
 
             return new Response(
                 JSON.stringify({ message: `Ignored: PR target branch "${pr.base.ref}" not allowed` }),
@@ -87,33 +92,30 @@ export async function handlePRWebhook(
         `[code-reviewer] Webhook received for PR #${pr.number}: "${pr.title}" (${repository.full_name}) — sending to queue...`
     );
 
-    const headSha = pr.head.sha;
+    // 7. Create a Check Run with status "in_progress" (blocks merge)
+    const checkRunId = await createCheckRun(repository.full_name, headSha, token, {
+        status: 'in_progress',
+        summary: 'AI Code Review is in progress. The LLM is analyzing your changes...',
+    });
 
-    // 6. Set Commit Status to "pending" immediately so GitHub blocks the merge
-    await setCommitStatus(
-        repository.full_name,
-        headSha,
-        'pending',
-        'AI Code Review in progress...',
-        env.GITHUB_TOKEN
-    );
-
-    // 7. Send ReviewMessage to the Queue
+    // 8. Send ReviewMessage to the Queue (include checkRunId for the consumer to update)
     await env.REVIEW_QUEUE.send({
         prNumber: pr.number,
         title: pr.title,
         diffUrl: pr.diff_url,
         repoFullName: repository.full_name,
-        headSha: headSha
+        headSha,
+        checkRunId,
     });
 
-    // 8. Respond immediately with 202 Accepted. The LLM handles the rest asynchronously.
+    // 9. Respond immediately with 202 Accepted
     return new Response(
         JSON.stringify({
             message: 'Review queued in the background worker',
             pr: pr.number,
             repo: repository.full_name,
-            sha: headSha
+            sha: headSha,
+            checkRunId,
         }),
         { status: 202, headers: { 'Content-Type': 'application/json' } }
     );

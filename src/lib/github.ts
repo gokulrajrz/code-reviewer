@@ -12,6 +12,10 @@ function githubHeaders(token: string): HeadersInit {
     };
 }
 
+// ---------------------------------------------------------------------------
+// PR Data Fetching
+// ---------------------------------------------------------------------------
+
 /**
  * Fetches the raw unified diff for a Pull Request.
  */
@@ -120,6 +124,10 @@ export async function buildReviewContext(
     return parts.join('\n\n---\n\n');
 }
 
+// ---------------------------------------------------------------------------
+// PR Comments
+// ---------------------------------------------------------------------------
+
 /**
  * Posts a review comment on a GitHub Pull Request.
  */
@@ -145,35 +153,133 @@ export async function postPRComment(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Check Runs API (requires GitHub App authentication)
+// ---------------------------------------------------------------------------
+
+type CheckRunConclusion =
+    | 'action_required'
+    | 'cancelled'
+    | 'failure'
+    | 'neutral'
+    | 'success'
+    | 'skipped'
+    | 'timed_out';
+
+interface CheckRunResponse {
+    id: number;
+    status: string;
+    conclusion: string | null;
+}
+
 /**
- * Sets a commit status on a GitHub Pull Request to block or allow merging.
+ * Creates a new Check Run on a commit.
+ * Returns the check run ID for later updates.
  */
-export async function setCommitStatus(
+export async function createCheckRun(
     repoFullName: string,
-    sha: string,
-    state: 'error' | 'failure' | 'pending' | 'success',
-    description: string,
+    headSha: string,
     token: string,
-    targetUrl?: string
-): Promise<void> {
-    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/statuses/${sha}`;
+    options: {
+        status: 'queued' | 'in_progress' | 'completed';
+        conclusion?: CheckRunConclusion;
+        summary?: string;
+    }
+): Promise<number> {
+    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs`;
+
+    const body: Record<string, unknown> = {
+        name: 'AI Code Reviewer',
+        head_sha: headSha,
+        status: options.status,
+    };
+
+    if (options.conclusion) {
+        body.conclusion = options.conclusion;
+    }
+
+    if (options.summary || options.conclusion) {
+        body.output = {
+            title: options.conclusion === 'skipped'
+                ? 'Review Skipped'
+                : options.conclusion === 'success'
+                    ? 'Review Approved'
+                    : options.conclusion === 'failure'
+                        ? 'Changes Requested'
+                        : 'AI Code Review',
+            summary: options.summary ?? 'AI Code Review in progress...',
+        };
+    }
+
+    // If completed, record the completion timestamp
+    if (options.status === 'completed') {
+        body.completed_at = new Date().toISOString();
+    }
+    body.started_at = new Date().toISOString();
+
     const response = await fetch(url, {
         method: 'POST',
         headers: {
             ...githubHeaders(token),
             'Content-Type': 'application/json',
         },
+        body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to create check run: ${response.status} — ${errorText}`);
+    }
+
+    const data: CheckRunResponse = await response.json();
+    console.log(`[github] Created check run #${data.id} (status=${options.status}, conclusion=${options.conclusion ?? 'n/a'})`);
+    return data.id;
+}
+
+/**
+ * Updates an existing Check Run with the final conclusion and summary.
+ */
+export async function updateCheckRun(
+    repoFullName: string,
+    checkRunId: number,
+    token: string,
+    conclusion: CheckRunConclusion,
+    summary: string,
+): Promise<void> {
+    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs/${checkRunId}`;
+
+    const title = conclusion === 'success'
+        ? 'Review Approved'
+        : conclusion === 'failure'
+            ? 'Changes Requested'
+            : 'AI Code Review';
+
+    // GitHub limits the summary field to 65535 characters
+    const truncatedSummary = summary.length > 65000
+        ? summary.slice(0, 65000) + '\n\n_[Summary truncated due to length]_'
+        : summary;
+
+    const response = await fetch(url, {
+        method: 'PATCH',
+        headers: {
+            ...githubHeaders(token),
+            'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
-            state,
-            description: description.substring(0, 140), // GitHub limits this to 140 chars
-            context: 'AI Code Reviewer',
-            target_url: targetUrl
+            status: 'completed',
+            conclusion,
+            completed_at: new Date().toISOString(),
+            output: {
+                title,
+                summary: truncatedSummary,
+            },
         }),
     });
 
     if (!response.ok) {
         const errorText = await response.text();
-        console.error(`[github] Failed to set commit status: ${response.status} — ${errorText}`);
-        // We log but don't throw to avoid crashing the whole pipeline if status fails
+        console.error(`[github] Failed to update check run: ${response.status} — ${errorText}`);
+    } else {
+        console.log(`[github] Updated check run #${checkRunId} → conclusion=${conclusion}`);
     }
 }

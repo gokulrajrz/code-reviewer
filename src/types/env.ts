@@ -11,9 +11,13 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   /** Google AI API key for Gemini */
   GEMINI_API_KEY: string;
-  /** GitHub Personal Access Token (Fine-grained: Pull Requests: Read & Write) */
-  GITHUB_TOKEN: string;
-  /** GitHub Webhook Secret (configured in repo webhook settings) */
+  /** GitHub App ID (from GitHub Developer Settings → GitHub Apps) */
+  GITHUB_APP_ID: string;
+  /** GitHub App Private Key (PEM format, generated on the App settings page) */
+  GITHUB_APP_PRIVATE_KEY: string;
+  /** GitHub App Installation ID (from the URL after installing the App on a repo) */
+  GITHUB_APP_INSTALLATION_ID: string;
+  /** GitHub Webhook Secret (configured in the GitHub App webhook settings) */
   GITHUB_WEBHOOK_SECRET: string;
 
   // --- Vars (non-secret, safe to set in wrangler.jsonc) ---
@@ -36,4 +40,6 @@ export interface ReviewMessage {
   diffUrl: string;
   repoFullName: string;
   headSha: string;
+  /** The Check Run ID created by the webhook, so the queue consumer can update it */
+  checkRunId: number;
 }

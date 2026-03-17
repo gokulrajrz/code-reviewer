@@ -5,8 +5,9 @@ import {
     fetchChangedFiles,
     buildReviewContext,
     postPRComment,
-    setCommitStatus,
+    updateCheckRun,
 } from '../lib/github';
+import { getInstallationToken } from '../lib/github-auth';
 import { callLLM } from '../lib/llm/index';
 
 /**
@@ -21,25 +22,36 @@ export async function queueHandler(
     ctx: ExecutionContext
 ): Promise<void> {
     for (const message of batch.messages) {
-        const { prNumber, title, diffUrl, repoFullName, headSha } = message.body;
+        const { prNumber, title, diffUrl, repoFullName, headSha, checkRunId } = message.body;
 
         console.log(
             `[queue] Processing PR #${prNumber}: "${title}" (${repoFullName}) at commit ${headSha}`
         );
 
+        // Get a fresh installation token for this queue run
+        let token: string;
+        try {
+            token = await getInstallationToken(env);
+        } catch (error) {
+            const errMsg = error instanceof Error ? error.message : String(error);
+            console.error(`[queue] ❌ Failed to get installation token: ${errMsg}`);
+            message.ack(); // Don't retry if auth fails
+            return;
+        }
+
         try {
             // 1. Fetch PR diff
-            const diff = await fetchPRDiff(diffUrl, env.GITHUB_TOKEN);
+            const diff = await fetchPRDiff(diffUrl, token);
 
             // 2. Fetch list of changed files for richer context
-            const changedFiles = await fetchChangedFiles(repoFullName, prNumber, env.GITHUB_TOKEN);
+            const changedFiles = await fetchChangedFiles(repoFullName, prNumber, token);
 
             console.log(
                 `[queue] Fetched diff (${diff.length} chars) and ${changedFiles.length} changed files`
             );
 
             // 3. Build assembled context (diff + full file contents)
-            const reviewContext = await buildReviewContext(diff, changedFiles, env.GITHUB_TOKEN, MAX_DIFF_CHARS);
+            const reviewContext = await buildReviewContext(diff, changedFiles, token, MAX_DIFF_CHARS);
 
             // 4. Call the configured LLM (this can safely take > 30 seconds now!)
             console.log(`[queue] Calling LLM (${env.AI_PROVIDER ?? 'claude'})...`);
@@ -48,25 +60,24 @@ export async function queueHandler(
             console.log(`[queue] Review generated (${review.length} chars), posting to PR...`);
 
             // 5. Post the review as a PR comment
-            await postPRComment(repoFullName, prNumber, review, env.GITHUB_TOKEN);
+            await postPRComment(repoFullName, prNumber, review, token);
 
-            // 6. Determine status check success/failure using the LLM's required output format
-            // The prompt mandates: "Overall verdict: **Approve** / **Request Changes** / **Needs Discussion**"
+            // 6. Determine Check Run conclusion based on the LLM's verdict
             const hasRequestedChanges = review.includes('**Request Changes**') || review.includes('Request Changes');
-            const state = hasRequestedChanges ? 'failure' : 'success';
-            const description = hasRequestedChanges ? 'AI Code Review: Changes requested' : 'AI Code Review: Approved';
+            const conclusion = hasRequestedChanges ? 'failure' : 'success';
 
-            await setCommitStatus(
+            // 7. Update the Check Run with the final conclusion and review summary
+            await updateCheckRun(
                 repoFullName,
-                headSha,
-                state,
-                description,
-                env.GITHUB_TOKEN
+                checkRunId,
+                token,
+                conclusion,
+                review
             );
 
-            console.log(`[queue] ✅ Review posted to PR #${prNumber} and status set to ${state}`);
+            console.log(`[queue] ✅ Review posted to PR #${prNumber} and check run set to ${conclusion}`);
 
-            // 7. Explicitly acknowledge the message so it isn't retried
+            // 8. Explicitly acknowledge the message so it isn't retried
             message.ack();
 
         } catch (error) {
@@ -78,24 +89,22 @@ export async function queueHandler(
                     repoFullName,
                     prNumber,
                     `> ⚠️ **Code Reviewer Agent Error**\n> The automated background review failed: \`${errMsg}\`\n> You can trigger another review by closing and reopening this PR.`,
-                    env.GITHUB_TOKEN
+                    token
                 );
 
-                // Update commit status to error
-                await setCommitStatus(
+                // Update the Check Run to failure with the error message
+                await updateCheckRun(
                     repoFullName,
-                    headSha,
-                    'error',
-                    'AI Code Review failed due to an error',
-                    env.GITHUB_TOKEN
+                    checkRunId,
+                    token,
+                    'failure',
+                    `## ❌ Review Pipeline Error\n\nThe automated review failed with the following error:\n\n\`\`\`\n${errMsg}\n\`\`\`\n\nYou can trigger another review by closing and reopening this PR.`
                 );
             } catch {
-                console.error('[queue] Could not post error comment or set status on PR');
+                console.error('[queue] Could not post error comment or update check run on PR');
             }
 
-            // We explicitly DO NOT ack() the message here if we want it to retry,
-            // but since we posted an error comment, we should end the cycle so we don't spam the PR
-            // with repeated error comments on implicit retry.
+            // Ack to prevent spamming the PR with repeated error comments
             message.ack();
         }
     }
