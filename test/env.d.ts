@@ -1,3 +1,6 @@
+import type { Env as WorkerEnv } from '../src/types/env';
+
 declare module 'cloudflare:test' {
-	interface ProvidedEnv extends Env {}
+	// Make the test `env` match our full Env interface (secrets + vars)
+	interface ProvidedEnv extends WorkerEnv { }
 }

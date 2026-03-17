@@ -50,6 +50,9 @@ build/Release
 
 # Dependency directories
 
+# Local secrets — never commit
+.dev.vars
+
 node_modules/
 jspm_packages/
 
