@@ -1,14 +1,7 @@
 import type { Env } from '../types/env';
 import type { PullRequestWebhookPayload } from '../types/github';
-import { REVIEWABLE_ACTIONS, MAX_DIFF_CHARS } from '../config/constants';
+import { REVIEWABLE_ACTIONS } from '../config/constants';
 import { verifyWebhookSignature } from '../lib/security';
-import {
-    fetchPRDiff,
-    fetchChangedFiles,
-    buildReviewContext,
-    postPRComment,
-} from '../lib/github';
-import { callLLM } from '../lib/llm/index';
 
 /**
  * Core webhook handler — called for every POST / request.
@@ -17,15 +10,12 @@ import { callLLM } from '../lib/llm/index';
  * 1. Read body once (needed for both signature check and parsing)
  * 2. Verify HMAC-SHA256 signature
  * 3. Check X-GitHub-Event header and payload action
- * 4. Fetch PR diff + changed files
- * 5. Build review context
- * 6. In ctx.waitUntil(): call LLM + post comment asynchronously
- * 7. Return 202 immediately so GitHub doesn't time out
+ * 4. Instead of processing here, we immediately push to Cloudflare Queues
+ * 5. Return 202 immediately so GitHub doesn't time out
  */
 export async function handlePRWebhook(
     request: Request,
-    env: Env,
-    ctx: ExecutionContext
+    env: Env
 ): Promise<Response> {
     // — Read body once —
     const rawBody = await request.text();
@@ -71,71 +61,24 @@ export async function handlePRWebhook(
     const { pull_request: pr, repository } = payload;
 
     console.log(
-        `[code-reviewer] Reviewing PR #${pr.number}: "${pr.title}" (${repository.full_name}) — action: ${payload.action}`
+        `[code-reviewer] Webhook received for PR #${pr.number}: "${pr.title}" (${repository.full_name}) — sending to queue...`
     );
 
-    // 5. Kick off the async review pipeline without blocking the response
-    ctx.waitUntil(runReviewPipeline(pr, repository, env));
+    // 5. Send ReviewMessage to the Queue
+    await env.REVIEW_QUEUE.send({
+        prNumber: pr.number,
+        title: pr.title,
+        diffUrl: pr.diff_url,
+        repoFullName: repository.full_name
+    });
 
-    // 6. Respond immediately with 202 Accepted
+    // 6. Respond immediately with 202 Accepted. The LLM handles the rest asynchronously.
     return new Response(
         JSON.stringify({
-            message: 'Review queued',
+            message: 'Review queued in the background worker',
             pr: pr.number,
             repo: repository.full_name,
-            provider: env.AI_PROVIDER ?? 'claude',
         }),
         { status: 202, headers: { 'Content-Type': 'application/json' } }
     );
-}
-
-// ---------------------------------------------------------------------------
-// Private: The actual review pipeline (runs asynchronously)
-// ---------------------------------------------------------------------------
-
-async function runReviewPipeline(
-    pr: PullRequestWebhookPayload['pull_request'],
-    repository: PullRequestWebhookPayload['repository'],
-    env: Env
-): Promise<void> {
-    try {
-        // Fetch PR diff
-        const diff = await fetchPRDiff(pr.diff_url, env.GITHUB_TOKEN);
-
-        // Fetch list of changed files for richer context
-        const changedFiles = await fetchChangedFiles(repository.full_name, pr.number, env.GITHUB_TOKEN);
-
-        console.log(
-            `[code-reviewer] Fetched diff (${diff.length} chars) and ${changedFiles.length} changed files`
-        );
-
-        // Build assembled context (diff + full file contents)
-        const reviewContext = await buildReviewContext(diff, changedFiles, env.GITHUB_TOKEN, MAX_DIFF_CHARS);
-
-        // Call the configured LLM
-        const review = await callLLM(reviewContext, pr.title, env);
-
-        console.log(`[code-reviewer] Review generated (${review.length} chars), posting to PR...`);
-
-        // Post the review as a PR comment
-        await postPRComment(repository.full_name, pr.number, review, env.GITHUB_TOKEN);
-
-        console.log(`[code-reviewer] ✅ Review posted to PR #${pr.number}`);
-    } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(`[code-reviewer] ❌ Review pipeline failed for PR #${pr.number}: ${message}`);
-
-        // Attempt to post a failure notice back to the PR so developers aren't left guessing
-        try {
-            await postPRComment(
-                repository.full_name,
-                pr.number,
-                `> ⚠️ **Code Reviewer Agent Error**\n> The automated review failed: \`${message}\`\n> Please review manually or check the worker logs.`,
-                env.GITHUB_TOKEN
-            );
-        } catch {
-            // If posting the error also fails, just log it — don't throw again
-            console.error('[code-reviewer] Could not post error comment to PR');
-        }
-    }
 }

@@ -19,4 +19,18 @@ export interface Env {
   // --- Vars (non-secret, safe to set in wrangler.jsonc) ---
   /** Which LLM provider to use. Defaults to "claude". */
   AI_PROVIDER: AIProvider;
+
+  // --- Queues ---
+  /** The Queue responsible for processing reviews in the background */
+  REVIEW_QUEUE: Queue<ReviewMessage>;
+}
+
+/**
+ * The message payload sent from the HTTP webhook handler to the Queue Consumer
+ */
+export interface ReviewMessage {
+  prNumber: number;
+  title: string;
+  diffUrl: string;
+  repoFullName: string;
 }

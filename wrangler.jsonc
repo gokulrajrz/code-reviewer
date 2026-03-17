@@ -24,5 +24,25 @@
 	 */
 	"vars": {
 		"AI_PROVIDER": "claude"
+	},
+	/**
+	 * Queues
+	 * Connects the fast webhook handler to the long-running LLM worker
+	 */
+	"queues": {
+		"producers": [
+			{
+				"binding": "REVIEW_QUEUE",
+				"queue": "code-reviewer-queue"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "code-reviewer-queue",
+				"max_batch_size": 1,
+				"max_concurrency": 2,
+				"max_retries": 1
+			}
+		]
 	}
 }
