@@ -23,7 +23,16 @@ export default {
 
 		// — GitHub Webhook Entry Point —
 		if (method === 'POST' && pathname === '/') {
-			return handlePRWebhook(request, env);
+			try {
+				return await handlePRWebhook(request, env);
+			} catch (error) {
+				const errMsg = error instanceof Error ? error.message : String(error);
+				console.error(`[code-reviewer] ❌ Unhandled webhook error: ${errMsg}`);
+				return new Response(
+					JSON.stringify({ error: 'Internal server error', detail: errMsg }),
+					{ status: 500, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
 		}
 
 		// — Method Not Allowed —
@@ -38,6 +47,11 @@ export default {
 	 * Extracts messages and routes them to the executor function.
 	 */
 	async queue(batch: MessageBatch<ReviewMessage>, env: Env, ctx: ExecutionContext): Promise<void> {
-		await queueHandler(batch, env, ctx);
+		try {
+			await queueHandler(batch, env, ctx);
+		} catch (error) {
+			const errMsg = error instanceof Error ? error.message : String(error);
+			console.error(`[code-reviewer] ❌ Unhandled queue error: ${errMsg}`);
+		}
 	}
 } satisfies ExportedHandler<Env, ReviewMessage>;

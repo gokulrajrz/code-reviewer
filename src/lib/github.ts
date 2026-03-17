@@ -1,5 +1,13 @@
 import type { GitHubPRFile } from '../types/github';
-import { MAX_CONTEXT_FILES, MAX_FILE_SIZE_BYTES } from '../config/constants';
+import {
+    MAX_FILE_SIZE_BYTES,
+    MAX_TOTAL_FILES,
+    TIER1_MAX_FILES,
+    NOISE_EXTENSIONS,
+    NOISE_FILENAMES,
+    NOISE_DIRECTORIES,
+    PRIORITY_EXTENSIONS,
+} from '../config/constants';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 
@@ -13,51 +21,148 @@ function githubHeaders(token: string): HeadersInit {
 }
 
 // ---------------------------------------------------------------------------
-// PR Data Fetching
+// PR Data Fetching (with pagination)
 // ---------------------------------------------------------------------------
 
 /**
- * Fetches the raw unified diff for a Pull Request.
- */
-export async function fetchPRDiff(diffUrl: string, token: string): Promise<string> {
-    const response = await fetch(diffUrl, {
-        headers: {
-            ...githubHeaders(token),
-            Accept: 'application/vnd.github.diff',
-        },
-    });
-
-    if (!response.ok) {
-        throw new Error(`Failed to fetch PR diff: ${response.status} ${response.statusText}`);
-    }
-
-    return response.text();
-}
-
-/**
- * Fetches the list of files changed in a Pull Request.
- * Returns up to MAX_CONTEXT_FILES non-deleted files.
+ * Fetches ALL files changed in a Pull Request, handling GitHub pagination.
+ * GitHub returns max 100 files per page and max 3000 total.
+ * We cap at MAX_TOTAL_FILES to stay practical.
  */
 export async function fetchChangedFiles(
     repoFullName: string,
     prNumber: number,
     token: string
 ): Promise<GitHubPRFile[]> {
-    // GitHub paginates at 30 by default; we request up to 100
-    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100`;
-    const response = await fetch(url, { headers: githubHeaders(token) });
+    const allFiles: GitHubPRFile[] = [];
+    let page = 1;
 
-    if (!response.ok) {
-        throw new Error(`Failed to fetch PR files: ${response.status} ${response.statusText}`);
+    while (allFiles.length < MAX_TOTAL_FILES) {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100&page=${page}`;
+        const response = await fetch(url, { headers: githubHeaders(token) });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch PR files (page ${page}): ${response.status} ${response.statusText}`);
+        }
+
+        const files: GitHubPRFile[] = await response.json();
+
+        if (files.length === 0) break; // No more pages
+
+        allFiles.push(...files);
+        page++;
+
+        // GitHub caps at 3000 files; stop if we got fewer than 100 (last page)
+        if (files.length < 100) break;
     }
 
-    const files: GitHubPRFile[] = await response.json();
-
-    // Filter out deleted files (they have no content to review) and limit count
-    return files
+    // Filter out deleted files (they have no content to review)
+    return allFiles
         .filter((f) => f.status !== 'removed')
-        .slice(0, MAX_CONTEXT_FILES);
+        .slice(0, MAX_TOTAL_FILES);
 }
+
+// ---------------------------------------------------------------------------
+// Smart File Classification
+// ---------------------------------------------------------------------------
+
+/** The result of classifying PR files into review tiers. */
+export interface ClassifiedFiles {
+    /** Top priority files — get full content + diff patch */
+    tier1: GitHubPRFile[];
+    /** Remaining files — get diff patch only (no subrequest) */
+    tier2: GitHubPRFile[];
+    /** Filenames that were auto-skipped (noise) */
+    skipped: string[];
+}
+
+/**
+ * Returns true if the file should be auto-skipped (noise, generated, vendor, etc.)
+ */
+function isNoiseFile(file: GitHubPRFile): boolean {
+    const filename = file.filename;
+    const basename = filename.split('/').pop() ?? '';
+    const ext = basename.includes('.') ? basename.split('.').pop()?.toLowerCase() ?? '' : '';
+
+    // Check exact filename matches
+    if (NOISE_FILENAMES.has(basename)) return true;
+
+    // Check extension matches
+    if (NOISE_EXTENSIONS.has(ext)) return true;
+
+    // Check for compound extensions like .min.js, .chunk.css
+    const lastTwoParts = basename.split('.').slice(-2).join('.');
+    if (NOISE_EXTENSIONS.has(lastTwoParts)) return true;
+
+    // Check directory prefix matches
+    for (const dir of NOISE_DIRECTORIES) {
+        if (filename.startsWith(dir) || filename.includes(`/${dir}`)) return true;
+    }
+
+    // Skip files with no patch AND no meaningful content (binary files)
+    if (!file.patch && file.changes === 0) return true;
+
+    return false;
+}
+
+/**
+ * Calculates a priority score for a file.
+ * Higher score = more important to review deeply.
+ */
+function filePriorityScore(file: GitHubPRFile): number {
+    const ext = file.filename.split('.').pop()?.toLowerCase() ?? '';
+    let score = file.additions + file.deletions; // Raw change volume
+
+    // Bonus for source code files (business logic)
+    if (PRIORITY_EXTENSIONS.has(ext)) {
+        score *= 2;
+    }
+
+    // Bonus for new files (they need careful review)
+    if (file.status === 'added') {
+        score *= 1.5;
+    }
+
+    // Bonus for files in src/ or app/ directories (likely core code)
+    if (file.filename.startsWith('src/') || file.filename.startsWith('app/')) {
+        score *= 1.3;
+    }
+
+    return score;
+}
+
+/**
+ * Classifies PR files into review tiers:
+ * - **Tier 1** (top TIER1_MAX_FILES by priority): Full content + diff patch
+ * - **Tier 2** (remaining reviewable files): Diff patch only
+ * - **Skipped**: Noise files excluded from review entirely
+ */
+export function classifyFiles(files: GitHubPRFile[]): ClassifiedFiles {
+    const skipped: string[] = [];
+    const reviewable: GitHubPRFile[] = [];
+
+    // Step 1: Separate noise from reviewable
+    for (const file of files) {
+        if (isNoiseFile(file)) {
+            skipped.push(file.filename);
+        } else {
+            reviewable.push(file);
+        }
+    }
+
+    // Step 2: Sort reviewable files by priority score (highest first)
+    reviewable.sort((a, b) => filePriorityScore(b) - filePriorityScore(a));
+
+    // Step 3: Split into Tier 1 (full context) and Tier 2 (diff only)
+    const tier1 = reviewable.slice(0, TIER1_MAX_FILES);
+    const tier2 = reviewable.slice(TIER1_MAX_FILES);
+
+    return { tier1, tier2, skipped };
+}
+
+// ---------------------------------------------------------------------------
+// File Content Fetching
+// ---------------------------------------------------------------------------
 
 /**
  * Fetches the raw content of a file from its raw_url.
@@ -88,40 +193,126 @@ export async function fetchFileContent(rawUrl: string, token: string): Promise<s
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tiered Chunk Building
+// ---------------------------------------------------------------------------
+
 /**
- * Builds a rich context string for the LLM by assembling the diff +
- * full content of the most important changed files.
+ * Builds a file block for a Tier 1 file (full content + diff patch).
  */
-export async function buildReviewContext(
-    diff: string,
-    files: GitHubPRFile[],
-    token: string,
-    maxDiffChars: number
-): Promise<string> {
-    const truncatedDiff =
-        diff.length > maxDiffChars
-            ? diff.slice(0, maxDiffChars) + '\n\n[... diff truncated due to size ...]'
-            : diff;
+async function buildTier1Block(file: GitHubPRFile, token: string): Promise<string> {
+    let block = `## 🔍 FILE CHANGED: \`${file.filename}\` (${file.status}) — *Full Review*\n`;
 
-    const parts: string[] = [
-        '## PULL REQUEST DIFF\n```diff\n' + truncatedDiff + '\n```',
-    ];
-
-    // Fetch and append full file contents for richer context
-    const fileContexts = await Promise.all(
-        files.map(async (file) => {
-            const content = await fetchFileContent(file.raw_url, token);
-            if (!content) return null;
-            const ext = file.filename.split('.').pop() ?? '';
-            return `## FULL FILE: \`${file.filename}\` (${file.status})\n\`\`\`${ext}\n${content}\n\`\`\``;
-        })
-    );
-
-    for (const ctx of fileContexts) {
-        if (ctx) parts.push(ctx);
+    if (file.patch) {
+        block += `### DIFF PATCH\n\`\`\`diff\n${file.patch}\n\`\`\`\n`;
+    } else {
+        block += `_(No diff patch available)_\n`;
     }
 
-    return parts.join('\n\n---\n\n');
+    const content = await fetchFileContent(file.raw_url, token);
+    if (content && !content.startsWith('[File too large')) {
+        const ext = file.filename.split('.').pop() ?? '';
+        block += `\n### FULL FILE CONTENT\n\`\`\`${ext}\n${content}\n\`\`\`\n`;
+    } else if (content) {
+        block += `\n${content}\n`;
+    }
+
+    block += `\n---\n\n`;
+    return block;
+}
+
+/**
+ * Builds a file block for a Tier 2 file (diff patch only — no subrequest).
+ */
+function buildTier2Block(file: GitHubPRFile): string {
+    let block = `## 📄 FILE CHANGED: \`${file.filename}\` (${file.status}) — *Diff Only*\n`;
+
+    if (file.patch) {
+        block += `### DIFF PATCH\n\`\`\`diff\n${file.patch}\n\`\`\`\n`;
+    } else {
+        block += `_(No diff patch available — binary or empty change)_\n`;
+    }
+
+    block += `\n---\n\n`;
+    return block;
+}
+
+/**
+ * Builds review chunks using the tiered classification system.
+ *
+ * - Tier 1 files get full content + diff (uses subrequests)
+ * - Tier 2 files get diff-only (zero subrequests)
+ * - A summary header is prepended to the first chunk
+ *
+ * Chunks are split when they exceed `maxChunkChars`.
+ */
+export async function buildReviewChunks(
+    classified: ClassifiedFiles,
+    token: string,
+    maxChunkChars: number
+): Promise<string[]> {
+    const { tier1, tier2, skipped } = classified;
+    const chunks: string[] = [];
+    let currentChunkText = '';
+
+    // ── Summary header ──
+    const totalReviewed = tier1.length + tier2.length;
+    let header = `# PR Review Context\n\n`;
+    header += `| Category | Count |\n|---|---|\n`;
+    header += `| 🔍 **Tier 1** (Full Content) | ${tier1.length} files |\n`;
+    header += `| 📄 **Tier 2** (Diff Only) | ${tier2.length} files |\n`;
+    header += `| ⏭️ **Skipped** (Noise) | ${skipped.length} files |\n`;
+    header += `| **Total Reviewed** | ${totalReviewed} files |\n\n`;
+
+    if (skipped.length > 0) {
+        const skippedPreview = skipped.slice(0, 10).join(', ');
+        header += `> _Skipped files:_ ${skippedPreview}${skipped.length > 10 ? ` ... and ${skipped.length - 10} more` : ''}\n\n`;
+    }
+
+    header += `---\n\n`;
+    currentChunkText = header;
+
+    // ── Process Tier 1 files (full content, uses subrequests) ──
+    for (const file of tier1) {
+        const fileBlock = await buildTier1Block(file, token);
+
+        if (fileBlock.length > maxChunkChars) {
+            if (currentChunkText) {
+                chunks.push(currentChunkText);
+                currentChunkText = '';
+            }
+            chunks.push(fileBlock.slice(0, maxChunkChars) + '\n\n_[... file truncated due to size ...]_');
+        } else if (currentChunkText.length + fileBlock.length > maxChunkChars) {
+            chunks.push(currentChunkText);
+            currentChunkText = fileBlock;
+        } else {
+            currentChunkText += fileBlock;
+        }
+    }
+
+    // ── Process Tier 2 files (diff only, no subrequests) ──
+    for (const file of tier2) {
+        const fileBlock = buildTier2Block(file);
+
+        if (fileBlock.length > maxChunkChars) {
+            if (currentChunkText) {
+                chunks.push(currentChunkText);
+                currentChunkText = '';
+            }
+            chunks.push(fileBlock.slice(0, maxChunkChars) + '\n\n_[... file truncated due to size ...]_');
+        } else if (currentChunkText.length + fileBlock.length > maxChunkChars) {
+            chunks.push(currentChunkText);
+            currentChunkText = fileBlock;
+        } else {
+            currentChunkText += fileBlock;
+        }
+    }
+
+    if (currentChunkText) {
+        chunks.push(currentChunkText);
+    }
+
+    return chunks.length > 0 ? chunks : ['No verifiable file changes found.'];
 }
 
 // ---------------------------------------------------------------------------

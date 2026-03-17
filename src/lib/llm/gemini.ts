@@ -9,8 +9,13 @@ import { SYSTEM_PROMPT } from '../../config/system-prompt';
 export async function reviewWithGemini(
     reviewContext: string,
     prTitle: string,
-    apiKey: string
+    apiKey: string,
+    signal?: AbortSignal
 ): Promise<string> {
+    if (!apiKey || !apiKey.trim()) {
+        throw new Error('[llm:gemini] GEMINI_API_KEY is missing or empty. Set it via `wrangler secret put GEMINI_API_KEY`.');
+    }
+
     const genAI = new GoogleGenerativeAI(apiKey);
 
     const model = genAI.getGenerativeModel({
@@ -30,12 +35,18 @@ Please review the following Pull Request.
 ${reviewContext}
 `.trim();
 
-    const result = await model.generateContent(userMessage);
-    const response = result.response;
+    let result;
+    try {
+        result = await model.generateContent(userMessage, { signal });
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        throw new Error(`[llm:gemini] API call failed: ${errMsg}`);
+    }
 
+    const response = result.response;
     const text = response.text();
     if (!text) {
-        throw new Error('Gemini returned an empty response');
+        throw new Error('[llm:gemini] Gemini returned an empty response — the model may have refused or hit a safety filter.');
     }
 
     return text;

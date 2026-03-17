@@ -7,11 +7,26 @@ export const MODELS = {
     gemini: 'gemini-1.5-pro',
 } as const satisfies Record<AIProvider, string>;
 
-/** Maximum characters of diff/file content to send to the LLM. Guards against huge PRs. */
-export const MAX_DIFF_CHARS = 200_000;
+/** Maximum characters per LLM chunk. Guards against massive PR context windows. */
+export const MAX_CHUNK_CHARS = 100_000;
 
-/** Maximum number of changed files whose full content we fetch for extra context. */
-export const MAX_CONTEXT_FILES = 50;
+/**
+ * Hard limit on how many LLM chunks to process to prevent hitting 
+ * the Cloudflare Worker 50 subrequests limit. (32 chunks = 32 requests = crash)
+ */
+export const MAX_LLM_CHUNKS = 10;
+
+/**
+ * Tier 1: Maximum files that get FULL content fetched (patch + raw file).
+ * Each file costs 1 subrequest, so this is bounded by Cloudflare's limit.
+ */
+export const TIER1_MAX_FILES = 15;
+
+/**
+ * Maximum total files we consider from the PR at all.
+ * GitHub can return up to 3000, but reviewing all of them isn't practical.
+ */
+export const MAX_TOTAL_FILES = 300;
 
 /** Only fetch full content for files below this byte size (200KB). */
 export const MAX_FILE_SIZE_BYTES = 200_000;
@@ -21,3 +36,41 @@ export const REVIEWABLE_ACTIONS = new Set(['opened', 'synchronize', 'reopened'])
 
 /** Worker version — update in sync with package.json on releases. */
 export const WORKER_VERSION = '1.0.0';
+
+// ---------------------------------------------------------------------------
+// Noise File Filtering
+// ---------------------------------------------------------------------------
+
+/** File extensions that should be auto-skipped (no review value). */
+export const NOISE_EXTENSIONS = new Set([
+    'lock', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'woff', 'woff2',
+    'ttf', 'eot', 'otf', 'mp4', 'mp3', 'wav', 'pdf', 'zip', 'tar', 'gz',
+    'map', 'snap', 'min.js', 'min.css', 'chunk.js', 'chunk.css',
+    'DS_Store', 'pyc', 'class', 'o', 'so', 'dll', 'exe',
+]);
+
+/** Exact filenames that should be auto-skipped. */
+export const NOISE_FILENAMES = new Set([
+    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb',
+    'composer.lock', 'Gemfile.lock', 'Cargo.lock', 'poetry.lock',
+    '.gitignore', '.gitattributes', '.editorconfig', '.prettierrc',
+    '.eslintignore', '.npmrc', '.nvmrc', '.node-version',
+    'LICENSE', 'LICENSE.md', 'LICENSE.txt',
+    'CHANGELOG.md', 'CHANGELOG',
+]);
+
+/** Directory prefixes that indicate auto-generated or vendor code. */
+export const NOISE_DIRECTORIES = [
+    'node_modules/', 'vendor/', 'dist/', 'build/', '.next/',
+    'coverage/', '__snapshots__/', '.turbo/', '.cache/',
+    'public/assets/', 'static/assets/',
+];
+
+/**
+ * File extensions that get priority scoring bonus (business logic files).
+ * These are the files most likely to contain reviewable code.
+ */
+export const PRIORITY_EXTENSIONS = new Set([
+    'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'rs', 'java', 'kt',
+    'rb', 'php', 'cs', 'swift', 'dart', 'vue', 'svelte',
+]);

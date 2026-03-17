@@ -24,31 +24,42 @@ export async function verifyWebhookSignature(
         return false;
     }
 
+    if (!secret || !secret.trim()) {
+        console.error('[security] GITHUB_WEBHOOK_SECRET is missing or empty — cannot verify signature');
+        return false;
+    }
+
     const expectedHex = signature.slice('sha256='.length);
 
-    // Import the secret as a CryptoKey
-    const key = await crypto.subtle.importKey(
-        'raw',
-        new TextEncoder().encode(secret),
-        { name: 'HMAC', hash: 'SHA-256' },
-        false,
-        ['sign']
-    );
+    try {
+        // Import the secret as a CryptoKey
+        const key = await crypto.subtle.importKey(
+            'raw',
+            new TextEncoder().encode(secret),
+            { name: 'HMAC', hash: 'SHA-256' },
+            false,
+            ['sign']
+        );
 
-    // Sign the raw body
-    const signatureBuffer = await crypto.subtle.sign(
-        'HMAC',
-        key,
-        new TextEncoder().encode(rawBody)
-    );
+        // Sign the raw body
+        const signatureBuffer = await crypto.subtle.sign(
+            'HMAC',
+            key,
+            new TextEncoder().encode(rawBody)
+        );
 
-    // Convert to hex string
-    const computedHex = Array.from(new Uint8Array(signatureBuffer))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
+        // Convert to hex string
+        const computedHex = Array.from(new Uint8Array(signatureBuffer))
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('');
 
-    // Constant-time comparison to prevent timing attacks
-    return timingSafeEqual(computedHex, expectedHex);
+        // Constant-time comparison to prevent timing attacks
+        return timingSafeEqual(computedHex, expectedHex);
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        console.error(`[security] Signature verification failed unexpectedly: ${errMsg}`);
+        return false;
+    }
 }
 
 /**

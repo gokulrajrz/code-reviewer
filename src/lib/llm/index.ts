@@ -12,16 +12,17 @@ import { reviewWithGemini } from './gemini';
 export async function callLLM(
     reviewContext: string,
     prTitle: string,
-    env: Env
+    env: Env,
+    signal?: AbortSignal
 ): Promise<string> {
     const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
     switch (provider) {
         case 'gemini':
-            return reviewWithGemini(reviewContext, prTitle, env.GEMINI_API_KEY);
+            return reviewWithGemini(reviewContext, prTitle, env.GEMINI_API_KEY, signal);
 
         case 'claude':
         default:
-            return reviewWithClaude(reviewContext, prTitle, env.ANTHROPIC_API_KEY);
+            return reviewWithClaude(reviewContext, prTitle, env.ANTHROPIC_API_KEY, signal);
     }
 }

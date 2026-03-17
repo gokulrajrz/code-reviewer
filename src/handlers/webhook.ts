@@ -48,6 +48,7 @@ export async function handlePRWebhook(
     try {
         payload = JSON.parse(rawBody) as PullRequestWebhookPayload;
     } catch {
+        console.error('[code-reviewer] Failed to parse webhook JSON payload');
         return new Response(JSON.stringify({ error: 'Invalid JSON payload' }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' },
@@ -66,7 +67,17 @@ export async function handlePRWebhook(
     const headSha = pr.head.sha;
 
     // 5. Get GitHub App installation token
-    const token = await getInstallationToken(env);
+    let token: string;
+    try {
+        token = await getInstallationToken(env);
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        console.error(`[code-reviewer] ❌ GitHub App auth failed: ${errMsg}`);
+        return new Response(
+            JSON.stringify({ error: 'GitHub App authentication failed', detail: errMsg }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+    }
 
     // 6. Filter by allowed target branches (if configured)
     if (env.ALLOWED_TARGET_BRANCHES) {
@@ -75,11 +86,17 @@ export async function handlePRWebhook(
             console.log(`[code-reviewer] Ignored PR #${pr.number} — target branch "${pr.base.ref}" is not in ALLOWED_TARGET_BRANCHES`);
 
             // Create a completed Check Run with "skipped" conclusion (grey badge!)
-            await createCheckRun(repository.full_name, headSha, token, {
-                status: 'completed',
-                conclusion: 'skipped',
-                summary: `Review skipped — target branch \`${pr.base.ref}\` is not in the allowed list (\`${env.ALLOWED_TARGET_BRANCHES}\`).`,
-            });
+            try {
+                await createCheckRun(repository.full_name, headSha, token, {
+                    status: 'completed',
+                    conclusion: 'skipped',
+                    summary: `Review skipped — target branch \`${pr.base.ref}\` is not in the allowed list (\`${env.ALLOWED_TARGET_BRANCHES}\`).`,
+                });
+            } catch (error) {
+                const errMsg = error instanceof Error ? error.message : String(error);
+                console.error(`[code-reviewer] ⚠️ Failed to create skipped Check Run: ${errMsg}`);
+                // Non-fatal: we still return the ignore response
+            }
 
             return new Response(
                 JSON.stringify({ message: `Ignored: PR target branch "${pr.base.ref}" not allowed` }),
@@ -93,20 +110,36 @@ export async function handlePRWebhook(
     );
 
     // 7. Create a Check Run with status "in_progress" (blocks merge)
-    const checkRunId = await createCheckRun(repository.full_name, headSha, token, {
-        status: 'in_progress',
-        summary: 'AI Code Review is in progress. The LLM is analyzing your changes...',
-    });
+    let checkRunId: number | null = null;
+    try {
+        checkRunId = await createCheckRun(repository.full_name, headSha, token, {
+            status: 'in_progress',
+            summary: 'AI Code Review is in progress. The LLM is analyzing your changes...',
+        });
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        console.error(`[code-reviewer] ⚠️ Failed to create in_progress Check Run: ${errMsg}`);
+        // Non-fatal: the queue consumer will still process the review
+    }
 
     // 8. Send ReviewMessage to the Queue (include checkRunId for the consumer to update)
-    await env.REVIEW_QUEUE.send({
-        prNumber: pr.number,
-        title: pr.title,
-        diffUrl: pr.diff_url,
-        repoFullName: repository.full_name,
-        headSha,
-        checkRunId,
-    });
+    try {
+        await env.REVIEW_QUEUE.send({
+            prNumber: pr.number,
+            title: pr.title,
+            diffUrl: pr.diff_url,
+            repoFullName: repository.full_name,
+            headSha,
+            checkRunId: checkRunId ?? 0,
+        });
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        console.error(`[code-reviewer] ❌ Failed to enqueue review: ${errMsg}`);
+        return new Response(
+            JSON.stringify({ error: 'Failed to enqueue review job', detail: errMsg }),
+            { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+    }
 
     // 9. Respond immediately with 202 Accepted
     return new Response(
