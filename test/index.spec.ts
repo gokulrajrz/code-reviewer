@@ -2,9 +2,8 @@ import {
 	env,
 	createExecutionContext,
 	waitOnExecutionContext,
-	SELF,
 } from 'cloudflare:test';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import worker from '../src/index';
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
@@ -82,7 +81,7 @@ describe('Code Reviewer Worker', () => {
 	it('GET / returns health status', async () => {
 		const request = new IncomingRequest('http://localhost/');
 		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
+		const response = await worker.fetch(request, env);
 		await waitOnExecutionContext(ctx);
 
 		expect(response.status).toBe(200);
@@ -95,7 +94,7 @@ describe('Code Reviewer Worker', () => {
 	it('PUT / returns 405', async () => {
 		const request = new IncomingRequest('http://localhost/', { method: 'PUT' });
 		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
+		const response = await worker.fetch(request, env);
 		await waitOnExecutionContext(ctx);
 
 		expect(response.status).toBe(405);
@@ -113,7 +112,7 @@ describe('Code Reviewer Worker', () => {
 			body: JSON.stringify(mockPRPayload),
 		});
 		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
+		const response = await worker.fetch(request, env);
 		await waitOnExecutionContext(ctx);
 
 		expect(response.status).toBe(401);
@@ -130,7 +129,7 @@ describe('Code Reviewer Worker', () => {
 			body: JSON.stringify(mockPRPayload),
 		});
 		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
+		const response = await worker.fetch(request, env);
 		await waitOnExecutionContext(ctx);
 
 		expect(response.status).toBe(401);
@@ -144,7 +143,7 @@ describe('Code Reviewer Worker', () => {
 			'push' // push event, not pull_request
 		);
 		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
+		const response = await worker.fetch(request, env);
 		await waitOnExecutionContext(ctx);
 
 		expect(response.status).toBe(200);
@@ -160,12 +159,15 @@ describe('Code Reviewer Worker', () => {
 			env.GITHUB_WEBHOOK_SECRET,
 			'pull_request'
 		);
-		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
-		await waitOnExecutionContext(ctx);
+		const response = await worker.fetch(request, env);
 
 		expect(response.status).toBe(200);
 		const body = await response.json<{ message: string }>();
 		expect(body.message).toContain('closed');
+	});
+
+	// — Queue Handler Accessibility —
+	it('exports a queue() handler', () => {
+		expect(typeof worker.queue).toBe('function');
 	});
 });

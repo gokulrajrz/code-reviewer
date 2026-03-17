@@ -1,6 +1,7 @@
 {
 	"name": "code-reviewer",
-	"version": "0.0.0",
+	"version": "1.0.0",
+	"description": "AI-powered GitHub PR reviewer using Cloudflare Workers + Queues with Claude/Gemini LLMs",
 	"private": true,
 	"scripts": {
 		"deploy": "wrangler deploy",

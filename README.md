@@ -4,13 +4,13 @@ An AI-powered Cloudflare Worker that automatically reviews GitHub Pull Requests 
 
 ---
 
-## How It Works
+## 🏗️ High-Performance Architecture (Queues)
 
-1. A developer opens or updates a PR on GitHub.
-2. GitHub sends a webhook event to the Cloudflare Worker URL.
-3. The Worker verifies the HMAC-SHA256 signature, fetches the PR diff + full file contents, and sends them to the LLM.
-4. The LLM returns a structured markdown review (FSD compliance, severity-tagged findings, code suggestions).
-5. The Worker posts the review as a PR comment — all within seconds.
+This agent uses a decoupled **Producer/Consumer** architecture using **Cloudflare Queues** to bypass the standard 30-second webhook execution limit on the Workers Free Tier:
+
+1. **Webhook Handler (Producer)**: Receives the GitHub webhook, verifies the HMAC signature, and instantly pushes the PR details into a queue.
+2. **Background Worker (Consumer)**: A background process that triggers when a message is added to the queue. It performs the heavy lifting: fetching diffs, assembling full-file context (~1M tokens), calling the LLM, and posting the comment.
+3. **Execution Limits**: On the Cloudflare Free Tier, this background consumer enjoys a **15-minute** execution window, allowing for deep, opinionated reviews of even the largest PRs without timing out.
 
 ---
 
@@ -22,7 +22,14 @@ An AI-powered Cloudflare Worker that automatically reviews GitHub Pull Requests 
 npm install
 ```
 
-### 2. Configure Secrets
+### 2. Configure Infrastructure (Queues)
+
+Create the queue in your Cloudflare account:
+```bash
+npx wrangler queues create code-reviewer-queue
+```
+
+### 3. Configure Secrets
 
 Set these via Wrangler — they are **never** committed to source control:
 
@@ -38,7 +45,7 @@ Create a [Fine-Grained Personal Access Token](https://github.com/settings/tokens
 - **Repository permissions → Pull Requests**: `Read and Write`
 - **Repository permissions → Contents**: `Read` (for fetching file contents)
 
-### 3. Local Development
+### 4. Local Development
 
 Copy the secrets template and fill in your keys:
 
@@ -48,18 +55,13 @@ cp .dev.vars.example .dev.vars
 npm run dev
 ```
 
-### 4. Deploy to Cloudflare
+### 5. Deploy to Cloudflare
 
 ```bash
 npm run deploy
 ```
 
-After deploy, Wrangler will output your Worker URL:
-```
-https://code-reviewer.<your-account>.workers.dev
-```
-
-### 5. Configure GitHub Webhook
+### 6. Configure GitHub Webhook
 
 In your React project repository:
 
@@ -82,30 +84,37 @@ In your React project repository:
 | `GITHUB_WEBHOOK_SECRET` | Secret | HMAC signature secret |
 | `AI_PROVIDER` | Var | `"claude"` (default) or `"gemini"` |
 
-### Switching to Gemini
-
-In `wrangler.jsonc`, change the `vars` block:
-
-```jsonc
-"vars": {
-  "AI_PROVIDER": "gemini"
-}
-```
-
-Or override at deploy time:
-
-```bash
-npx wrangler deploy --var AI_PROVIDER:gemini
-```
-
 ---
 
 ## Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/` | Health check — returns status, version, active provider |
-| `POST` | `/` | GitHub webhook receiver |
+| Method | Path | Handler | Description |
+|---|---|---|---|
+| `GET` | `/` | `fetch()` | Health check — returns status, version, active provider |
+| `POST` | `/` | `fetch()` | GitHub webhook receiver — pushes to queue |
+| `N/A` | `queue()` | `queue()` | Background Queue Consumer — executes LLM review |
+
+---
+
+## Configuration & Usage
+
+### 1. Switching Models
+
+The agent defaults to **Claude 3.5 Sonnet**. To switch to **Gemini 1.5 Pro**:
+
+1. Ensure `GEMINI_API_KEY` is set via `wrangler secret put`.
+2. Update the provider:
+   ```bash
+   npx wrangler deploy --var AI_PROVIDER:gemini
+   ```
+
+### 2. Monitoring & Logs
+
+To see the agent working in real-time (webhook reception + background LLM processing):
+
+```bash
+npx wrangler tail
+```
 
 ---
 
@@ -117,7 +126,8 @@ src/
 │   ├── constants.ts        # Model names, limits, defaults
 │   └── system-prompt.ts    # Detailed LLM system prompt
 ├── handlers/
-│   └── webhook.ts          # Core PR webhook handler
+│   ├── webhook.ts          # HTTP Producer (receives webhooks)
+│   └── queue.ts            # Background Consumer (executes LLM)
 ├── lib/
 │   ├── github.ts           # GitHub API helpers
 │   ├── security.ts         # HMAC-SHA256 signature verification
@@ -126,9 +136,9 @@ src/
 │       ├── gemini.ts       # Gemini adapter
 │       └── index.ts        # Unified LLM dispatcher
 ├── types/
-│   ├── env.ts              # Env interface
+│   ├── env.ts              # Env interface & ReviewMessage type
 │   └── github.ts           # GitHub webhook & API types
-└── index.ts                # Worker entry point
+└── index.ts                # Worker entry point (ExportedHandler)
 ```
 
 ---

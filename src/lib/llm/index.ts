@@ -1,5 +1,4 @@
-import type { AIProvider } from '../../types/env';
-import type { Env } from '../../types/env';
+import type { AIProvider, Env } from '../../types/env';
 import { DEFAULT_AI_PROVIDER } from '../../config/constants';
 import { reviewWithClaude } from './claude';
 import { reviewWithGemini } from './gemini';
