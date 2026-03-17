@@ -23,7 +23,8 @@
 	 * AI_PROVIDER: "claude" (default) | "gemini"
 	 */
 	"vars": {
-		"AI_PROVIDER": "claude"
+		"AI_PROVIDER": "claude",
+		"ALLOWED_TARGET_BRANCHES": "dev"
 	},
 	/**
 	 * Queues

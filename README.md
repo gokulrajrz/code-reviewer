@@ -83,6 +83,7 @@ In your React project repository:
 | `GITHUB_TOKEN` | Secret | GitHub PAT for API access |
 | `GITHUB_WEBHOOK_SECRET` | Secret | HMAC signature secret |
 | `AI_PROVIDER` | Var | `"claude"` (default) or `"gemini"` |
+| `ALLOWED_TARGET_BRANCHES` | Var | Comma-separated list of target branches to review (e.g., `"dev,main"`). |
 
 ---
 

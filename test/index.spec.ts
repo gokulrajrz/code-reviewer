@@ -60,7 +60,7 @@ const mockPRPayload = {
 		deletions: 5,
 		changed_files: 3,
 		head: { ref: 'feat/user-profile', sha: 'abc123' },
-		base: { ref: 'main', sha: 'def456' },
+		base: { ref: 'dev', sha: 'def456' },
 		user: { login: 'dev', id: 1 },
 	},
 	repository: {

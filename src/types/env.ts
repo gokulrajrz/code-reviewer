@@ -19,6 +19,8 @@ export interface Env {
   // --- Vars (non-secret, safe to set in wrangler.jsonc) ---
   /** Which LLM provider to use. Defaults to "claude". */
   AI_PROVIDER: AIProvider;
+  /** Comma-separated list of target branches to review (e.g., "dev,main"). If unset, all branches are reviewed. */
+  ALLOWED_TARGET_BRANCHES?: string;
 
   // --- Queues ---
   /** The Queue responsible for processing reviews in the background */

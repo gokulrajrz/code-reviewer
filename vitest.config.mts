@@ -13,6 +13,7 @@ export default defineWorkersConfig({
 						GITHUB_TOKEN: 'test-github-token',
 						GITHUB_WEBHOOK_SECRET: 'test-webhook-secret',
 						AI_PROVIDER: 'claude',
+						ALLOWED_TARGET_BRANCHES: 'dev',
 					},
 				},
 			},

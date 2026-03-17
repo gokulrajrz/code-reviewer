@@ -60,6 +60,18 @@ export async function handlePRWebhook(
 
     const { pull_request: pr, repository } = payload;
 
+    // 5. Filter by allowed target branches (if configured)
+    if (env.ALLOWED_TARGET_BRANCHES) {
+        const allowedBranches = env.ALLOWED_TARGET_BRANCHES.split(',').map(b => b.trim());
+        if (!allowedBranches.includes(pr.base.ref)) {
+            console.log(`[code-reviewer] Ignored PR #${pr.number} — target branch "${pr.base.ref}" is not in ALLOWED_TARGET_BRANCHES`);
+            return new Response(
+                JSON.stringify({ message: `Ignored: PR target branch "${pr.base.ref}" not allowed` }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+    }
+
     console.log(
         `[code-reviewer] Webhook received for PR #${pr.number}: "${pr.title}" (${repository.full_name}) — sending to queue...`
     );
