@@ -3,7 +3,7 @@ import type { AIProvider } from '../types/env';
 export const DEFAULT_AI_PROVIDER: AIProvider = 'claude';
 
 export const MODELS = {
-    claude: 'claude-3-5-sonnet-20240620',
+    claude: 'claude-sonnet-4-6',
     gemini: 'gemini-1.5-pro',
 } as const satisfies Record<AIProvider, string>;
 
