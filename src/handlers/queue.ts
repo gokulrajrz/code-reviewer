@@ -5,6 +5,7 @@ import {
     fetchChangedFiles,
     buildReviewContext,
     postPRComment,
+    setCommitStatus,
 } from '../lib/github';
 import { callLLM } from '../lib/llm/index';
 
@@ -20,10 +21,10 @@ export async function queueHandler(
     ctx: ExecutionContext
 ): Promise<void> {
     for (const message of batch.messages) {
-        const { prNumber, title, diffUrl, repoFullName } = message.body;
+        const { prNumber, title, diffUrl, repoFullName, headSha } = message.body;
 
         console.log(
-            `[queue] Processing PR #${prNumber}: "${title}" (${repoFullName})`
+            `[queue] Processing PR #${prNumber}: "${title}" (${repoFullName}) at commit ${headSha}`
         );
 
         try {
@@ -49,9 +50,23 @@ export async function queueHandler(
             // 5. Post the review as a PR comment
             await postPRComment(repoFullName, prNumber, review, env.GITHUB_TOKEN);
 
-            console.log(`[queue] ✅ Review posted to PR #${prNumber}`);
+            // 6. Determine status check success/failure using the LLM's required output format
+            // The prompt mandates: "Overall verdict: **Approve** / **Request Changes** / **Needs Discussion**"
+            const hasRequestedChanges = review.includes('**Request Changes**') || review.includes('Request Changes');
+            const state = hasRequestedChanges ? 'failure' : 'success';
+            const description = hasRequestedChanges ? 'AI Code Review: Changes requested' : 'AI Code Review: Approved';
 
-            // 6. Explicitly acknowledge the message so it isn't retried
+            await setCommitStatus(
+                repoFullName,
+                headSha,
+                state,
+                description,
+                env.GITHUB_TOKEN
+            );
+
+            console.log(`[queue] ✅ Review posted to PR #${prNumber} and status set to ${state}`);
+
+            // 7. Explicitly acknowledge the message so it isn't retried
             message.ack();
 
         } catch (error) {
@@ -65,8 +80,17 @@ export async function queueHandler(
                     `> ⚠️ **Code Reviewer Agent Error**\n> The automated background review failed: \`${errMsg}\`\n> You can trigger another review by closing and reopening this PR.`,
                     env.GITHUB_TOKEN
                 );
+
+                // Update commit status to error
+                await setCommitStatus(
+                    repoFullName,
+                    headSha,
+                    'error',
+                    'AI Code Review failed due to an error',
+                    env.GITHUB_TOKEN
+                );
             } catch {
-                console.error('[queue] Could not post error comment to PR');
+                console.error('[queue] Could not post error comment or set status on PR');
             }
 
             // We explicitly DO NOT ack() the message here if we want it to retry,

@@ -35,4 +35,5 @@ export interface ReviewMessage {
   title: string;
   diffUrl: string;
   repoFullName: string;
+  headSha: string;
 }

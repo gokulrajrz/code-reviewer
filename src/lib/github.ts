@@ -144,3 +144,36 @@ export async function postPRComment(
         throw new Error(`Failed to post PR comment: ${response.status} — ${errorText}`);
     }
 }
+
+/**
+ * Sets a commit status on a GitHub Pull Request to block or allow merging.
+ */
+export async function setCommitStatus(
+    repoFullName: string,
+    sha: string,
+    state: 'error' | 'failure' | 'pending' | 'success',
+    description: string,
+    token: string,
+    targetUrl?: string
+): Promise<void> {
+    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/statuses/${sha}`;
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            ...githubHeaders(token),
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            state,
+            description: description.substring(0, 140), // GitHub limits this to 140 chars
+            context: 'AI Code Reviewer',
+            target_url: targetUrl
+        }),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[github] Failed to set commit status: ${response.status} — ${errorText}`);
+        // We log but don't throw to avoid crashing the whole pipeline if status fails
+    }
+}

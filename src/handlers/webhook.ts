@@ -2,6 +2,7 @@ import type { Env } from '../types/env';
 import type { PullRequestWebhookPayload } from '../types/github';
 import { REVIEWABLE_ACTIONS } from '../config/constants';
 import { verifyWebhookSignature } from '../lib/security';
+import { setCommitStatus } from '../lib/github';
 
 /**
  * Core webhook handler — called for every POST / request.
@@ -65,6 +66,16 @@ export async function handlePRWebhook(
         const allowedBranches = env.ALLOWED_TARGET_BRANCHES.split(',').map(b => b.trim());
         if (!allowedBranches.includes(pr.base.ref)) {
             console.log(`[code-reviewer] Ignored PR #${pr.number} — target branch "${pr.base.ref}" is not in ALLOWED_TARGET_BRANCHES`);
+
+            // Emit a "success" status immediately so we don't block the merge
+            await setCommitStatus(
+                repository.full_name,
+                pr.head.sha,
+                'success',
+                'AI Code Review: Skipped (branch ignored)',
+                env.GITHUB_TOKEN
+            );
+
             return new Response(
                 JSON.stringify({ message: `Ignored: PR target branch "${pr.base.ref}" not allowed` }),
                 { status: 200, headers: { 'Content-Type': 'application/json' } }
@@ -76,20 +87,33 @@ export async function handlePRWebhook(
         `[code-reviewer] Webhook received for PR #${pr.number}: "${pr.title}" (${repository.full_name}) — sending to queue...`
     );
 
-    // 5. Send ReviewMessage to the Queue
+    const headSha = pr.head.sha;
+
+    // 6. Set Commit Status to "pending" immediately so GitHub blocks the merge
+    await setCommitStatus(
+        repository.full_name,
+        headSha,
+        'pending',
+        'AI Code Review in progress...',
+        env.GITHUB_TOKEN
+    );
+
+    // 7. Send ReviewMessage to the Queue
     await env.REVIEW_QUEUE.send({
         prNumber: pr.number,
         title: pr.title,
         diffUrl: pr.diff_url,
-        repoFullName: repository.full_name
+        repoFullName: repository.full_name,
+        headSha: headSha
     });
 
-    // 6. Respond immediately with 202 Accepted. The LLM handles the rest asynchronously.
+    // 8. Respond immediately with 202 Accepted. The LLM handles the rest asynchronously.
     return new Response(
         JSON.stringify({
             message: 'Review queued in the background worker',
             pr: pr.number,
             repo: repository.full_name,
+            sha: headSha
         }),
         { status: 202, headers: { 'Content-Type': 'application/json' } }
     );
