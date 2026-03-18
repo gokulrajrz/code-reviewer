@@ -7,6 +7,7 @@ An AI-powered Cloudflare Worker that automatically reviews GitHub Pull Requests 
 ## 🏗️ Architecture
 
 ```
+```
 GitHub PR Event → Webhook POST → fetch handler
                                    ├── Verify HMAC-SHA256
                                    ├── Get Installation Token (JWT → GitHub API)
@@ -16,11 +17,27 @@ GitHub PR Event → Webhook POST → fetch handler
                                        └── Push to Cloudflare Queue
                                                   ↓
                                        Queue Consumer (up to 15 min)
-                                       ├── Fetch diff + file contents
-                                       ├── Call LLM (Claude / Gemini)
+                                       ├── Paginated fetch of all PR files (max 300)
+                                       ├── Smart Prioritization (classify noise vs code)
+                                       ├── Tiered Context:
+                                       │    ├── Tier 1 (top 15): Full raw content + Diff patch
+                                       │    └── Tier 2 (rest): Diff patch only
+                                       ├── Subrequest limits enforced (max 10 chunks)
+                                       ├── Sequence LLM calls (Claude / Gemini) w/ AbortSignal teardown
+                                       ├── Aggregate findings
                                        ├── Post PR comment as [bot]
                                        └── Update Check Run → success / failure
 ```
+
+---
+
+## 🌟 Key Features
+
+- **Tiered Review System**: Handles massive PRs (up to 300 files) by sorting files by significance. Top 15 files (`Tier 1`) get full file content fetched for deep architectural review. Remaining files (`Tier 2`) use diff-only context to save subrequests and tokens.
+- **Smart Prioritization**: Extracted files are scored based on change size, with bonuses applied to source code (`.ts`, `.py`, etc.), newly-added files, and core application directories (`src/`).
+- **Aggressive Noise Filtering**: Automatically ignores >30 extensions (`.lock`, `.svg`, `.map`) and vendor directories (`node_modules/`, `dist/`), saving API costs and LLM context.
+- **Execution Limits Protection**: Hard limits on generation chunks (max 10) to mathematically prevent Cloudflare's 50-subrequest free-tier ceiling. `AbortSignal` implementation forcibly tears down hung sockets during LLM timeouts to avoid connection exhaustion cascades.
+- **Multi-LLM Support**: Switch seamlessly between Claude 3.5 Sonnet (default) and Gemini 1.5 Pro via environment variables.
 
 ---
 
