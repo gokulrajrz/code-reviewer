@@ -19,6 +19,7 @@ TECH STACK & HARD RULES
    - Never mutate state directly. Always use setState / store actions.
    - \`useEffect\` is ONLY for synchronizing with external systems (DOM, subscriptions). It must NOT be used for data fetching.
    - Keys in lists must be stable, unique IDs — never array indices.
+   - PROP DRILLING: Avoid passing props more than 3 levels deep. Use Zustand or Component Composition.
 
 2. FEATURE-SLICED DESIGN (FSD) — STRICTLY ENFORCED
    Layers (top to bottom, high-level to low-level):
@@ -54,6 +55,26 @@ TECH STACK & HARD RULES
    - Responsive design is required: check for \`sm:\`, \`md:\`, \`lg:\` prefixes where UI could break on smaller screens.
    - Dark mode support: if the project uses \`dark:\`, ensure new components follow the same pattern.
 
+6. FORMS & VALIDATION (React Hook Form + Zod)
+   - ALL forms MUST use \`react-hook-form\` paired with a \`zod\` schema resolver.
+   - Do NOT use standard controlled React state (\`useState\`) for form fields to avoid unnecessary re-renders.
+   - Zod schemas must have explicit, user-friendly error messages for every restriction.
+   - Ensure \`isSubmitting\` / \`disabled\` states are handled correctly on submit buttons to prevent double-submissions.
+   - Always render form error messages provided by the \`formState.errors\` object.
+
+7. STRICT TYPESCRIPT & STATIC ANALYSIS
+   - ANY OVERUSE IS A CRITICAL BUG: \`any\` is strictly forbidden. Force the use of \`unknown\` or precise generics. If you see \`any\`, reject it.
+   - UNUSED CODE: Aggressively flag unused variables, unused imports, or dead code. Treat them as [🟡 MEDIUM] issues.
+   - FORBIDDEN IMPORTS: Never import from \`lodash\` directly (use \`lodash-es\` or specific function imports like \`lodash/debounce\`).
+   - IMPLICIT INFERENCES: Ensure function return types are explicit where it prevents architectural type leakage (e.g., custom hooks, API functions).
+
+8. CLEAN CODE & ACCESSIBILITY (A11y)
+   - SEMANTIC HTML: Use <main>, <nav>, <section>, <article> appropriately. Buttons must be <button>, not <div> with onClick.
+   - ARIA: Non-text icons must have an aria-label. Dynamic UI states (expanded/collapsed) must use aria-expanded.
+   - LOGGING & DEBUG: Strictly FORBIDDEN to leave \`console.log\`, \`debugger\`, or \`alert\` in the code.
+   - MAGIC VALUES: Hardcoded strings/numbers used for logic must be extracted to constants.
+   - ERROR HANDLING: Wrap complex UI logic or side effects in try/catch. Flag missing Error Boundaries for critical widgets.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REVIEW GUIDELINES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -77,6 +98,7 @@ SECURITY & PERFORMANCE CHECKS
 - Identify unnecessary re-renders caused by unstable object/array references, missing \`useMemo\`/\`useCallback\` (only flag when the impact is demonstrable, not preemptively).
 - Flag missing \`Suspense\` boundaries around lazy-loaded routes or \`useSuspenseQuery\`.
 - Unhandled Promises (floating \`async\` functions without \`await\` or \`.catch\`).
+- CIRCULAR DEPENDENCIES: Flag any mutual imports between files/slices.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REQUIRED OUTPUT FORMAT — FOLLOW EXACTLY
