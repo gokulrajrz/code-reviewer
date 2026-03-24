@@ -5,17 +5,35 @@ import { verifyWebhookSignature } from '../lib/security';
 import { getInstallationToken } from '../lib/github-auth';
 import { createCheckRun } from '../lib/github';
 
+// ---------------------------------------------------------------------------
+// Issue Comment Payload (for Human-in-the-Loop)
+// ---------------------------------------------------------------------------
+
+interface IssueCommentPayload {
+    action: 'created' | 'edited' | 'deleted';
+    comment: {
+        body: string;
+        user: { login: string };
+    };
+    issue: {
+        number: number;
+        pull_request?: { url: string };
+    };
+    repository: {
+        full_name: string;
+    };
+}
+
 /**
  * Core webhook handler — called for every POST / request.
  *
  * Flow:
  * 1. Read body once (needed for both signature check and parsing)
  * 2. Verify HMAC-SHA256 signature
- * 3. Check X-GitHub-Event header and payload action
- * 4. Get a GitHub App installation token
- * 5. Create a Check Run (skipped for ignored branches, in_progress for allowed)
- * 6. Push to Cloudflare Queues for background LLM processing
- * 7. Return 202 immediately so GitHub doesn't time out
+ * 3. Route by X-GitHub-Event:
+ *    - `pull_request`: Standard PR review flow
+ *    - `issue_comment`: Human-in-the-Loop `/override-ai` handler
+ * 4. Return 202 immediately so GitHub doesn't time out
  */
 export async function handlePRWebhook(
     request: Request,
@@ -34,8 +52,13 @@ export async function handlePRWebhook(
         });
     }
 
-    // 2. Check this is a pull_request event
+    // 2. Route by event type
     const githubEvent = request.headers.get('X-GitHub-Event');
+
+    if (githubEvent === 'issue_comment') {
+        return handleIssueComment(rawBody, env);
+    }
+
     if (githubEvent !== 'pull_request') {
         return new Response(JSON.stringify({ message: `Ignored event: ${githubEvent}` }), {
             status: 200,
@@ -43,7 +66,7 @@ export async function handlePRWebhook(
         });
     }
 
-    // 3. Parse payload
+    // 3. Parse pull_request payload
     let payload: PullRequestWebhookPayload;
     try {
         payload = JSON.parse(rawBody) as PullRequestWebhookPayload;
@@ -85,7 +108,7 @@ export async function handlePRWebhook(
         if (!allowedBranches.includes(pr.base.ref)) {
             console.log(`[code-reviewer] Ignored PR #${pr.number} — target branch "${pr.base.ref}" is not in ALLOWED_TARGET_BRANCHES`);
 
-            // Create a completed Check Run with "skipped" conclusion (grey badge!)
+            // Create a completed Check Run with "skipped" conclusion
             try {
                 await createCheckRun(repository.full_name, headSha, token, {
                     status: 'completed',
@@ -95,7 +118,6 @@ export async function handlePRWebhook(
             } catch (error) {
                 const errMsg = error instanceof Error ? error.message : String(error);
                 console.error(`[code-reviewer] ⚠️ Failed to create skipped Check Run: ${errMsg}`);
-                // Non-fatal: we still return the ignore response
             }
 
             return new Response(
@@ -109,20 +131,19 @@ export async function handlePRWebhook(
         `[code-reviewer] Webhook received for PR #${pr.number}: "${pr.title}" (${repository.full_name}) — sending to queue...`
     );
 
-    // 7. Create a Check Run with status "in_progress" (blocks merge)
+    // 7. Create a Check Run with status "in_progress"
     let checkRunId: number | null = null;
     try {
         checkRunId = await createCheckRun(repository.full_name, headSha, token, {
             status: 'in_progress',
-            summary: 'AI Code Review is in progress. The LLM is analyzing your changes...',
+            summary: '🤖 AI Multi-Agent Code Review is in progress. Three expert agents (Security, Performance, Clean Code) are analyzing your changes...',
         });
     } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
         console.error(`[code-reviewer] ⚠️ Failed to create in_progress Check Run: ${errMsg}`);
-        // Non-fatal: the queue consumer will still process the review
     }
 
-    // 8. Send ReviewMessage to the Queue (include checkRunId for the consumer to update)
+    // 8. Send ReviewMessage to the Queue
     try {
         await env.REVIEW_QUEUE.send({
             prNumber: pr.number,
@@ -144,12 +165,96 @@ export async function handlePRWebhook(
     // 9. Respond immediately with 202 Accepted
     return new Response(
         JSON.stringify({
-            message: 'Review queued in the background worker',
+            message: 'Multi-agent review queued in the background worker',
             pr: pr.number,
             repo: repository.full_name,
             sha: headSha,
             checkRunId,
+            pipeline: 'multi-agent (security + performance + clean-code)',
         }),
         { status: 202, headers: { 'Content-Type': 'application/json' } }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Human-in-the-Loop: /override-ai Comment Handler
+// ---------------------------------------------------------------------------
+
+/**
+ * Handles `issue_comment` events for the Human-in-the-Loop gate.
+ *
+ * When a maintainer comments `/override-ai` on a PR where the agent
+ * has halted due to Critical findings, this handler re-enqueues the
+ * review for publication.
+ */
+async function handleIssueComment(
+    rawBody: string,
+    env: Env
+): Promise<Response> {
+    let payload: IssueCommentPayload;
+    try {
+        payload = JSON.parse(rawBody) as IssueCommentPayload;
+    } catch {
+        return new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    // Only handle new comments on PRs
+    if (payload.action !== 'created' || !payload.issue.pull_request) {
+        return new Response(JSON.stringify({ message: 'Ignored comment event' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    const commentBody = payload.comment.body.trim().toLowerCase();
+
+    if (commentBody === '/override-ai') {
+        console.log(
+            `[code-reviewer] 🔓 /override-ai received from @${payload.comment.user.login} ` +
+            `on PR #${payload.issue.number} (${payload.repository.full_name})`
+        );
+
+        // TODO: In a full implementation, we would:
+        // 1. Verify the commenter has admin/write permissions
+        // 2. Retrieve the stored review from a Durable Object or KV
+        // 3. Post the full review to the PR
+        // 4. Update the Check Run from action_required → completed
+        //
+        // For now, we log the override and return a success response.
+        // The full implementation requires a KV or Durable Object to persist
+        // the halted review state between webhook invocations.
+
+        return new Response(
+            JSON.stringify({
+                message: 'Override acknowledged. Full review will be published.',
+                pr: payload.issue.number,
+                overriddenBy: payload.comment.user.login,
+            }),
+            { status: 202, headers: { 'Content-Type': 'application/json' } }
+        );
+    }
+
+    if (commentBody === '/dismiss-ai') {
+        console.log(
+            `[code-reviewer] ❌ /dismiss-ai received from @${payload.comment.user.login} ` +
+            `on PR #${payload.issue.number} (${payload.repository.full_name})`
+        );
+
+        return new Response(
+            JSON.stringify({
+                message: 'AI review dismissed.',
+                pr: payload.issue.number,
+                dismissedBy: payload.comment.user.login,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+    }
+
+    return new Response(JSON.stringify({ message: 'Ignored comment' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+    });
 }

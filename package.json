@@ -1,13 +1,14 @@
 {
 	"name": "code-reviewer",
-	"version": "1.0.0",
-	"description": "AI-powered GitHub PR reviewer using Cloudflare Workers + Queues with Claude/Gemini LLMs",
+	"version": "2.0.0",
+	"description": "Multi-Agent AI Code Reviewer using Cloudflare Workers + Queues with Claude/Gemini LLMs",
 	"private": true,
 	"scripts": {
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
 		"test": "vitest",
+		"evals": "npx tsx evals/runner.ts",
 		"cf-typegen": "wrangler types"
 	},
 	"devDependencies": {
@@ -19,6 +20,7 @@
 	},
 	"dependencies": {
 		"@anthropic-ai/sdk": "^0.79.0",
-		"@google/generative-ai": "^0.24.1"
+		"@google/generative-ai": "^0.24.1",
+		"zod": "^4.3.6"
 	}
 }

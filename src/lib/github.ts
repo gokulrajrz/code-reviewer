@@ -63,6 +63,59 @@ export async function fetchChangedFiles(
 }
 
 // ---------------------------------------------------------------------------
+// Repo Context Fetching (for Multi-Agent Pipeline)
+// ---------------------------------------------------------------------------
+
+/** Files to fetch from the repo root for global context */
+const CONTEXT_FILES = ['package.json', 'README.md', '.eslintrc.js', '.eslintrc.json', '.eslintrc.cjs', 'tsconfig.json'];
+
+/**
+ * Fetches key project context files from the repo root.
+ * These are used by expert agents to understand the project's tech stack
+ * and avoid suggesting tools/patterns not in use.
+ *
+ * Returns a formatted string of all found context files.
+ */
+export async function fetchRepoContext(
+    repoFullName: string,
+    token: string
+): Promise<string> {
+    const contextParts: string[] = [];
+
+    for (const filename of CONTEXT_FILES) {
+        try {
+            const url = `${GITHUB_API_BASE}/repos/${repoFullName}/contents/${filename}`;
+            const response = await fetch(url, {
+                headers: {
+                    ...githubHeaders(token),
+                    Accept: 'application/vnd.github.raw+json',
+                },
+            });
+
+            if (!response.ok) continue; // File doesn't exist, skip silently
+
+            const content = await response.text();
+
+            // Cap individual context files at 5KB to save tokens
+            const trimmedContent = content.length > 5000
+                ? content.slice(0, 5000) + '\n[... truncated ...]'
+                : content;
+
+            contextParts.push(`### ${filename}\n\`\`\`\n${trimmedContent}\n\`\`\``);
+        } catch {
+            // Non-fatal: skip files that can't be fetched
+            continue;
+        }
+    }
+
+    if (contextParts.length === 0) {
+        return '_No project context files found._';
+    }
+
+    return `# Project Context\n\n${contextParts.join('\n\n')}`;
+}
+
+// ---------------------------------------------------------------------------
 // Smart File Classification
 // ---------------------------------------------------------------------------
 

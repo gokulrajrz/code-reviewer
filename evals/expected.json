@@ -1,0 +1,56 @@
+{
+    "sql_injection": {
+        "description": "A PR diff containing a deliberate SQL injection vulnerability via string concatenation",
+        "expectedFindings": [
+            {
+                "file": "src/db/queries.ts",
+                "severity": "Critical",
+                "category": "Security",
+                "issue": "SQL injection via string concatenation"
+            }
+        ]
+    },
+    "fsd_violation": {
+        "description": "A PR diff where a component in features/ imports from another slice in features/ (cross-slice import)",
+        "expectedFindings": [
+            {
+                "file": "src/features/auth/ui/LoginForm.tsx",
+                "severity": "High",
+                "category": "Maintainability",
+                "issue": "FSD cross-slice import violation"
+            }
+        ]
+    },
+    "react_performance": {
+        "description": "A PR diff with an object created inline inside JSX causing re-renders and the whole Zustand store selected",
+        "expectedFindings": [
+            {
+                "file": "src/components/Dashboard.tsx",
+                "severity": "Medium",
+                "category": "Performance",
+                "issue": "Unstable object reference causing unnecessary re-renders"
+            },
+            {
+                "file": "src/components/Dashboard.tsx",
+                "severity": "High",
+                "category": "Performance",
+                "issue": "Entire Zustand store selected instead of atomic selector"
+            }
+        ]
+    },
+    "hardcoded_secret": {
+        "description": "A PR diff with a hardcoded API key in source code",
+        "expectedFindings": [
+            {
+                "file": "src/config/api.ts",
+                "severity": "Critical",
+                "category": "Security",
+                "issue": "Hardcoded API key in source code"
+            }
+        ]
+    },
+    "perfect_code": {
+        "description": "A PR diff with clean, well-structured code and no issues",
+        "expectedFindings": []
+    }
+}
