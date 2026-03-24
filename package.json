@@ -1,5 +1,5 @@
 {
-	"name": "code-reviewer",
+	"name": "code-reviewer-v2",
 	"version": "2.0.0",
 	"description": "Multi-Agent AI Code Reviewer using Cloudflare Workers + Queues with Claude/Gemini LLMs",
 	"private": true,

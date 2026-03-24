@@ -7,7 +7,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "code-reviewer",
+	"name": "code-reviewer-v2",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-03-10",
 	"compatibility_flags": [
@@ -34,12 +34,12 @@
 		"producers": [
 			{
 				"binding": "REVIEW_QUEUE",
-				"queue": "code-reviewer-queue"
+				"queue": "code-reviewer-v2-queue"
 			}
 		],
 		"consumers": [
 			{
-				"queue": "code-reviewer-queue",
+				"queue": "code-reviewer-v2-queue",
 				"max_batch_size": 1,
 				"max_concurrency": 2,
 				"max_retries": 1
