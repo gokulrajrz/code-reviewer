@@ -15,7 +15,7 @@ export default {
 					status: 'ok',
 					service: 'code-reviewer-agent',
 					version: WORKER_VERSION,
-					provider: env.AI_PROVIDER ?? 'claude',
+					provider: env.AI_PROVIDER ?? 'gemini',
 				}),
 				{ status: 200, headers: { 'Content-Type': 'application/json' } }
 			);

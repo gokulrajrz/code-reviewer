@@ -198,7 +198,7 @@ export async function callStructuredLLM(
     env: Env,
     signal?: AbortSignal
 ): Promise<StructuredLLMResult> {
-    const provider: AIProvider = (env.AI_PROVIDER ?? 'claude') as AIProvider;
+    const provider: AIProvider = (env.AI_PROVIDER ?? 'gemini') as AIProvider;
     const apiKey = provider === 'gemini' ? env.GEMINI_API_KEY : env.ANTHROPIC_API_KEY;
 
     if (!apiKey?.trim()) {

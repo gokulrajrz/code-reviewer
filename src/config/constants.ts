@@ -1,6 +1,6 @@
 import type { AIProvider } from '../types/env';
 
-export const DEFAULT_AI_PROVIDER: AIProvider = 'claude';
+export const DEFAULT_AI_PROVIDER: AIProvider = 'gemini';
 
 export const MODELS = {
     claude: 'claude-sonnet-4-20250514',

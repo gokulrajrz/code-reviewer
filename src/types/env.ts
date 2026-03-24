@@ -21,8 +21,8 @@ export interface Env {
   GITHUB_WEBHOOK_SECRET: string;
 
   // --- Vars (non-secret, safe to set in wrangler.jsonc) ---
-  /** Which LLM provider to use. Defaults to "claude". */
-  AI_PROVIDER: AIProvider;
+  /** Which LLM provider to use. Defaults to "gemini". */
+  AI_PROVIDER?: 'claude' | 'gemini';
   /** Comma-separated list of target branches to review (e.g., "dev,main"). If unset, all branches are reviewed. */
   ALLOWED_TARGET_BRANCHES?: string;
 

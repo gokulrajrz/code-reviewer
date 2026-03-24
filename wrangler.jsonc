@@ -20,10 +20,10 @@
 	 * Non-secret environment variables.
 	 * Override at deploy time: npx wrangler deploy --var AI_PROVIDER:gemini
 	 *
-	 * AI_PROVIDER: "claude" (default) | "gemini"
+	 * AI_PROVIDER: "gemini" (default) | "claude"
 	 */
 	"vars": {
-		"AI_PROVIDER": "claude",
+		"AI_PROVIDER": "gemini",
 		"ALLOWED_TARGET_BRANCHES": "dev"
 	},
 	/**
