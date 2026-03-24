@@ -19,7 +19,7 @@ export async function queueHandler(
     _ctx: ExecutionContext
 ): Promise<void> {
     for (const message of batch.messages) {
-        const { prNumber, title, repoFullName, headSha, checkRunId } = message.body;
+        const { prNumber, title, repoFullName, headSha, checkRunId, isOverride } = message.body;
 
         console.log(
             `[queue] Processing PR #${prNumber}: "${title}" (${repoFullName}) at commit ${headSha}`
@@ -33,6 +33,7 @@ export async function queueHandler(
                 repoFullName,
                 headSha,
                 checkRunId,
+                isOverride,
                 env,
             });
 

@@ -182,8 +182,12 @@ function aggregatorNode(state: AgentState): AgentState {
 
 function humanGateNode(state: AgentState): AgentState {
     if (state.reviewStatus === 'needs_human_review') {
+        if (state.isOverride) {
+            console.log('[workflow:gate] 🔓 Critical findings present, but bypassing gate due to manual /override-ai');
+            state.reviewStatus = 'approved';
+            return state;
+        }
         console.log('[workflow:gate] 🚨 Critical findings detected — halting for human review');
-        // The queue handler will check for this status and post a "blocked" comment
         return state;
     }
 
@@ -213,6 +217,7 @@ export async function executeWorkflow(params: {
     repoFullName: string;
     headSha: string;
     checkRunId: number;
+    isOverride?: boolean;
     env: Env;
 }): Promise<WorkflowResult> {
     const { env, ...stateParams } = params;

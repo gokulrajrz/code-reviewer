@@ -69,6 +69,28 @@ export async function fetchChangedFiles(
 /** Files to fetch from the repo root for global context */
 const CONTEXT_FILES = ['package.json', 'README.md', '.eslintrc.js', '.eslintrc.json', '.eslintrc.cjs', 'tsconfig.json'];
 
+export async function getPullRequest(
+    repoFullName: string,
+    prNumber: number,
+    token: string
+): Promise<{ title: string; headSha: string; diffUrl: string }> {
+    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}`;
+    const response = await fetch(url, {
+        headers: githubHeaders(token),
+    });
+
+    if (!response.ok) {
+        throw new Error(`[github] Failed to fetch PR #${prNumber}: ${response.statusText}`);
+    }
+
+    const pr = await response.json() as any;
+    return {
+        title: pr.title,
+        headSha: pr.head.sha,
+        diffUrl: pr.diff_url,
+    };
+}
+
 /**
  * Fetches key project context files from the repo root.
  * These are used by expert agents to understand the project's tech stack

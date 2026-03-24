@@ -3,7 +3,7 @@ import type { PullRequestWebhookPayload } from '../types/github';
 import { REVIEWABLE_ACTIONS } from '../config/constants';
 import { verifyWebhookSignature } from '../lib/security';
 import { getInstallationToken } from '../lib/github-auth';
-import { createCheckRun } from '../lib/github';
+import { createCheckRun, getPullRequest } from '../lib/github';
 
 // ---------------------------------------------------------------------------
 // Issue Comment Payload (for Human-in-the-Loop)
@@ -217,15 +217,50 @@ async function handleIssueComment(
             `on PR #${payload.issue.number} (${payload.repository.full_name})`
         );
 
-        // TODO: In a full implementation, we would:
-        // 1. Verify the commenter has admin/write permissions
-        // 2. Retrieve the stored review from a Durable Object or KV
-        // 3. Post the full review to the PR
-        // 4. Update the Check Run from action_required → completed
-        //
-        // For now, we log the override and return a success response.
-        // The full implementation requires a KV or Durable Object to persist
-        // the halted review state between webhook invocations.
+        // 1. Get auth token
+        let token: string;
+        try {
+            token = await getInstallationToken(env);
+        } catch (error) {
+            console.error(`[code-reviewer] ❌ /override-ai auth failed:`, error);
+            return new Response(JSON.stringify({ error: 'GitHub App auth failed' }), { status: 500 });
+        }
+
+        // 2. Fetch PR details (since issue_comment doesn't contain head.sha)
+        let pr;
+        try {
+            pr = await getPullRequest(payload.repository.full_name, payload.issue.number, token);
+        } catch (error) {
+            console.error(`[code-reviewer] ❌ /override-ai PR fetch failed:`, error);
+            return new Response(JSON.stringify({ error: 'Failed to fetch PR details' }), { status: 500 });
+        }
+
+        // 3. Create a new Check Run for the override review
+        let checkRunId: number | null = null;
+        try {
+            checkRunId = await createCheckRun(payload.repository.full_name, pr.headSha, token, {
+                status: 'in_progress',
+                summary: `🤖 Manual Override by @${payload.comment.user.login}. Re-running review and forcing publish...`,
+            });
+        } catch (error) {
+            console.error(`[code-reviewer] ⚠️ /override-ai Check Run failed:`, error);
+        }
+
+        // 4. Dispatch to queue with isOverride = true
+        try {
+            await env.REVIEW_QUEUE.send({
+                prNumber: payload.issue.number,
+                title: pr.title,
+                diffUrl: pr.diffUrl,
+                repoFullName: payload.repository.full_name,
+                headSha: pr.headSha,
+                checkRunId: checkRunId ?? 0,
+                isOverride: true,
+            });
+        } catch (error) {
+            console.error(`[code-reviewer] ❌ /override-ai queue dispatch failed:`, error);
+            return new Response(JSON.stringify({ error: 'Failed to enqueue override' }), { status: 500 });
+        }
 
         return new Response(
             JSON.stringify({

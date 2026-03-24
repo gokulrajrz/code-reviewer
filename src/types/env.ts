@@ -42,4 +42,6 @@ export interface ReviewMessage {
   headSha: string;
   /** The Check Run ID created by the webhook, so the queue consumer can update it */
   checkRunId: number;
+  /** True if this review was manually triggered by an /override-ai comment */
+  isOverride?: boolean;
 }

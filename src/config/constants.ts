@@ -35,7 +35,7 @@ export const MAX_FILE_SIZE_BYTES = 200_000;
 export const REVIEWABLE_ACTIONS = new Set(['opened', 'synchronize', 'reopened']);
 
 /** Worker version — update in sync with package.json on releases. */
-export const WORKER_VERSION = '1.0.0';
+export const WORKER_VERSION = '2.0.0';
 
 // ---------------------------------------------------------------------------
 // Noise File Filtering

@@ -13,6 +13,7 @@ export interface AgentState {
     repoFullName: string;
     headSha: string;
     checkRunId: number;
+    isOverride?: boolean;
 
     /** Global repo context: README.md, package.json, .eslintrc etc. */
     globalContext: string;
@@ -45,6 +46,7 @@ export function createInitialState(params: {
     repoFullName: string;
     headSha: string;
     checkRunId: number;
+    isOverride?: boolean;
 }): AgentState {
     return {
         ...params,
