@@ -8,6 +8,7 @@
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
 		"test": "vitest",
+		"test:e2e": "vitest run --config vitest.e2e.config.mts",
 		"evals": "npx tsx evals/runner.ts",
 		"cf-typegen": "wrangler types"
 	},
