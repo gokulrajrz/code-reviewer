@@ -8,9 +8,10 @@
  *   IngestContext → [Security | Performance | CleanCode] (parallel) → Aggregate → Gate → Publish
  */
 
-import type { Env } from '../types/env';
+import type { Env, AIProvider } from '../types/env';
 import type { AgentState } from './state';
 import type { TelemetryData } from '../types/review';
+
 import { createInitialState } from './state';
 import { SECURITY_AGENT_PROMPT } from '../agents/security';
 import { PERFORMANCE_AGENT_PROMPT } from '../agents/performance';
@@ -19,32 +20,44 @@ import { aggregateFindings } from '../agents/aggregator';
 import { callStructuredLLM } from '../lib/llm/structured';
 import { renderMarkdownReview } from '../lib/formatter';
 import { buildTelemetryEvent, emitTelemetry } from '../lib/telemetry';
+import { getInstallationToken } from '../lib/github-auth';
 import {
     fetchChangedFiles,
     classifyFiles,
     buildReviewChunks,
-    postPRComment,
-    updateCheckRun,
     fetchRepoContext,
 } from '../lib/github';
-import { getInstallationToken } from '../lib/github-auth';
-import { MAX_CHUNK_CHARS, MAX_LLM_CHUNKS } from '../config/constants';
+import {
+    getChunkSize,
+    MAX_LLM_CHUNKS,
+    DEFAULT_AI_PROVIDER,
+    MODELS,
+} from '../config/constants';
 
-/** Maximum time (ms) to wait for a single LLM agent call. */
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
 const AGENT_TIMEOUT_MS = 120_000;
 
 // ---------------------------------------------------------------------------
-// Node 1: Ingest Context
+// Pipeline Nodes
 // ---------------------------------------------------------------------------
 
 async function ingestContextNode(state: AgentState, env: Env): Promise<AgentState> {
     const token = await getInstallationToken(env);
+    const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
+    const model = MODELS[provider];
+    const maxChunkChars = getChunkSize(provider);
 
-    console.log(`[workflow] Ingesting context for PR #${state.prNumber}...`);
+    console.log(
+        `[workflow] Ingesting context for PR #${state.prNumber}`,
+        `(model: ${model}, chunk size: ${maxChunkChars.toLocaleString()} chars)...`
+    );
 
     // Fetch global repo context (README, package.json, etc.)
     const globalContext = await fetchRepoContext(state.repoFullName, token);
-    console.log(`[workflow] ✓ Global context fetched (${globalContext.length} chars)`);
+    console.log(`[workflow] ✓ Global context fetched (${globalContext.length.toLocaleString()} chars)`);
 
     // Fetch changed files
     const allFiles = await fetchChangedFiles(state.repoFullName, state.prNumber, token);
@@ -67,9 +80,9 @@ async function ingestContextNode(state: AgentState, env: Env): Promise<AgentStat
         `${classified.tier2.length} tier2, ${classified.skipped.length} skipped`
     );
 
-    let chunks = await buildReviewChunks(classified, token, MAX_CHUNK_CHARS);
+    let chunks = await buildReviewChunks(classified, token, maxChunkChars);
 
-    // Apply hard cap
+    // Apply hard cap to stay within Cloudflare Workers subrequest limits
     if (chunks.length > MAX_LLM_CHUNKS) {
         console.log(`[workflow] ⚠️ Truncating chunks from ${chunks.length} to ${MAX_LLM_CHUNKS}`);
         chunks = chunks.slice(0, MAX_LLM_CHUNKS);
@@ -79,7 +92,7 @@ async function ingestContextNode(state: AgentState, env: Env): Promise<AgentStat
 }
 
 // ---------------------------------------------------------------------------
-// Node 2-4: Expert Agent Nodes (Fan-out, run in parallel)
+// Expert Agent Runner
 // ---------------------------------------------------------------------------
 
 async function runAgentNode(
@@ -87,10 +100,11 @@ async function runAgentNode(
     systemPrompt: string,
     state: AgentState,
     env: Env
-): Promise<{ findings: AgentState['securityFindings']; summary: string; telemetry: TelemetryData }> {
+): Promise<{ findings: AgentState['securityFindings']; summary: string; telemetry: TelemetryData; errors: string[] }> {
     const allFindings: AgentState['securityFindings'] = [];
     let combinedSummary = '';
     let combinedTelemetry: TelemetryData | null = null;
+    const errors: string[] = [];
 
     for (let i = 0; i < state.fileChunks.length; i++) {
         const chunkLabel = state.fileChunks.length > 1 ? ` (Part ${i + 1}/${state.fileChunks.length})` : '';
@@ -114,9 +128,9 @@ ${state.fileChunks[i]}
         try {
             const result = await callStructuredLLM(systemPrompt, userMessage, env, controller.signal);
             allFindings.push(...result.output.findings);
-            combinedSummary = result.output.summary; // Use the last chunk's summary
+            combinedSummary = result.output.summary;
 
-            // Accumulate telemetry
+            // Accumulate telemetry across chunks
             if (!combinedTelemetry) {
                 combinedTelemetry = { ...result.telemetry };
             } else {
@@ -129,31 +143,31 @@ ${state.fileChunks[i]}
         } catch (error) {
             const errMsg = error instanceof Error ? error.message : String(error);
             console.error(`[workflow:${agentName}] ⚠️ Chunk ${i + 1} failed: ${errMsg}`);
+            errors.push(`[${agentName}] Chunk ${i + 1} failed: ${errMsg}`);
         } finally {
             clearTimeout(timer);
         }
     }
 
-    const fallbackTelemetry: TelemetryData = combinedTelemetry ?? {
-        provider: 'unknown',
-        model: 'unknown',
-        inputTokens: 0,
-        outputTokens: 0,
-        latencyMs: 0,
-        success: false,
-        retryCount: 0,
-        error: 'No chunks processed',
-    };
-
     return {
         findings: allFindings,
         summary: combinedSummary || `${agentName} agent did not produce a summary.`,
-        telemetry: fallbackTelemetry,
+        telemetry: combinedTelemetry ?? {
+            provider: 'unknown',
+            model: 'unknown',
+            inputTokens: 0,
+            outputTokens: 0,
+            latencyMs: 0,
+            success: false,
+            retryCount: 0,
+            error: 'No chunks processed',
+        },
+        errors,
     };
 }
 
 // ---------------------------------------------------------------------------
-// Node 5: Aggregator
+// Aggregator & Gate Nodes
 // ---------------------------------------------------------------------------
 
 function aggregatorNode(state: AgentState): AgentState {
@@ -166,7 +180,8 @@ function aggregatorNode(state: AgentState): AgentState {
     );
 
     console.log(
-        `[workflow:aggregator] ✓ ${result.findings.length} findings (${result.reviewStatus}, verdict: ${result.verdict})`
+        `[workflow:aggregator] ✓ ${result.findings.length} findings ` +
+        `(${result.reviewStatus}, verdict: ${result.verdict})`
     );
 
     return {
@@ -176,16 +191,14 @@ function aggregatorNode(state: AgentState): AgentState {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Node 6: Human-in-the-Loop Gate
-// ---------------------------------------------------------------------------
-
 function humanGateNode(state: AgentState): AgentState {
     if (state.reviewStatus === 'needs_human_review') {
         if (state.isOverride) {
             console.log('[workflow:gate] 🔓 Critical findings present, but bypassing gate due to manual /override-ai');
-            state.reviewStatus = 'approved';
-            return state;
+            return {
+                ...state,
+                reviewStatus: 'approved',
+            };
         }
         console.log('[workflow:gate] 🚨 Critical findings detected — halting for human review');
         return state;
@@ -196,7 +209,7 @@ function humanGateNode(state: AgentState): AgentState {
 }
 
 // ---------------------------------------------------------------------------
-// The Full Pipeline
+// Main Workflow Orchestrator
 // ---------------------------------------------------------------------------
 
 export interface WorkflowResult {
@@ -208,9 +221,6 @@ export interface WorkflowResult {
     };
 }
 
-/**
- * Executes the full multi-agent review pipeline.
- */
 export async function executeWorkflow(params: {
     prNumber: number;
     prTitle: string;
@@ -227,7 +237,7 @@ export async function executeWorkflow(params: {
     console.log(`[workflow] Starting Multi-Agent Pipeline for PR #${state.prNumber}`);
     console.log(`[workflow] ═══════════════════════════════════════════════════`);
 
-    // ── Step 1: Ingest Context ──
+    // Step 1: Ingest Context
     state = await ingestContextNode(state, env);
 
     if (state.fileChunks.length === 0) {
@@ -242,7 +252,7 @@ export async function executeWorkflow(params: {
         };
     }
 
-    // ── Step 2-4: Fan-out — Run 3 Expert Agents in Parallel ──
+    // Step 2-4: Fan-out — Run 3 Expert Agents in Parallel
     console.log('[workflow] Launching 3 expert agents in parallel...');
 
     const [securityResult, performanceResult, cleanCodeResult] = await Promise.allSettled([
@@ -251,10 +261,17 @@ export async function executeWorkflow(params: {
         runAgentNode('clean-code', CLEAN_CODE_AGENT_PROMPT, state, env),
     ]);
 
-    // Extract results (handle rejections gracefully)
     const security = securityResult.status === 'fulfilled' ? securityResult.value : null;
     const performance = performanceResult.status === 'fulfilled' ? performanceResult.value : null;
     const cleanCode = cleanCodeResult.status === 'fulfilled' ? cleanCodeResult.value : null;
+
+    if (securityResult.status === 'rejected') state.errors.push(`[security] Agent rejected: ${String(securityResult.reason)}`);
+    if (performanceResult.status === 'rejected') state.errors.push(`[performance] Agent rejected: ${String(performanceResult.reason)}`);
+    if (cleanCodeResult.status === 'rejected') state.errors.push(`[clean-code] Agent rejected: ${String(cleanCodeResult.reason)}`);
+
+    if (security?.errors) state.errors.push(...security.errors);
+    if (performance?.errors) state.errors.push(...performance.errors);
+    if (cleanCode?.errors) state.errors.push(...cleanCode.errors);
 
     state.securityFindings = security?.findings ?? [];
     state.performanceFindings = performance?.findings ?? [];
@@ -272,22 +289,28 @@ export async function executeWorkflow(params: {
         `CleanCode=${state.cleanCodeFindings.length} findings`
     );
 
-    // ── Step 5: Aggregate ──
+    if (state.errors.length > 0) {
+        console.error(`[workflow] ❌ Agents failed with errors:\n${state.errors.join('\n')}`);
+        state.reviewStatus = 'failed';
+        throw new Error(state.errors.join('\n'));
+    }
+
+    // Step 5: Aggregate
     state = aggregatorNode(state);
 
-    // ── Step 6: Human Gate ──
+    // Step 6: Human Gate
     state = humanGateNode(state);
 
-    // ── Build agent summaries ──
+    // Build agent summaries
     const agentSummaries = {
         security: security?.summary ?? 'Agent failed to execute.',
         performance: performance?.summary ?? 'Agent failed to execute.',
         cleanCode: cleanCode?.summary ?? 'Agent failed to execute.',
     };
 
-    // ── Build final markdown ──
-    const totalInputTokens = state.telemetry.reduce((s, t) => s + t.inputTokens, 0);
-    const totalOutputTokens = state.telemetry.reduce((s, t) => s + t.outputTokens, 0);
+    // Build final markdown
+    const totalInputTokens = state.telemetry.reduce((sum, t) => sum + t.inputTokens, 0);
+    const totalOutputTokens = state.telemetry.reduce((sum, t) => sum + t.outputTokens, 0);
     const maxLatency = Math.max(...state.telemetry.map((t) => t.latencyMs), 0);
 
     state.finalMarkdown = renderMarkdownReview({
@@ -306,7 +329,15 @@ export async function executeWorkflow(params: {
         },
     });
 
-    // ── Emit Telemetry ──
+    // Emit Telemetry
+    const severityCounts = state.aggregatedFindings.reduce(
+        (acc, f) => {
+            acc[f.severity.toLowerCase() as 'critical' | 'high' | 'medium' | 'low']++;
+            return acc;
+        },
+        { critical: 0, high: 0, medium: 0, low: 0 }
+    );
+
     const telemetryEvent = buildTelemetryEvent({
         prNumber: state.prNumber,
         repoFullName: state.repoFullName,
@@ -315,10 +346,10 @@ export async function executeWorkflow(params: {
         performanceTelemetry: performance?.telemetry ?? null,
         cleanCodeTelemetry: cleanCode?.telemetry ?? null,
         totalFindings: state.aggregatedFindings.length,
-        criticalCount: state.aggregatedFindings.filter((f) => f.severity === 'Critical').length,
-        highCount: state.aggregatedFindings.filter((f) => f.severity === 'High').length,
-        mediumCount: state.aggregatedFindings.filter((f) => f.severity === 'Medium').length,
-        lowCount: state.aggregatedFindings.filter((f) => f.severity === 'Low').length,
+        criticalCount: severityCounts.critical,
+        highCount: severityCounts.high,
+        mediumCount: severityCounts.medium,
+        lowCount: severityCounts.low,
         verdict: state.reviewStatus === 'needs_human_review' ? 'RequestChanges' : 'Approve',
         reviewStatus: state.reviewStatus,
     });

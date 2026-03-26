@@ -92,7 +92,7 @@ export async function getPullRequest(
 }
 
 /**
- * Fetches key project context files from the repo root.
+ * Fetches key project context files from the repo root in parallel.
  * These are used by expert agents to understand the project's tech stack
  * and avoid suggesting tools/patterns not in use.
  *
@@ -102,9 +102,7 @@ export async function fetchRepoContext(
     repoFullName: string,
     token: string
 ): Promise<string> {
-    const contextParts: string[] = [];
-
-    for (const filename of CONTEXT_FILES) {
+    const fetchPromises = CONTEXT_FILES.map(async (filename) => {
         try {
             const url = `${GITHUB_API_BASE}/repos/${repoFullName}/contents/${filename}`;
             const response = await fetch(url, {
@@ -114,7 +112,7 @@ export async function fetchRepoContext(
                 },
             });
 
-            if (!response.ok) continue; // File doesn't exist, skip silently
+            if (!response.ok) return null; // File doesn't exist, skip silently
 
             const content = await response.text();
 
@@ -123,12 +121,14 @@ export async function fetchRepoContext(
                 ? content.slice(0, 5000) + '\n[... truncated ...]'
                 : content;
 
-            contextParts.push(`### ${filename}\n\`\`\`\n${trimmedContent}\n\`\`\``);
+            return `### ${filename}\n\`\`\`\n${trimmedContent}\n\`\`\``;
         } catch {
-            // Non-fatal: skip files that can't be fetched
-            continue;
+            return null; // Non-fatal
         }
-    }
+    });
+
+    const results = await Promise.all(fetchPromises);
+    const contextParts = results.filter((part): part is string => part !== null);
 
     if (contextParts.length === 0) {
         return '_No project context files found._';
@@ -240,12 +240,20 @@ export function classifyFiles(files: GitHubPRFile[]): ClassifiedFiles {
 // ---------------------------------------------------------------------------
 
 /**
- * Fetches the raw content of a file from its raw_url.
+ * Fetches the raw content of a file.
+ * Rewrites github.com/raw/ to raw.githubusercontent.com to avoid 302 Redirects
+ * which consume an extra Cloudflare subrequest!
  * Returns null if the file is too large or the request fails.
  */
 export async function fetchFileContent(rawUrl: string, token: string): Promise<string | null> {
     try {
-        const response = await fetch(rawUrl, { headers: githubHeaders(token) });
+        // rawUrl looks like: https://github.com/owner/repo/raw/sha/filename
+        // Transform to: https://raw.githubusercontent.com/owner/repo/sha/filename
+        const directUrl = rawUrl
+            .replace('https://github.com/', 'https://raw.githubusercontent.com/')
+            .replace('/raw/', '/');
+
+        const response = await fetch(directUrl, { headers: githubHeaders(token) });
 
         if (!response.ok) return null;
 
