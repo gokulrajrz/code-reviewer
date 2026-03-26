@@ -47,24 +47,6 @@ export interface ReviewFinding {
     category: FindingCategory;
 }
 
-/**
- * The JSON schema that chunk reviewers (Map phase) must output.
- */
-export interface ChunkReviewOutput {
-    findings: ReviewFinding[];
-}
-
-/**
- * Result of processing a single chunk, including error recovery metadata.
- */
-export interface ChunkReviewResult {
-    /** Zero-based index of the chunk */
-    chunkIndex: number;
-    /** Parsed findings from the LLM */
-    findings: ReviewFinding[];
-    /** If the chunk failed, the error message */
-    error?: string;
-}
 
 /**
  * The payload sent to the synthesizer LLM (Reduce phase).

@@ -86,22 +86,3 @@ ${synthesizerPayload}
     return textBlock.text;
 }
 
-// ---------------------------------------------------------------------------
-// Legacy (kept for backward compatibility during migration)
-// ---------------------------------------------------------------------------
-
-/**
- * @deprecated Use chunkReviewWithClaude + synthesizeWithClaude instead.
- */
-export async function reviewWithClaude(
-    reviewContext: string,
-    prTitle: string,
-    apiKey: string,
-    signal?: AbortSignal
-): Promise<string> {
-    return synthesizeWithClaude(
-        `PR Title: ${prTitle}\n\n${reviewContext}`,
-        apiKey,
-        signal
-    );
-}

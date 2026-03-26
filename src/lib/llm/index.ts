@@ -1,8 +1,8 @@
 import type { AIProvider, Env } from '../../types/env';
 import type { ReviewFinding } from '../../types/review';
 import { DEFAULT_AI_PROVIDER } from '../../config/constants';
-import { chunkReviewWithClaude, synthesizeWithClaude, reviewWithClaude } from './claude';
-import { chunkReviewWithGemini, synthesizeWithGemini, reviewWithGemini } from './gemini';
+import { chunkReviewWithClaude, synthesizeWithClaude } from './claude';
+import { chunkReviewWithGemini, synthesizeWithGemini } from './gemini';
 import { parseFindings } from './parse-findings';
 
 // ---------------------------------------------------------------------------
@@ -65,27 +65,3 @@ export async function callSynthesizer(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Legacy Dispatcher (backward compatibility)
-// ---------------------------------------------------------------------------
-
-/**
- * @deprecated Use callChunkReview + callSynthesizer instead.
- * Kept for any code paths that haven't been migrated yet.
- */
-export async function callLLM(
-    reviewContext: string,
-    prTitle: string,
-    env: Env,
-    signal?: AbortSignal
-): Promise<string> {
-    const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
-
-    switch (provider) {
-        case 'gemini':
-            return reviewWithGemini(reviewContext, prTitle, env.GEMINI_API_KEY, signal);
-        case 'claude':
-        default:
-            return reviewWithClaude(reviewContext, prTitle, env.ANTHROPIC_API_KEY, signal);
-    }
-}

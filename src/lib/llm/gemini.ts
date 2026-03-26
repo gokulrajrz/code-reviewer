@@ -94,22 +94,3 @@ ${synthesizerPayload}
     return text;
 }
 
-// ---------------------------------------------------------------------------
-// Legacy (kept for backward compatibility during migration)
-// ---------------------------------------------------------------------------
-
-/**
- * @deprecated Use chunkReviewWithGemini + synthesizeWithGemini instead.
- */
-export async function reviewWithGemini(
-    reviewContext: string,
-    prTitle: string,
-    apiKey: string,
-    signal?: AbortSignal
-): Promise<string> {
-    return synthesizeWithGemini(
-        `PR Title: ${prTitle}\n\n${reviewContext}`,
-        apiKey,
-        signal
-    );
-}

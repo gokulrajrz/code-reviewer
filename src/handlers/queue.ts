@@ -97,74 +97,7 @@ function buildSynthesizerPayload(
     return payload;
 }
 
-/**
- * Generates a fallback markdown review from raw findings when the synthesizer fails.
- * This ensures we always post something useful, even if the Reduce phase crashes.
- */
-function buildFallbackReview(
-    findings: ReviewFinding[],
-    totalChunks: number,
-    failedChunks: number
-): string {
-    const severityEmoji: Record<string, string> = {
-        critical: '🔴 CRITICAL',
-        high: '🟠 HIGH',
-        medium: '🟡 MEDIUM',
-        low: '🟢 LOW',
-    };
 
-    let md = `> ⚠️ **Notice:** The AI synthesizer was unable to produce a cohesive review. `;
-    md += `Below are the raw findings from ${totalChunks} review chunks`;
-    if (failedChunks > 0) md += ` (${failedChunks} chunks failed)`;
-    md += `.\n\n---\n\n`;
-
-    if (findings.length === 0) {
-        md += `## ✅ No Issues Found\n\nThe automated inspectors found no actionable issues in this PR.\n\n`;
-        md += `Overall verdict: **Approve**\n`;
-        return md;
-    }
-
-    // Group by file
-    const byFile = new Map<string, ReviewFinding[]>();
-    for (const f of findings) {
-        const existing = byFile.get(f.file) ?? [];
-        existing.push(f);
-        byFile.set(f.file, existing);
-    }
-
-    md += `## 🐛 Findings\n\n`;
-    for (const [file, fileFindings] of byFile) {
-        for (const f of fileFindings) {
-            md += `### [${severityEmoji[f.severity] ?? f.severity}] File: \`${file}\` — ${f.title}\n\n`;
-            md += `**Issue:** ${f.issue}\n\n`;
-            if (f.currentCode) {
-                md += `**Current:**\n\`\`\`tsx\n${f.currentCode}\n\`\`\`\n\n`;
-            }
-            if (f.suggestedCode) {
-                md += `**Suggested:**\n\`\`\`tsx\n${f.suggestedCode}\n\`\`\`\n\n`;
-            }
-            md += `---\n\n`;
-        }
-    }
-
-    // Summary table
-    const counts = { critical: 0, high: 0, medium: 0, low: 0 };
-    for (const f of findings) {
-        if (f.severity in counts) counts[f.severity as keyof typeof counts]++;
-    }
-
-    md += `## ✅ Summary\n`;
-    md += `| Category | Count |\n|---|---|\n`;
-    md += `| 🔴 Critical | ${counts.critical} |\n`;
-    md += `| 🟠 High | ${counts.high} |\n`;
-    md += `| 🟡 Medium | ${counts.medium} |\n`;
-    md += `| 🟢 Low | ${counts.low} |\n\n`;
-
-    const verdict = (counts.critical > 0 || counts.high > 0) ? '**Request Changes**' : '**Approve**';
-    md += `Overall verdict: ${verdict}\n`;
-
-    return md;
-}
 
 /**
  * Background Queue Consumer Handler.
@@ -327,10 +260,7 @@ export async function queueHandler(
             } catch (error) {
                 const errMsg = error instanceof Error ? error.message : String(error);
                 console.error(`[queue] [REDUCE] ⚠️ Synthesizer failed: ${errMsg}`);
-                console.log(`[queue] [REDUCE] Falling back to raw findings markdown...`);
-
-                // Graceful fallback: build a basic markdown directly from findings
-                finalReview = buildFallbackReview(deduplicated, chunks.length, failedChunks);
+                throw new Error(`Synthesizer failed to generate review: ${errMsg}`);
             }
 
             // Add metadata banner for multi-chunk reviews

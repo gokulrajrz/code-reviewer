@@ -1,4 +1,4 @@
-import type { ReviewFinding, ChunkReviewOutput } from '../../types/review';
+import type { ReviewFinding } from '../../types/review';
 import { MAX_FINDINGS_PER_CHUNK } from '../../config/constants';
 
 /**

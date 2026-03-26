@@ -3,8 +3,6 @@
  *
  * Phase 1 (Map): CHUNK_REVIEWER_PROMPT — Extracts structured JSON findings from code chunks.
  * Phase 2 (Reduce): SYNTHESIZER_PROMPT — Aggregates findings into a cohesive markdown review.
- *
- * The old monolithic SYSTEM_PROMPT is preserved as an alias for backward compatibility.
  */
 
 // ---------------------------------------------------------------------------
@@ -221,12 +219,4 @@ RULES
 - IMPORTANT: your output must contain the literal text "**Request Changes**" in the verdict line if any critical/high issues exist. This text is parsed programmatically to determine the Check Run conclusion.
 `.trim();
 
-// ---------------------------------------------------------------------------
-// Legacy Alias (backward compatibility)
-// ---------------------------------------------------------------------------
 
-/**
- * @deprecated Use CHUNK_REVIEWER_PROMPT and SYNTHESIZER_PROMPT instead.
- * Kept as an alias for any external references during migration.
- */
-export const SYSTEM_PROMPT = SYNTHESIZER_PROMPT;
