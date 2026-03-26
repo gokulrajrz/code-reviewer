@@ -1,5 +1,6 @@
 import type { ReviewFinding } from '../../types/review';
 import { MAX_FINDINGS_PER_CHUNK } from '../../config/constants';
+import { logger } from '../logger';
 
 /**
  * Defensive JSON parser for chunk reviewer LLM output.
@@ -19,13 +20,15 @@ export function parseFindings(rawOutput: string): ReviewFinding[] {
     try {
         parsed = JSON.parse(cleaned);
     } catch {
-        console.error('[parse-findings] Failed to parse LLM JSON output. Raw (first 500 chars):', rawOutput.slice(0, 500));
+        logger.error('Failed to parse LLM JSON output', undefined, {
+            rawOutput: rawOutput.slice(0, 500),
+        });
         return [];
     }
 
     // Validate top-level structure
     if (!parsed || typeof parsed !== 'object') {
-        console.error('[parse-findings] Parsed output is not an object');
+        logger.error('Parsed output is not an object');
         return [];
     }
 
@@ -38,7 +41,7 @@ export function parseFindings(rawOutput: string): ReviewFinding[] {
     } else if (Array.isArray(parsed)) {
         rawFindings = parsed as unknown[];
     } else {
-        console.error('[parse-findings] No "findings" array found in parsed output');
+        logger.error('No "findings" array found in parsed output');
         return [];
     }
 
@@ -50,7 +53,9 @@ export function parseFindings(rawOutput: string): ReviewFinding[] {
             validated.push(finding);
         }
         if (validated.length >= MAX_FINDINGS_PER_CHUNK) {
-            console.warn(`[parse-findings] Hit MAX_FINDINGS_PER_CHUNK (${MAX_FINDINGS_PER_CHUNK}), truncating`);
+            logger.warn('Hit MAX_FINDINGS_PER_CHUNK, truncating', {
+                max: MAX_FINDINGS_PER_CHUNK,
+            });
             break;
         }
     }

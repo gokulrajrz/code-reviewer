@@ -45,5 +45,14 @@
 				"max_retries": 1
 			}
 		]
-	}
+	},
+	/**
+	 * KV Namespace for storing usage metrics
+	 */
+	"kv_namespaces": [
+		{
+			"binding": "USAGE_METRICS",
+			"id": "2825e1ef509f4069b316c5e96d1dd61b"
+		}
+	]
 }

@@ -38,6 +38,7 @@ GitHub PR Event → Webhook POST → fetch handler
 - **Aggressive Noise Filtering**: Automatically ignores >30 extensions (`.lock`, `.svg`, `.map`) and vendor directories (`node_modules/`, `dist/`), saving API costs and LLM context.
 - **Execution Limits Protection**: Hard limits on generation chunks (max 10) to mathematically prevent Cloudflare's 50-subrequest free-tier ceiling. `AbortSignal` implementation forcibly tears down hung sockets during LLM timeouts to avoid connection exhaustion cascades.
 - **Multi-LLM Support**: Switch seamlessly between Claude 3.5 Sonnet (default) and Gemini 1.5 Pro via environment variables.
+- **📊 Token Usage & Cost Tracking**: Automatic per-PR token usage tracking with detailed cost estimates, stored in Cloudflare KV. Query via REST API or view in the included dashboard. [See USAGE_TRACKING.md](./USAGE_TRACKING.md)
 
 ---
 
@@ -79,7 +80,19 @@ npm install
 npx wrangler queues create code-reviewer-queue
 ```
 
-### 5. Configure Secrets
+### 5. Create KV Namespace for Usage Tracking
+
+```bash
+# Production namespace
+npx wrangler kv:namespace create USAGE_METRICS
+
+# Preview namespace for development
+npx wrangler kv:namespace create USAGE_METRICS --preview
+```
+
+Update the IDs in `wrangler.jsonc` with the output from these commands.
+
+### 6. Configure Secrets
 
 ```bash
 npx wrangler secret put ANTHROPIC_API_KEY
@@ -90,7 +103,13 @@ npx wrangler secret put GITHUB_APP_INSTALLATION_ID
 npx wrangler secret put GITHUB_WEBHOOK_SECRET
 ```
 
-### 6. Local Development
+### 7. Generate Types
+
+```bash
+npx wrangler types
+```
+
+### 8. Local Development
 
 ```bash
 cp .dev.vars.example .dev.vars
@@ -98,7 +117,7 @@ cp .dev.vars.example .dev.vars
 npm run dev
 ```
 
-### 7. Deploy
+### 9. Deploy
 
 ```bash
 npm run deploy
@@ -157,9 +176,46 @@ src/
 └── index.ts                # Worker entry point (ExportedHandler)
 ```
 
----
+## 📊 Usage Tracking & Cost Monitoring
 
-## Running Tests
+Track detailed token usage and costs for every PR review. See [docs/README.md](./docs/README.md) for complete documentation.
+
+### Quick Start
+
+Query usage for a specific PR:
+```bash
+curl https://your-worker.workers.dev/usage/owner/repo/pr/123
+```
+
+Get repository statistics:
+```bash
+curl https://your-worker.workers.dev/usage/owner/repo/stats
+```
+
+Or use the included tools:
+```bash
+# Command-line script
+./scripts/check-usage.sh stats myorg myrepo
+
+# Visual dashboard (open in browser)
+open scripts/usage-dashboard.html
+```
+
+### Documentation
+
+- **[Quick Start](./docs/QUICKSTART.md)** - Get started in 5 minutes
+- **[User Guide](./docs/USER_GUIDE.md)** - Complete API reference
+- **[Deployment](./docs/DEPLOYMENT.md)** - Setup instructions
+- **[Architecture](./docs/ARCHITECTURE.md)** - Technical details
+
+### API Endpoints
+
+- `GET /usage/{owner}/{repo}/pr/{prNumber}` - Latest PR usage
+- `GET /usage/{owner}/{repo}/pr/{prNumber}?sha={sha}` - Specific commit
+- `GET /usage/{owner}/{repo}?limit=50` - List all reviews
+- `GET /usage/{owner}/{repo}/stats` - Aggregate statistics
+
+---
 
 ```bash
 npm run test

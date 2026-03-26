@@ -3,6 +3,8 @@
  * Uses the Web Crypto API available natively in Cloudflare Workers — no external deps needed.
  */
 
+import { logger } from './logger';
+
 /**
  * Verifies that an incoming GitHub webhook request was signed with the correct secret.
  *
@@ -25,7 +27,7 @@ export async function verifyWebhookSignature(
     }
 
     if (!secret || !secret.trim()) {
-        console.error('[security] GITHUB_WEBHOOK_SECRET is missing or empty — cannot verify signature');
+        logger.error('GITHUB_WEBHOOK_SECRET is missing or empty — cannot verify signature');
         return false;
     }
 
@@ -57,7 +59,7 @@ export async function verifyWebhookSignature(
         return timingSafeEqual(computedHex, expectedHex);
     } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
-        console.error(`[security] Signature verification failed unexpectedly: ${errMsg}`);
+        logger.error('Signature verification failed unexpectedly', error instanceof Error ? error : undefined);
         return false;
     }
 }

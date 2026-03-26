@@ -1,0 +1,151 @@
+import { LLMProviderAdapter, type LLMProviderConfig, type LLMResponse, type ChunkReviewRequest, type SynthesisRequest } from '../adapter';
+import { CHUNK_REVIEWER_PROMPT, SYNTHESIZER_PROMPT } from '../../../config/system-prompt';
+import { logger } from '../../logger';
+import type { TokenUsage } from '../../../types/usage';
+
+/**
+ * Anthropic Claude LLM Provider Adapter
+ * Implements the adapter pattern for Anthropic's Claude API.
+ */
+export class ClaudeAdapter extends LLMProviderAdapter {
+    private readonly model: string;
+    private readonly maxTokens: number;
+    private readonly temperature: number;
+
+    constructor(config: LLMProviderConfig) {
+        super(config);
+        this.model = config.model ?? 'claude-3-sonnet-20240229';
+        this.maxTokens = config.maxTokens ?? 4096;
+        this.temperature = config.temperature ?? 0.1;
+    }
+
+    getProviderName(): string {
+        return 'anthropic';
+    }
+
+    getModelName(): string {
+        return this.model;
+    }
+
+    async reviewChunk(request: ChunkReviewRequest, signal?: AbortSignal): Promise<LLMResponse> {
+        const { chunkContent, prTitle, chunkLabel } = request;
+
+        const userPrompt = `Pull Request Title: "${prTitle}"
+
+Chunk ${chunkLabel}:
+\`\`\`
+${chunkContent}
+\`\`\`
+
+Analyze this code chunk for issues. Return findings as JSON array.`;
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'x-api-key': this.config.apiKey,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: this.model,
+                max_tokens: this.maxTokens,
+                temperature: this.temperature,
+                system: CHUNK_REVIEWER_PROMPT,
+                messages: [{ role: 'user', content: userPrompt }],
+            }),
+            signal,
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            // Sanitize error message to prevent potential API key leaks
+            const sanitizedError = errorText
+                .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
+                .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
+                .substring(0, 500); // Limit error text length
+            throw new Error(`Claude API error: ${response.status} ${response.statusText} - ${sanitizedError}`);
+        }
+
+        const data = await response.json() as {
+            content: Array<{ type: string; text: string }>;
+            usage: { input_tokens: number; output_tokens: number };
+        };
+
+        const content = data.content.find(c => c.type === 'text')?.text ?? '';
+        
+        const usage: TokenUsage = {
+            inputTokens: data.usage.input_tokens,
+            outputTokens: data.usage.output_tokens,
+            totalTokens: data.usage.input_tokens + data.usage.output_tokens,
+        };
+
+        logger.debug('Claude chunk review completed', {
+            model: this.model,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            chunkLabel,
+        });
+
+        return { content, usage };
+    }
+
+    async synthesize(request: SynthesisRequest, signal?: AbortSignal): Promise<LLMResponse> {
+        const { payload } = request;
+
+        const userPrompt = `Synthesize these code review findings into a cohesive markdown report:
+
+${payload}`;
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'x-api-key': this.config.apiKey,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: this.model,
+                max_tokens: this.maxTokens,
+                temperature: this.temperature,
+                system: SYNTHESIZER_PROMPT,
+                messages: [{ role: 'user', content: userPrompt }],
+            }),
+            signal,
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            // Sanitize error message to prevent potential API key leaks
+            const sanitizedError = errorText
+                .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
+                .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
+                .substring(0, 500); // Limit error text length
+            throw new Error(`Claude API error: ${response.status} ${response.statusText} - ${sanitizedError}`);
+        }
+
+        const data = await response.json() as {
+            content: Array<{ type: string; text: string }>;
+            usage: { input_tokens: number; output_tokens: number };
+        };
+
+        const content = data.content.find(c => c.type === 'text')?.text ?? '';
+        
+        const usage: TokenUsage = {
+            inputTokens: data.usage.input_tokens,
+            outputTokens: data.usage.output_tokens,
+            totalTokens: data.usage.input_tokens + data.usage.output_tokens,
+        };
+
+        logger.debug('Claude synthesis completed', {
+            model: this.model,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+        });
+
+        return { content, usage };
+    }
+}
+
+// Register the adapter
+import { LLMProviderFactory } from '../adapter';
+LLMProviderFactory.registerProvider('claude', ClaudeAdapter);

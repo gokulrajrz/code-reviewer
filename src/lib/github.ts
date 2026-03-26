@@ -9,6 +9,8 @@ import {
     PRIORITY_EXTENSIONS,
     GLOBAL_CONTEXT_BUDGET_CHARS,
 } from '../config/constants';
+import { retryWithBackoff, circuitBreakers } from './retry';
+import { logger } from './logger';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 
@@ -29,38 +31,74 @@ function githubHeaders(token: string): HeadersInit {
  * Fetches ALL files changed in a Pull Request, handling GitHub pagination.
  * GitHub returns max 100 files per page and max 3000 total.
  * We cap at MAX_TOTAL_FILES to stay practical.
+ * Includes retry logic and circuit breaker protection.
  */
 export async function fetchChangedFiles(
     repoFullName: string,
     prNumber: number,
     token: string
 ): Promise<GitHubPRFile[]> {
-    const allFiles: GitHubPRFile[] = [];
-    let page = 1;
-
-    while (allFiles.length < MAX_TOTAL_FILES) {
-        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100&page=${page}`;
-        const response = await fetch(url, { headers: githubHeaders(token) });
-
-        if (!response.ok) {
-            throw new Error(`Failed to fetch PR files (page ${page}): ${response.status} ${response.statusText}`);
-        }
-
-        const files: GitHubPRFile[] = await response.json();
-
-        if (files.length === 0) break; // No more pages
-
-        allFiles.push(...files);
-        page++;
-
-        // GitHub caps at 3000 files; stop if we got fewer than 100 (last page)
-        if (files.length < 100) break;
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        throw new Error('GitHub API circuit breaker is OPEN - too many failures');
     }
 
-    // Filter out deleted files (they have no content to review)
-    return allFiles
-        .filter((f) => f.status !== 'removed')
-        .slice(0, MAX_TOTAL_FILES);
+    const executeFetch = async (): Promise<GitHubPRFile[]> => {
+        const allFiles: GitHubPRFile[] = [];
+        let page = 1;
+
+        while (allFiles.length < MAX_TOTAL_FILES) {
+            const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100&page=${page}`;
+            const response = await fetch(url, { headers: githubHeaders(token) });
+
+            if (!response.ok) {
+                throw new Error(`Failed to fetch PR files (page ${page}): ${response.status} ${response.statusText}`);
+            }
+
+            const files: GitHubPRFile[] = await response.json();
+
+            if (files.length === 0) break; // No more pages
+
+            allFiles.push(...files);
+            page++;
+
+            // GitHub caps at 3000 files; stop if we got fewer than 100 (last page)
+            if (files.length < 100) break;
+        }
+
+        // Filter out deleted files (they have no content to review)
+        return allFiles
+            .filter((f) => f.status !== 'removed')
+            .slice(0, MAX_TOTAL_FILES);
+    };
+
+    try {
+        const { result, attempts, totalDelayMs } = await retryWithBackoff(
+            executeFetch,
+            'GitHub fetch changed files',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`GitHub API call succeeded after ${attempts} attempts`, {
+                operation: 'fetchChangedFiles',
+                attempts,
+                totalDelayMs,
+            });
+        }
+
+        return result;
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        throw error;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +206,16 @@ export function classifyFiles(files: GitHubPRFile[]): ClassifiedFiles {
 /**
  * Fetches the raw content of a file from its raw_url.
  * Returns null if the file is too large or the request fails.
+ * Includes retry logic for transient failures.
  */
 export async function fetchFileContent(rawUrl: string, token: string): Promise<string | null> {
-    try {
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        logger.warn('GitHub API circuit breaker is OPEN, skipping file content fetch');
+        return null;
+    }
+
+    const executeFetch = async (): Promise<string | null> => {
         const response = await fetch(rawUrl, { headers: githubHeaders(token) });
 
         if (!response.ok) return null;
@@ -189,8 +234,25 @@ export async function fetchFileContent(rawUrl: string, token: string): Promise<s
         }
 
         return text;
-    } catch {
-        return null;
+    };
+
+    try {
+        const { result } = await retryWithBackoff(
+            executeFetch,
+            'GitHub fetch file content',
+            {
+                maxAttempts: 2, // Fewer retries for file content (not critical)
+                initialDelayMs: 500,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+        return result;
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        return null; // Fail gracefully - return null to use diff only
     }
 }
 
@@ -370,7 +432,10 @@ export async function buildReviewChunks(
     // Effective max for content (after global context is prepended)
     const effectiveMax = maxChunkChars - globalContext.length;
     if (effectiveMax < 10_000) {
-        console.warn(`[github] Global context is very large (${globalContext.length} chars), reducing effective chunk size`);
+        logger.warn('Global context is very large, reducing effective chunk size', {
+            globalContextLength: globalContext.length,
+            effectiveMax,
+        });
     }
 
     // ── Process Tier 1 files (full content, uses subrequests) ──
@@ -429,6 +494,7 @@ export async function buildReviewChunks(
 
 /**
  * Posts a review comment on a GitHub Pull Request.
+ * Includes retry logic for transient failures.
  */
 export async function postPRComment(
     repoFullName: string,
@@ -436,25 +502,58 @@ export async function postPRComment(
     body: string,
     token: string
 ): Promise<void> {
-    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/issues/${prNumber}/comments`;
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        logger.warn('GitHub API circuit breaker is OPEN, skipping PR comment');
+        throw new Error('GitHub API circuit breaker is OPEN');
+    }
 
-    // GitHub limits the body field to 65536 characters
-    const truncatedBody = body.length > 65000
-        ? body.slice(0, 65000) + '\n\n_[Comment truncated due to GitHub length limits]_'
-        : body;
+    const executePost = async (): Promise<void> => {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/issues/${prNumber}/comments`;
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            ...githubHeaders(token),
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ body: truncatedBody }),
-    });
+        // GitHub limits the body field to 65536 characters
+        const truncatedBody = body.length > 65000
+            ? body.slice(0, 65000) + '\n\n_[Comment truncated due to GitHub length limits]_'
+            : body;
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to post PR comment: ${response.status} — ${errorText}`);
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ body: truncatedBody }),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Failed to post PR comment: ${response.status} — ${errorText}`);
+        }
+    };
+
+    try {
+        const { attempts, totalDelayMs } = await retryWithBackoff(
+            executePost,
+            'GitHub post PR comment',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`PR comment posted after ${attempts} attempts`, {
+                attempts,
+                totalDelayMs,
+            });
+        }
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        throw error;
     }
 }
 
@@ -480,6 +579,7 @@ interface CheckRunResponse {
 /**
  * Creates a new Check Run on a commit.
  * Returns the check run ID for later updates.
+ * Includes retry logic and circuit breaker protection.
  */
 export async function createCheckRun(
     repoFullName: string,
@@ -491,58 +591,92 @@ export async function createCheckRun(
         summary?: string;
     }
 ): Promise<number> {
-    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs`;
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        throw new Error('GitHub API circuit breaker is OPEN - too many failures');
+    }
 
-    const body: Record<string, unknown> = {
-        name: 'AI Code Reviewer',
-        head_sha: headSha,
-        status: options.status,
+    const executeCreate = async (): Promise<number> => {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs`;
+
+        const body: Record<string, unknown> = {
+            name: 'AI Code Reviewer',
+            head_sha: headSha,
+            status: options.status,
+        };
+
+        if (options.conclusion) {
+            body.conclusion = options.conclusion;
+        }
+
+        if (options.summary || options.conclusion) {
+            body.output = {
+                title: options.conclusion === 'skipped'
+                    ? 'Review Skipped'
+                    : options.conclusion === 'success'
+                        ? 'Review Approved'
+                        : options.conclusion === 'failure'
+                            ? 'Changes Requested'
+                            : 'AI Code Review',
+                summary: options.summary ?? 'AI Code Review in progress...',
+            };
+        }
+
+        // If completed, record the completion timestamp
+        if (options.status === 'completed') {
+            body.completed_at = new Date().toISOString();
+        }
+        body.started_at = new Date().toISOString();
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Failed to create check run: ${response.status} — ${errorText}`);
+        }
+
+        const data: CheckRunResponse = await response.json();
+        return data.id;
     };
 
-    if (options.conclusion) {
-        body.conclusion = options.conclusion;
+    try {
+        const { result, attempts } = await retryWithBackoff(
+            executeCreate,
+            'GitHub create check run',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`Check run created after ${attempts} attempts`, {
+                checkRunId: result,
+                attempts,
+            });
+        }
+
+        return result;
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        throw error;
     }
-
-    if (options.summary || options.conclusion) {
-        body.output = {
-            title: options.conclusion === 'skipped'
-                ? 'Review Skipped'
-                : options.conclusion === 'success'
-                    ? 'Review Approved'
-                    : options.conclusion === 'failure'
-                        ? 'Changes Requested'
-                        : 'AI Code Review',
-            summary: options.summary ?? 'AI Code Review in progress...',
-        };
-    }
-
-    // If completed, record the completion timestamp
-    if (options.status === 'completed') {
-        body.completed_at = new Date().toISOString();
-    }
-    body.started_at = new Date().toISOString();
-
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            ...githubHeaders(token),
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to create check run: ${response.status} — ${errorText}`);
-    }
-
-    const data: CheckRunResponse = await response.json();
-    console.log(`[github] Created check run #${data.id} (status=${options.status}, conclusion=${options.conclusion ?? 'n/a'})`);
-    return data.id;
 }
 
 /**
  * Updates an existing Check Run with the final conclusion and summary.
+ * Includes retry logic for transient failures.
  */
 export async function updateCheckRun(
     repoFullName: string,
@@ -551,40 +685,74 @@ export async function updateCheckRun(
     conclusion: CheckRunConclusion,
     summary: string,
 ): Promise<void> {
-    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs/${checkRunId}`;
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        logger.warn('GitHub API circuit breaker is OPEN, skipping check run update');
+        return; // Non-critical: don't throw
+    }
 
-    const title = conclusion === 'success'
-        ? 'Review Approved'
-        : conclusion === 'failure'
-            ? 'Changes Requested'
-            : 'AI Code Review';
+    const executeUpdate = async (): Promise<void> => {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs/${checkRunId}`;
 
-    // GitHub limits the summary field to 65535 characters
-    const truncatedSummary = summary.length > 65000
-        ? summary.slice(0, 65000) + '\n\n_[Summary truncated due to length]_'
-        : summary;
+        const title = conclusion === 'success'
+            ? 'Review Approved'
+            : conclusion === 'failure'
+                ? 'Changes Requested'
+                : 'AI Code Review';
 
-    const response = await fetch(url, {
-        method: 'PATCH',
-        headers: {
-            ...githubHeaders(token),
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            status: 'completed',
-            conclusion,
-            completed_at: new Date().toISOString(),
-            output: {
-                title,
-                summary: truncatedSummary,
+        // GitHub limits the summary field to 65535 characters
+        const truncatedSummary = summary.length > 65000
+            ? summary.slice(0, 65000) + '\n\n_[Summary truncated due to length]_'
+            : summary;
+
+        const response = await fetch(url, {
+            method: 'PATCH',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
             },
-        }),
-    });
+            body: JSON.stringify({
+                status: 'completed',
+                conclusion,
+                completed_at: new Date().toISOString(),
+                output: {
+                    title,
+                    summary: truncatedSummary,
+                },
+            }),
+        });
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`[github] Failed to update check run: ${response.status} — ${errorText}`);
-    } else {
-        console.log(`[github] Updated check run #${checkRunId} → conclusion=${conclusion}`);
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Failed to update check run: ${response.status} — ${errorText}`);
+        }
+    };
+
+    try {
+        const { attempts } = await retryWithBackoff(
+            executeUpdate,
+            'GitHub update check run',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`Check run updated after ${attempts} attempts`, {
+                checkRunId,
+                attempts,
+            });
+        }
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        logger.error('Failed to update check run', error instanceof Error ? error : undefined, {
+            checkRunId,
+        });
+        // Non-critical: don't throw
     }
 }
