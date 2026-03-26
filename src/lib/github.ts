@@ -7,6 +7,7 @@ import {
     NOISE_FILENAMES,
     NOISE_DIRECTORIES,
     PRIORITY_EXTENSIONS,
+    GLOBAL_CONTEXT_BUDGET_CHARS,
 } from '../config/constants';
 
 const GITHUB_API_BASE = 'https://api.github.com';
@@ -194,7 +195,96 @@ export async function fetchFileContent(rawUrl: string, token: string): Promise<s
 }
 
 // ---------------------------------------------------------------------------
-// Tiered Chunk Building
+// Global PR Context (prepended to EVERY chunk)
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds a global context string that gets prepended to every chunk.
+ * This ensures every LLM call knows the full scope of the PR,
+ * even if it only sees a subset of the files.
+ */
+export function buildGlobalContext(classified: ClassifiedFiles): string {
+    const { tier1, tier2, skipped } = classified;
+    const allReviewable = [...tier1, ...tier2];
+
+    let ctx = `# Global PR Context\n\n`;
+    ctx += `> This context appears in every review chunk so you understand the full PR scope.\n\n`;
+    ctx += `## Files in This PR (${allReviewable.length} reviewable, ${skipped.length} skipped)\n\n`;
+
+    // Table header
+    ctx += `| Tier | File | Status | +/- |\n|---|---|---|---|\n`;
+
+    for (const f of tier1) {
+        ctx += `| 🔍 T1 | \`${f.filename}\` | ${f.status} | +${f.additions}/-${f.deletions} |\n`;
+    }
+    for (const f of tier2) {
+        ctx += `| 📄 T2 | \`${f.filename}\` | ${f.status} | +${f.additions}/-${f.deletions} |\n`;
+    }
+
+    if (skipped.length > 0) {
+        const preview = skipped.slice(0, 15).join(', ');
+        ctx += `\n> _Skipped (noise):_ ${preview}${skipped.length > 15 ? ` ... +${skipped.length - 15} more` : ''}\n`;
+    }
+
+    ctx += `\n---\n\n`;
+
+    // If the global context is too large (huge PRs), truncate the file list
+    if (ctx.length > GLOBAL_CONTEXT_BUDGET_CHARS) {
+        ctx = ctx.slice(0, GLOBAL_CONTEXT_BUDGET_CHARS - 100);
+        ctx += `\n\n_[... file list truncated — ${allReviewable.length} total files]_\n\n---\n\n`;
+    }
+
+    return ctx;
+}
+
+// ---------------------------------------------------------------------------
+// Safe File Splitting
+// ---------------------------------------------------------------------------
+
+/**
+ * Splits a large file block into multiple parts at line boundaries.
+ * Unlike the old approach, NO data is permanently lost.
+ *
+ * Each part is labeled: "Part 1 of N", "Part 2 of N", etc.
+ * so the LLM knows a file continues across chunks.
+ */
+function splitLargeFileBlock(
+    filename: string,
+    fileBlock: string,
+    maxChars: number
+): string[] {
+    const parts: string[] = [];
+    let remaining = fileBlock;
+
+    while (remaining.length > 0) {
+        if (remaining.length <= maxChars) {
+            parts.push(remaining);
+            break;
+        }
+
+        // Find the last newline before maxChars to avoid cutting mid-line
+        let splitPoint = remaining.lastIndexOf('\n', maxChars);
+        if (splitPoint <= 0) {
+            // No newline found? Force split at maxChars (extremely rare — binary or minified)
+            splitPoint = maxChars;
+        }
+
+        parts.push(remaining.slice(0, splitPoint));
+        remaining = remaining.slice(splitPoint);
+    }
+
+    // If we split, label each part
+    if (parts.length > 1) {
+        return parts.map((part, i) =>
+            `## ⚠️ FILE: \`${filename}\` — Part ${i + 1} of ${parts.length}\n\n${part}\n\n---\n\n`
+        );
+    }
+
+    return parts;
+}
+
+// ---------------------------------------------------------------------------
+// Tiered Chunk Building (Fixed)
 // ---------------------------------------------------------------------------
 
 /**
@@ -237,12 +327,23 @@ function buildTier2Block(file: GitHubPRFile): string {
     return block;
 }
 
+/** Return type for buildReviewChunks — includes global context for the synthesizer. */
+export interface ReviewChunksResult {
+    /** The code chunks to send to chunk reviewers (Map phase) */
+    chunks: string[];
+    /** The global PR context string (for use in the Reduce phase) */
+    globalContext: string;
+    /** All reviewable filenames (for the synthesizer payload) */
+    allFiles: string[];
+}
+
 /**
  * Builds review chunks using the tiered classification system.
  *
- * - Tier 1 files get full content + diff (uses subrequests)
- * - Tier 2 files get diff-only (zero subrequests)
- * - A summary header is prepended to the first chunk
+ * Key improvements over the old implementation:
+ * 1. Global context is prepended to EVERY chunk (not just the first)
+ * 2. Large files are split at line boundaries (never permanently truncated)
+ * 3. Returns structured metadata alongside chunks
  *
  * Chunks are split when they exceed `maxChunkChars`.
  */
@@ -250,40 +351,42 @@ export async function buildReviewChunks(
     classified: ClassifiedFiles,
     token: string,
     maxChunkChars: number
-): Promise<string[]> {
+): Promise<ReviewChunksResult> {
     const { tier1, tier2, skipped } = classified;
+    const globalContext = buildGlobalContext(classified);
+    const allFiles = [...tier1, ...tier2].map(f => f.filename);
+
     const chunks: string[] = [];
     let currentChunkText = '';
 
-    // ── Summary header ──
-    const totalReviewed = tier1.length + tier2.length;
-    let header = `# PR Review Context\n\n`;
-    header += `| Category | Count |\n|---|---|\n`;
-    header += `| 🔍 **Tier 1** (Full Content) | ${tier1.length} files |\n`;
-    header += `| 📄 **Tier 2** (Diff Only) | ${tier2.length} files |\n`;
-    header += `| ⏭️ **Skipped** (Noise) | ${skipped.length} files |\n`;
-    header += `| **Total Reviewed** | ${totalReviewed} files |\n\n`;
+    // Helper: flush current chunk text into the chunks array with global context
+    const flushChunk = () => {
+        if (currentChunkText) {
+            chunks.push(globalContext + currentChunkText);
+            currentChunkText = '';
+        }
+    };
 
-    if (skipped.length > 0) {
-        const skippedPreview = skipped.slice(0, 10).join(', ');
-        header += `> _Skipped files:_ ${skippedPreview}${skipped.length > 10 ? ` ... and ${skipped.length - 10} more` : ''}\n\n`;
+    // Effective max for content (after global context is prepended)
+    const effectiveMax = maxChunkChars - globalContext.length;
+    if (effectiveMax < 10_000) {
+        console.warn(`[github] Global context is very large (${globalContext.length} chars), reducing effective chunk size`);
     }
-
-    header += `---\n\n`;
-    currentChunkText = header;
 
     // ── Process Tier 1 files (full content, uses subrequests) ──
     for (const file of tier1) {
         const fileBlock = await buildTier1Block(file, token);
 
-        if (fileBlock.length > maxChunkChars) {
-            if (currentChunkText) {
-                chunks.push(currentChunkText);
-                currentChunkText = '';
+        if (fileBlock.length > effectiveMax) {
+            // File is larger than a single chunk — split it safely
+            flushChunk();
+            const parts = splitLargeFileBlock(file.filename, fileBlock, effectiveMax);
+            for (const part of parts) {
+                chunks.push(globalContext + part);
             }
-            chunks.push(fileBlock.slice(0, maxChunkChars) + '\n\n_[... file truncated due to size ...]_');
-        } else if (currentChunkText.length + fileBlock.length > maxChunkChars) {
-            chunks.push(currentChunkText);
+        } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
+            // Adding this file would exceed the chunk limit — start a new chunk
+            flushChunk();
             currentChunkText = fileBlock;
         } else {
             currentChunkText += fileBlock;
@@ -294,25 +397,30 @@ export async function buildReviewChunks(
     for (const file of tier2) {
         const fileBlock = buildTier2Block(file);
 
-        if (fileBlock.length > maxChunkChars) {
-            if (currentChunkText) {
-                chunks.push(currentChunkText);
-                currentChunkText = '';
+        if (fileBlock.length > effectiveMax) {
+            flushChunk();
+            const parts = splitLargeFileBlock(file.filename, fileBlock, effectiveMax);
+            for (const part of parts) {
+                chunks.push(globalContext + part);
             }
-            chunks.push(fileBlock.slice(0, maxChunkChars) + '\n\n_[... file truncated due to size ...]_');
-        } else if (currentChunkText.length + fileBlock.length > maxChunkChars) {
-            chunks.push(currentChunkText);
+        } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
+            flushChunk();
             currentChunkText = fileBlock;
         } else {
             currentChunkText += fileBlock;
         }
     }
 
-    if (currentChunkText) {
-        chunks.push(currentChunkText);
-    }
+    // Flush any remaining content
+    flushChunk();
 
-    return chunks.length > 0 ? chunks : ['No verifiable file changes found.'];
+    const finalChunks = chunks.length > 0 ? chunks : [globalContext + 'No verifiable file changes found.'];
+
+    return {
+        chunks: finalChunks,
+        globalContext,
+        allFiles,
+    };
 }
 
 // ---------------------------------------------------------------------------

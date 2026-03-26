@@ -1,5 +1,6 @@
 import type { Env, ReviewMessage } from '../types/env';
-import { MAX_CHUNK_CHARS, MAX_LLM_CHUNKS } from '../config/constants';
+import type { ReviewFinding, SynthesizerInput } from '../types/review';
+import { MAX_CHUNK_CHARS, MAX_LLM_CHUNKS, MAX_SYNTHESIZER_INPUT_CHARS } from '../config/constants';
 import {
     fetchChangedFiles,
     classifyFiles,
@@ -8,30 +9,29 @@ import {
     updateCheckRun,
 } from '../lib/github';
 import { getInstallationToken } from '../lib/github-auth';
-import { callLLM } from '../lib/llm/index';
+import { callChunkReview, callSynthesizer } from '../lib/llm/index';
 
 /** Maximum time (ms) to wait for a single LLM call before aborting. */
 const LLM_TIMEOUT_MS = 120_000;
 
 /**
- * Wraps an LLM call with a timeout guard.
- * If the LLM doesn't respond within `timeoutMs`, the promise rejects.
+ * Wraps an async function with a timeout guard.
+ * If it doesn't resolve within `timeoutMs`, the promise rejects.
  */
-async function callLLMWithTimeout(
-    context: string,
-    title: string,
-    env: Env,
-    timeoutMs: number
-): Promise<string> {
+async function withTimeout<T>(
+    fn: (signal: AbortSignal) => Promise<T>,
+    timeoutMs: number,
+    label: string
+): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
         const result = await Promise.race([
-            callLLM(context, title, env, controller.signal),
+            fn(controller.signal),
             new Promise<never>((_, reject) => {
                 controller.signal.addEventListener('abort', () =>
-                    reject(new Error(`LLM call timed out after ${timeoutMs / 1000}s`))
+                    reject(new Error(`${label} timed out after ${timeoutMs / 1000}s`))
                 );
             }),
         ]);
@@ -42,10 +42,138 @@ async function callLLMWithTimeout(
 }
 
 /**
+ * Builds the JSON payload string for the synthesizer (Reduce phase).
+ * Includes PR metadata and all findings from the Map phase.
+ */
+function buildSynthesizerPayload(
+    prTitle: string,
+    allFiles: string[],
+    skippedCount: number,
+    allFindings: ReviewFinding[],
+    totalChunks: number,
+    failedChunks: number
+): string {
+    const input: SynthesizerInput = {
+        prTitle,
+        allFiles,
+        skippedCount,
+        findings: allFindings,
+        totalChunks,
+        failedChunks,
+    };
+
+    let payload = JSON.stringify(input, null, 2);
+
+    // Guard against massive payloads that would blow the LLM context window
+    if (payload.length > MAX_SYNTHESIZER_INPUT_CHARS) {
+        console.warn(`[queue] Synthesizer payload too large (${payload.length} chars), truncating findings`);
+
+        // Sort findings: critical > high > medium > low, then truncate
+        const severityOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+        const sorted = [...allFindings].sort(
+            (a, b) => (severityOrder[a.severity] ?? 4) - (severityOrder[b.severity] ?? 4)
+        );
+
+        // Binary search for how many findings fit
+        let lo = 1, hi = sorted.length;
+        while (lo < hi) {
+            const mid = Math.ceil((lo + hi) / 2);
+            const test: SynthesizerInput = { ...input, findings: sorted.slice(0, mid) };
+            if (JSON.stringify(test).length <= MAX_SYNTHESIZER_INPUT_CHARS) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        const truncated: SynthesizerInput = {
+            ...input,
+            findings: sorted.slice(0, lo),
+        };
+        payload = JSON.stringify(truncated, null, 2);
+        console.log(`[queue] Truncated to ${lo}/${allFindings.length} findings (prioritized by severity)`);
+    }
+
+    return payload;
+}
+
+/**
+ * Generates a fallback markdown review from raw findings when the synthesizer fails.
+ * This ensures we always post something useful, even if the Reduce phase crashes.
+ */
+function buildFallbackReview(
+    findings: ReviewFinding[],
+    totalChunks: number,
+    failedChunks: number
+): string {
+    const severityEmoji: Record<string, string> = {
+        critical: '🔴 CRITICAL',
+        high: '🟠 HIGH',
+        medium: '🟡 MEDIUM',
+        low: '🟢 LOW',
+    };
+
+    let md = `> ⚠️ **Notice:** The AI synthesizer was unable to produce a cohesive review. `;
+    md += `Below are the raw findings from ${totalChunks} review chunks`;
+    if (failedChunks > 0) md += ` (${failedChunks} chunks failed)`;
+    md += `.\n\n---\n\n`;
+
+    if (findings.length === 0) {
+        md += `## ✅ No Issues Found\n\nThe automated inspectors found no actionable issues in this PR.\n\n`;
+        md += `Overall verdict: **Approve**\n`;
+        return md;
+    }
+
+    // Group by file
+    const byFile = new Map<string, ReviewFinding[]>();
+    for (const f of findings) {
+        const existing = byFile.get(f.file) ?? [];
+        existing.push(f);
+        byFile.set(f.file, existing);
+    }
+
+    md += `## 🐛 Findings\n\n`;
+    for (const [file, fileFindings] of byFile) {
+        for (const f of fileFindings) {
+            md += `### [${severityEmoji[f.severity] ?? f.severity}] File: \`${file}\` — ${f.title}\n\n`;
+            md += `**Issue:** ${f.issue}\n\n`;
+            if (f.currentCode) {
+                md += `**Current:**\n\`\`\`tsx\n${f.currentCode}\n\`\`\`\n\n`;
+            }
+            if (f.suggestedCode) {
+                md += `**Suggested:**\n\`\`\`tsx\n${f.suggestedCode}\n\`\`\`\n\n`;
+            }
+            md += `---\n\n`;
+        }
+    }
+
+    // Summary table
+    const counts = { critical: 0, high: 0, medium: 0, low: 0 };
+    for (const f of findings) {
+        if (f.severity in counts) counts[f.severity as keyof typeof counts]++;
+    }
+
+    md += `## ✅ Summary\n`;
+    md += `| Category | Count |\n|---|---|\n`;
+    md += `| 🔴 Critical | ${counts.critical} |\n`;
+    md += `| 🟠 High | ${counts.high} |\n`;
+    md += `| 🟡 Medium | ${counts.medium} |\n`;
+    md += `| 🟢 Low | ${counts.low} |\n\n`;
+
+    const verdict = (counts.critical > 0 || counts.high > 0) ? '**Request Changes**' : '**Approve**';
+    md += `Overall verdict: ${verdict}\n`;
+
+    return md;
+}
+
+/**
  * Background Queue Consumer Handler.
- * This function processes messages from Cloudflare Queues.
- * It is not bound by the 30-second webhook CPU limit. On the free tier,
- * a queue consumer can run for up to 15 minutes!
+ * Implements a Map-Reduce pipeline:
+ *   Step 1-4: Fetch files, classify, build chunks (unchanged)
+ *   Step 5: MAP — Each chunk → LLM → structured JSON findings
+ *   Step 6: Flatten & deduplicate findings
+ *   Step 7: REDUCE — All findings → LLM → final cohesive markdown
+ *   Step 8: Post to GitHub & update Check Run
  */
 export async function queueHandler(
     batch: MessageBatch<ReviewMessage>,
@@ -105,62 +233,118 @@ export async function queueHandler(
                 return;
             }
 
-            // ── Step 4: Build size-limited chunks ──
+            // ── Step 4: Build size-limited chunks with global context ──
             console.log(`[queue] Building review chunks (max ${MAX_CHUNK_CHARS} chars each)...`);
-            let chunks = await buildReviewChunks(classified, token, MAX_CHUNK_CHARS);
-            console.log(`[queue] ✓ Generated ${chunks.length} chunk(s) for review`);
+            const { chunks: rawChunks, globalContext, allFiles: reviewableFiles } =
+                await buildReviewChunks(classified, token, MAX_CHUNK_CHARS);
+
+            let chunks = rawChunks;
+            console.log(`[queue] ✓ Generated ${chunks.length} chunk(s) for review (global context: ${globalContext.length} chars)`);
 
             // Apply Hard Cap to prevent 50-subrequest limit exhaustion
+            // Budget: chunks × 1 (Map) + 1 (Reduce) + file fetches + auth ≤ 50
             if (chunks.length > MAX_LLM_CHUNKS) {
-                console.log(`[queue] ⚠️ Truncating chunks to ${MAX_LLM_CHUNKS} to prevent subrequest limit errors`);
+                console.log(`[queue] ⚠️ Truncating chunks from ${chunks.length} to ${MAX_LLM_CHUNKS} to prevent subrequest limit`);
                 chunks = chunks.slice(0, MAX_LLM_CHUNKS);
-                chunks[chunks.length - 1] += `\n\n> ⚠️ **Notice:** This Pull Request is extremely large. The AI review has been truncated to ${MAX_LLM_CHUNKS} parts to prevent execution limits from terminating the workflow. Consider breaking this PR into smaller, more focused pieces.`;
             }
 
-            // ── Step 5: Process each chunk sequentially with per-chunk error recovery ──
-            const reviews: string[] = [];
+            // ══════════════════════════════════════════════════════════════
+            // Step 5: MAP PHASE — Review each chunk, collect JSON findings
+            // ══════════════════════════════════════════════════════════════
+            console.log(`[queue] ═══ MAP PHASE: Processing ${chunks.length} chunks ═══`);
+
+            const allFindings: ReviewFinding[] = [];
             let failedChunks = 0;
 
             for (let i = 0; i < chunks.length; i++) {
-                const chunkContext = chunks[i];
-                const chunkLabel = chunks.length > 1 ? `(Part ${i + 1}/${chunks.length})` : '';
-                const chunkTitle = chunks.length > 1 ? `${title} ${chunkLabel}` : title;
+                const chunkContent = chunks[i];
+                const chunkLabel = `${i + 1}/${chunks.length}`;
 
-                console.log(`[queue] Calling LLM for chunk ${i + 1}/${chunks.length} (${chunkContext.length} chars)...`);
+                console.log(`[queue] [MAP] Chunk ${chunkLabel} (${chunkContent.length} chars) → LLM...`);
 
                 try {
-                    const chunkReview = await callLLMWithTimeout(chunkContext, chunkTitle, env, LLM_TIMEOUT_MS);
-                    console.log(`[queue] ✓ Chunk ${i + 1}/${chunks.length} review received (${chunkReview.length} chars)`);
-                    reviews.push(chunkReview);
+                    const findings = await withTimeout(
+                        (signal) => callChunkReview(chunkContent, title, chunkLabel, env, signal),
+                        LLM_TIMEOUT_MS,
+                        `Chunk ${chunkLabel}`
+                    );
+
+                    console.log(`[queue] [MAP] ✓ Chunk ${chunkLabel}: ${findings.length} findings`);
+                    allFindings.push(...findings);
                 } catch (error) {
                     failedChunks++;
                     const errMsg = error instanceof Error ? error.message : String(error);
-                    console.error(`[queue] ⚠️ Chunk ${i + 1}/${chunks.length} failed: ${errMsg}`);
-                    reviews.push(
-                        `## ⚠️ Review Part ${i + 1} Failed\n\n` +
-                        `The LLM was unable to review this section of the PR.\n\n` +
-                        `**Error:** \`${errMsg}\`\n\n` +
-                        `**Files in this chunk:**\n${chunkContext.slice(0, 500)}...\n`
-                    );
+                    console.error(`[queue] [MAP] ⚠️ Chunk ${chunkLabel} failed: ${errMsg}`);
+                    // Continue processing remaining chunks — graceful degradation
                 }
             }
 
-            // ── Step 6: Aggregate the reviews ──
-            let finalReview: string;
-            if (reviews.length === 0) {
-                finalReview = '## ❌ Review Failed\n\nAll review chunks failed. Please re-trigger the review by closing and reopening this PR.';
-            } else if (chunks.length > 1) {
-                finalReview = `> ℹ️ **Notice:** This PR was reviewed in **${chunks.length} parts** ` +
-                    `(${classified.tier1.length} files with full context, ${classified.tier2.length} diff-only` +
-                    `${failedChunks > 0 ? `, ${failedChunks} chunk(s) failed` : ''}).\n\n` +
-                    reviews.join('\n\n---\n\n');
-            } else {
-                finalReview = reviews[0];
+            console.log(
+                `[queue] ═══ MAP COMPLETE: ${allFindings.length} total findings, ` +
+                `${failedChunks}/${chunks.length} chunks failed ═══`
+            );
+
+            // ══════════════════════════════════════════════════════════════
+            // Step 6: Deduplicate findings (simple: same file + same title)
+            // ══════════════════════════════════════════════════════════════
+            const seen = new Set<string>();
+            const deduplicated: ReviewFinding[] = [];
+            for (const f of allFindings) {
+                const key = `${f.file}::${f.title.toLowerCase().trim()}`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    deduplicated.push(f);
+                }
             }
 
-            console.log(`[queue] ✓ Review aggregation complete (${finalReview.length} chars), posting to PR...`);
+            if (deduplicated.length < allFindings.length) {
+                console.log(`[queue] Deduplicated: ${allFindings.length} → ${deduplicated.length} findings`);
+            }
 
-            // ── Step 7: Post review comment to PR ──
+            // ══════════════════════════════════════════════════════════════
+            // Step 7: REDUCE PHASE — Synthesize final review
+            // ══════════════════════════════════════════════════════════════
+            console.log(`[queue] ═══ REDUCE PHASE: Synthesizing ${deduplicated.length} findings ═══`);
+
+            let finalReview: string;
+
+            const synthesizerPayload = buildSynthesizerPayload(
+                title,
+                reviewableFiles,
+                classified.skipped.length,
+                deduplicated,
+                chunks.length,
+                failedChunks
+            );
+
+            try {
+                finalReview = await withTimeout(
+                    (signal) => callSynthesizer(synthesizerPayload, env, signal),
+                    LLM_TIMEOUT_MS,
+                    'Synthesizer'
+                );
+                console.log(`[queue] [REDUCE] ✓ Synthesized review: ${finalReview.length} chars`);
+            } catch (error) {
+                const errMsg = error instanceof Error ? error.message : String(error);
+                console.error(`[queue] [REDUCE] ⚠️ Synthesizer failed: ${errMsg}`);
+                console.log(`[queue] [REDUCE] Falling back to raw findings markdown...`);
+
+                // Graceful fallback: build a basic markdown directly from findings
+                finalReview = buildFallbackReview(deduplicated, chunks.length, failedChunks);
+            }
+
+            // Add metadata banner for multi-chunk reviews
+            if (chunks.length > 1 || failedChunks > 0) {
+                const banner = `> ℹ️ **Review Pipeline:** ${chunks.length} chunks processed` +
+                    `${failedChunks > 0 ? ` (${failedChunks} failed)` : ''}, ` +
+                    `${deduplicated.length} findings synthesized from ` +
+                    `${classified.tier1.length} full-context + ${classified.tier2.length} diff-only files.\n\n`;
+                finalReview = banner + finalReview;
+            }
+
+            console.log(`[queue] ✓ Final review: ${finalReview.length} chars, posting to PR...`);
+
+            // ── Step 8: Post review comment to PR ──
             try {
                 await postPRComment(repoFullName, prNumber, finalReview, token);
                 console.log(`[queue] ✓ Review comment posted to PR #${prNumber}`);
@@ -169,9 +353,9 @@ export async function queueHandler(
                 console.error(`[queue] ⚠️ Failed to post review comment: ${errMsg}`);
             }
 
-            // ── Step 8: Determine conclusion and update Check Run ──
-            const allChunksFailed = failedChunks === chunks.length;
-            const hasRequestedChanges = finalReview.includes('**Request Changes**') || finalReview.includes('Request Changes');
+            // ── Step 9: Determine conclusion and update Check Run ──
+            const allChunksFailed = failedChunks === chunks.length && chunks.length > 0;
+            const hasRequestedChanges = finalReview.includes('**Request Changes**');
             const conclusion = allChunksFailed ? 'failure' : hasRequestedChanges ? 'failure' : 'success';
 
             if (checkRunId) {

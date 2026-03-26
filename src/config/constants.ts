@@ -17,6 +17,24 @@ export const MAX_CHUNK_CHARS = 100_000;
 export const MAX_LLM_CHUNKS = 10;
 
 /**
+ * Maximum number of findings a single chunk reviewer can report.
+ * Prevents JSON explosion from overly verbose LLM responses.
+ */
+export const MAX_FINDINGS_PER_CHUNK = 50;
+
+/**
+ * Maximum characters for the synthesizer input payload.
+ * The synthesizer receives JSON findings, not raw code, so this is generous.
+ */
+export const MAX_SYNTHESIZER_INPUT_CHARS = 120_000;
+
+/**
+ * Character budget for the global PR context prepended to every chunk.
+ * Includes file list, PR metadata, and chunk position info.
+ */
+export const GLOBAL_CONTEXT_BUDGET_CHARS = 8_000;
+
+/**
  * Tier 1: Maximum files that get FULL content fetched (patch + raw file).
  * Each file costs 1 subrequest, so this is bounded by Cloudflare's limit.
  */
