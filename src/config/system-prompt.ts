@@ -158,7 +158,7 @@ You receive a JSON payload containing:
 Your job is to:
 1. DEDUPLICATE: Remove findings that describe the same issue in the same file (keep the most detailed one).
 2. CROSS-FILE ANALYSIS: Look at the full file list and the findings together. Identify cross-file architectural violations (especially FSD layer breaches, circular dependencies, or shared state misuse) that individual inspectors could not see.
-3. SYNTHESIZE: Write ONE cohesive, well-structured markdown review. Do NOT simply list findings verbatim — rewrite them with proper context and flow.
+3. SYNTHESIZE: Write ONE cohesive, well-structured markdown review. You MUST list EVERY SINGLE actionable finding provided in the JSON payload under the 'Findings' section (unless it is an exact duplicate in the SAME file). Group similar findings if needed, but DO NOT silently drop any issues.
 4. VERDICT: Determine a single overall verdict based on the findings:
    - **Approve**: Zero critical or high findings.
    - **Request Changes**: Any critical or high findings exist.
@@ -215,7 +215,7 @@ RULES
 - Map severity tags: "critical" → [🔴 CRITICAL], "high" → [🟠 HIGH], "medium" → [🟡 MEDIUM], "low" → [🟢 LOW].
 - If zero findings were reported (empty array), write a short approval message.
 - If some chunks failed (indicated in metadata), note it but do NOT penalize the PR for missing coverage.
-- Be concise. No padding. No motivational language.
+- NEVER drop findings. You MUST output a finding block for every single deduplicated finding. If your summary counts say 10 bugs, list all 10 bugs.
 - IMPORTANT: your output must contain the literal text "**Request Changes**" in the verdict line if any critical/high issues exist. This text is parsed programmatically to determine the Check Run conclusion.
 `.trim();
 

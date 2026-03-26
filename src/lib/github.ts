@@ -437,13 +437,19 @@ export async function postPRComment(
     token: string
 ): Promise<void> {
     const url = `${GITHUB_API_BASE}/repos/${repoFullName}/issues/${prNumber}/comments`;
+
+    // GitHub limits the body field to 65536 characters
+    const truncatedBody = body.length > 65000
+        ? body.slice(0, 65000) + '\n\n_[Comment truncated due to GitHub length limits]_'
+        : body;
+
     const response = await fetch(url, {
         method: 'POST',
         headers: {
             ...githubHeaders(token),
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({ body: truncatedBody }),
     });
 
     if (!response.ok) {
