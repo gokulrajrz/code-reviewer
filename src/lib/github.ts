@@ -11,6 +11,7 @@ import {
 } from '../config/constants';
 import { retryWithBackoff, circuitBreakers } from './retry';
 import { logger } from './logger';
+import { RateLimitError } from './errors';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 
@@ -52,7 +53,16 @@ export async function fetchChangedFiles(
             const response = await fetch(url, { headers: githubHeaders(token) });
 
             if (!response.ok) {
-                throw new Error(`Failed to fetch PR files (page ${page}): ${response.status} ${response.statusText}`);
+                // Extract retry-after header for rate limit errors
+                const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+                const errorMessage = `Failed to fetch PR files (page ${page}): ${response.status} ${response.statusText}`;
+                if (response.status === 429 && retryAfter) {
+                    const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                    if (!isNaN(retryAfterMs)) {
+                        throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                    }
+                }
+                throw new Error(errorMessage);
             }
 
             const files: GitHubPRFile[] = await response.json();
@@ -218,7 +228,18 @@ export async function fetchFileContent(rawUrl: string, token: string): Promise<s
     const executeFetch = async (): Promise<string | null> => {
         const response = await fetch(rawUrl, { headers: githubHeaders(token) });
 
-        if (!response.ok) return null;
+        if (!response.ok) {
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to fetch file content: ${response.status} ${response.statusText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            return null;
+        }
 
         // Guard against massive files
         const contentLength = response.headers.get('Content-Length');
@@ -527,7 +548,16 @@ export async function postPRComment(
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`Failed to post PR comment: ${response.status} — ${errorText}`);
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to post PR comment: ${response.status} — ${errorText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
         }
     };
 
@@ -639,7 +669,16 @@ export async function createCheckRun(
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`Failed to create check run: ${response.status} — ${errorText}`);
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to create check run: ${response.status} — ${errorText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
         }
 
         const data: CheckRunResponse = await response.json();
@@ -724,7 +763,16 @@ export async function updateCheckRun(
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`Failed to update check run: ${response.status} — ${errorText}`);
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to update check run: ${response.status} — ${errorText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
         }
     };
 

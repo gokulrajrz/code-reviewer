@@ -55,7 +55,11 @@ export class AuthenticationError extends UsageTrackingError {
 }
 
 export class RateLimitError extends UsageTrackingError {
-    constructor(message: string, context?: Record<string, unknown>) {
+    constructor(
+        message: string,
+        context?: Record<string, unknown>,
+        public readonly retryAfterMs?: number
+    ) {
         super(message, 'RATE_LIMIT_EXCEEDED', 429, context);
         this.name = 'RateLimitError';
     }

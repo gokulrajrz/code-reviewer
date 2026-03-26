@@ -171,7 +171,7 @@ export function getModelName(provider: AIProvider): string {
         return adapter.getModelName();
     } catch {
         // Fallback to default models if adapter not found
-        return provider === 'gemini' ? 'gemini-1.5-flash' : 'claude-3-sonnet-20240229';
+        return provider === 'gemini' ? 'gemini-1.5-flash' : 'claude-haiku-4-5-20251001';
     }
 }
 

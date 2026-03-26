@@ -1,6 +1,7 @@
 import { LLMProviderAdapter, type LLMProviderConfig, type LLMResponse, type ChunkReviewRequest, type SynthesisRequest } from '../adapter';
 import { CHUNK_REVIEWER_PROMPT, SYNTHESIZER_PROMPT } from '../../../config/system-prompt';
 import { logger } from '../../logger';
+import { RateLimitError } from '../../errors';
 import type { TokenUsage } from '../../../types/usage';
 
 /**
@@ -14,7 +15,7 @@ export class ClaudeAdapter extends LLMProviderAdapter {
 
     constructor(config: LLMProviderConfig) {
         super(config);
-        this.model = config.model ?? 'claude-3-sonnet-20240229';
+        this.model = config.model ?? 'claude-haiku-4-5-20251001';
         this.maxTokens = config.maxTokens ?? 4096;
         this.temperature = config.temperature ?? 0.1;
     }
@@ -58,12 +59,22 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
 
         if (!response.ok) {
             const errorText = await response.text();
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
             // Sanitize error message to prevent potential API key leaks
             const sanitizedError = errorText
                 .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
                 .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
                 .substring(0, 500); // Limit error text length
-            throw new Error(`Claude API error: ${response.status} ${response.statusText} - ${sanitizedError}`);
+            const errorMessage = `Claude API error: ${response.status} ${response.statusText} - ${sanitizedError}`;
+            // Throw RateLimitError for 429 responses with retry-after header
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
         }
 
         const data = await response.json() as {
@@ -115,12 +126,22 @@ ${payload}`;
 
         if (!response.ok) {
             const errorText = await response.text();
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
             // Sanitize error message to prevent potential API key leaks
             const sanitizedError = errorText
                 .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
                 .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
                 .substring(0, 500); // Limit error text length
-            throw new Error(`Claude API error: ${response.status} ${response.statusText} - ${sanitizedError}`);
+            const errorMessage = `Claude API error: ${response.status} ${response.statusText} - ${sanitizedError}`;
+            // Throw RateLimitError for 429 responses with retry-after header
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
         }
 
         const data = await response.json() as {

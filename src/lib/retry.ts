@@ -4,6 +4,7 @@
  */
 
 import { logger } from './logger';
+import { RateLimitError } from './errors';
 
 export interface RetryConfig {
     /**
@@ -34,6 +35,10 @@ export interface RetryConfig {
      * Custom function to determine if error is retryable. Default: retry network/timeout errors
      */
     isRetryable?: (error: unknown) => boolean;
+    /**
+     * Extract retry delay from error (for rate limit headers). Return undefined to use backoff.
+     */
+    getRetryDelayMs?: (error: unknown) => number | undefined;
 }
 
 const DEFAULT_RETRY_CONFIG: Required<RetryConfig> = {
@@ -44,6 +49,7 @@ const DEFAULT_RETRY_CONFIG: Required<RetryConfig> = {
     jitter: true,
     retryableErrors: [],
     isRetryable: defaultIsRetryable,
+    getRetryDelayMs: defaultGetRetryDelayMs,
 };
 
 /**
@@ -91,6 +97,16 @@ function defaultIsRetryable(error: unknown): boolean {
     }
 
     return false;
+}
+
+/**
+ * Default retry delay extraction - checks for RateLimitError with retry-after.
+ */
+function defaultGetRetryDelayMs(error: unknown): number | undefined {
+    if (error instanceof RateLimitError) {
+        return error.retryAfterMs;
+    }
+    return undefined;
 }
 
 /**
@@ -181,8 +197,9 @@ export async function retryWithBackoff<T>(
                 throw error;
             }
 
-            // Calculate and apply delay
-            const delayMs = calculateDelay(attempt, cfg);
+            // Calculate delay: use retry-after from error if available, otherwise exponential backoff
+            const retryAfterMs = cfg.getRetryDelayMs(error);
+            const delayMs = retryAfterMs ?? calculateDelay(attempt, cfg);
             totalDelayMs += delayMs;
 
             logger.warn(`${operationName} failed (attempt ${attempt}/${cfg.maxAttempts}), retrying in ${delayMs}ms`, {
