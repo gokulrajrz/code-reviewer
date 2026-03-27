@@ -158,7 +158,6 @@ export async function handlePRWebhook(
         await env.REVIEW_QUEUE.send({
             prNumber: pr.number,
             title: pr.title,
-            diffUrl: pr.diff_url,
             repoFullName: repository.full_name,
             headSha,
             checkRunId: checkRunId ?? 0,

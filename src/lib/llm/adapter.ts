@@ -22,10 +22,12 @@ export interface ChunkReviewRequest {
     chunkContent: string;
     prTitle: string;
     chunkLabel: string;
+    systemPrompt?: string;
 }
 
 export interface SynthesisRequest {
     payload: string;
+    systemPrompt?: string;
 }
 
 /**

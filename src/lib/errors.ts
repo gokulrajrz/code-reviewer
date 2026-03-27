@@ -12,7 +12,6 @@ export class UsageTrackingError extends Error {
     ) {
         super(message);
         this.name = 'UsageTrackingError';
-        Error.captureStackTrace(this, this.constructor);
     }
 
     toJSON() {

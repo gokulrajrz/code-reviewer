@@ -1,5 +1,6 @@
 import { LLMProviderAdapter, type LLMProviderConfig, type LLMResponse, type ChunkReviewRequest, type SynthesisRequest } from '../adapter';
 import { CHUNK_REVIEWER_PROMPT, SYNTHESIZER_PROMPT } from '../../../config/system-prompt';
+import { MODELS } from '../../../config/constants';
 import { logger } from '../../logger';
 import { RateLimitError } from '../../errors';
 import type { TokenUsage } from '../../../types/usage';
@@ -15,7 +16,7 @@ export class GeminiAdapter extends LLMProviderAdapter {
 
     constructor(config: LLMProviderConfig) {
         super(config);
-        this.model = config.model ?? 'gemini-1.5-flash';
+        this.model = config.model ?? MODELS.gemini;
         this.maxTokens = config.maxTokens ?? 4096;
         this.temperature = config.temperature ?? 0.1;
     }
@@ -40,6 +41,8 @@ ${chunkContent}
 
 Analyze this code chunk for issues. Return findings as JSON array.`;
 
+        // Note: Google's Gemini API requires the key in the URL query string
+        // This is intentional by their design, not a security flaw on our part.
         const response = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.config.apiKey}`,
             {
@@ -49,7 +52,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                 },
                 body: JSON.stringify({
                     contents: [
-                        { role: 'user', parts: [{ text: CHUNK_REVIEWER_PROMPT }] },
+                        { role: 'user', parts: [{ text: request.systemPrompt || CHUNK_REVIEWER_PROMPT }] },
                         { role: 'model', parts: [{ text: 'I understand. I will analyze code chunks and return findings as JSON.' }] },
                         { role: 'user', parts: [{ text: userPrompt }] },
                     ],
@@ -90,7 +93,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         };
 
         const content = data.candidates[0]?.content?.parts[0]?.text ?? '';
-        
+
         const usage: TokenUsage = {
             inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
             outputTokens: data.usageMetadata?.candidatesTokenCount ?? 0,
@@ -114,6 +117,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
 
 ${payload}`;
 
+        // Note: Google's Gemini API requires the key in the URL query string
         const response = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.config.apiKey}`,
             {
@@ -123,7 +127,7 @@ ${payload}`;
                 },
                 body: JSON.stringify({
                     contents: [
-                        { role: 'user', parts: [{ text: SYNTHESIZER_PROMPT }] },
+                        { role: 'user', parts: [{ text: request.systemPrompt || SYNTHESIZER_PROMPT }] },
                         { role: 'model', parts: [{ text: 'I understand. I will synthesize code review findings into markdown.' }] },
                         { role: 'user', parts: [{ text: userPrompt }] },
                     ],
@@ -164,7 +168,7 @@ ${payload}`;
         };
 
         const content = data.candidates[0]?.content?.parts[0]?.text ?? '';
-        
+
         const usage: TokenUsage = {
             inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
             outputTokens: data.usageMetadata?.candidatesTokenCount ?? 0,

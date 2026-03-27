@@ -1,4 +1,8 @@
 import type { GitHubPRFile } from '../types/github';
+import type { Env } from '../types/env';
+import type { ReviewFinding } from '../types/review';
+import { cachedGitHubFetch, CACHE_TTLS } from './cache';
+import { pluginRegistry } from './plugin-system';
 import {
     MAX_FILE_SIZE_BYTES,
     MAX_TOTAL_FILES,
@@ -37,7 +41,8 @@ function githubHeaders(token: string): HeadersInit {
 export async function fetchChangedFiles(
     repoFullName: string,
     prNumber: number,
-    token: string
+    token: string,
+    env: Env
 ): Promise<GitHubPRFile[]> {
     // Check circuit breaker before attempting
     if (!circuitBreakers.github.canExecute()) {
@@ -50,22 +55,15 @@ export async function fetchChangedFiles(
 
         while (allFiles.length < MAX_TOTAL_FILES) {
             const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100&page=${page}`;
-            const response = await fetch(url, { headers: githubHeaders(token) });
 
-            if (!response.ok) {
-                // Extract retry-after header for rate limit errors
-                const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
-                const errorMessage = `Failed to fetch PR files (page ${page}): ${response.status} ${response.statusText}`;
-                if (response.status === 429 && retryAfter) {
-                    const retryAfterMs = parseInt(retryAfter, 10) * 1000;
-                    if (!isNaN(retryAfterMs)) {
-                        throw new RateLimitError(errorMessage, undefined, retryAfterMs);
-                    }
-                }
-                throw new Error(errorMessage);
-            }
-
-            const files: GitHubPRFile[] = await response.json();
+            // Note: cachedGitHubFetch handles the 429 extraction automatically inside cache.ts
+            const files = await cachedGitHubFetch<GitHubPRFile[]>(
+                env,
+                url,
+                { headers: githubHeaders(token) },
+                { ttlSeconds: CACHE_TTLS.PR_FILES, staleWhileRevalidate: true },
+                async (u, i) => fetch(u, i)
+            );
 
             if (files.length === 0) break; // No more pages
 
@@ -218,7 +216,7 @@ export function classifyFiles(files: GitHubPRFile[]): ClassifiedFiles {
  * Returns null if the file is too large or the request fails.
  * Includes retry logic for transient failures.
  */
-export async function fetchFileContent(rawUrl: string, token: string): Promise<string | null> {
+export async function fetchFileContent(rawUrl: string, token: string, env: Env): Promise<string | null> {
     // Check circuit breaker before attempting
     if (!circuitBreakers.github.canExecute()) {
         logger.warn('GitHub API circuit breaker is OPEN, skipping file content fetch');
@@ -226,30 +224,37 @@ export async function fetchFileContent(rawUrl: string, token: string): Promise<s
     }
 
     const executeFetch = async (): Promise<string | null> => {
-        const response = await fetch(rawUrl, { headers: githubHeaders(token) });
+        const text = await cachedGitHubFetch<string>(
+            env,
+            rawUrl,
+            { headers: githubHeaders(token) },
+            { ttlSeconds: CACHE_TTLS.FILE_CONTENT, staleWhileRevalidate: true },
+            async (u, i) => {
+                const response = await fetch(u, i);
 
-        if (!response.ok) {
-            // Extract retry-after header for rate limit errors
-            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
-            const errorMessage = `Failed to fetch file content: ${response.status} ${response.statusText}`;
-            if (response.status === 429 && retryAfter) {
-                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
-                if (!isNaN(retryAfterMs)) {
-                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                // Extra safety check during fetch before reading body
+                const contentLength = response.headers.get('Content-Length');
+                if (contentLength && parseInt(contentLength, 10) > MAX_FILE_SIZE_BYTES) {
+                    // Fast abort for huge files
+                    throw new Error(`FILE_TOO_LARGE:${contentLength}`);
                 }
+                return response;
+            },
+            'text'
+        ).catch(err => {
+            if (err.message.startsWith('FILE_TOO_LARGE:')) {
+                const size = err.message.split(':')[1];
+                return `[File too large to include — ${size} bytes. Review diff only.]`;
             }
-            return null;
+            throw err;
+        });
+
+        // If it was already caught for size in the fast path, return it directly
+        if (text && text.startsWith('[File too large to include')) {
+            return text;
         }
 
-        // Guard against massive files
-        const contentLength = response.headers.get('Content-Length');
-        if (contentLength && parseInt(contentLength, 10) > MAX_FILE_SIZE_BYTES) {
-            return `[File too large to include — ${contentLength} bytes. Review diff only.]`;
-        }
-
-        const text = await response.text();
-
-        // Secondary size check on the body itself
+        // Secondary size check on the body itself (sometimes Content-Length is missing)
         if (text.length > MAX_FILE_SIZE_BYTES) {
             return `[File too large to include — ${text.length} chars. Review diff only.]`;
         }
@@ -373,8 +378,14 @@ function splitLargeFileBlock(
 /**
  * Builds a file block for a Tier 1 file (full content + diff patch).
  */
-async function buildTier1Block(file: GitHubPRFile, token: string): Promise<string> {
+async function buildTier1Block(
+    file: GitHubPRFile,
+    token: string,
+    env: Env,
+    prContext: { title: string; repoFullName: string; prNumber: number }
+): Promise<{ block: string; findings: ReviewFinding[] }> {
     let block = `## 🔍 FILE CHANGED: \`${file.filename}\` (${file.status}) — *Full Review*\n`;
+    const findings: ReviewFinding[] = [];
 
     if (file.patch) {
         block += `### DIFF PATCH\n\`\`\`diff\n${file.patch}\n\`\`\`\n`;
@@ -382,16 +393,32 @@ async function buildTier1Block(file: GitHubPRFile, token: string): Promise<strin
         block += `_(No diff patch available)_\n`;
     }
 
-    const content = await fetchFileContent(file.raw_url, token);
+    const content = await fetchFileContent(file.raw_url, token, env);
     if (content && !content.startsWith('[File too large')) {
         const ext = file.filename.split('.').pop() ?? '';
         block += `\n### FULL FILE CONTENT\n\`\`\`${ext}\n${content}\n\`\`\`\n`;
+
+        // Run analyzer plugins on the full file content
+        try {
+            const pluginResult = await pluginRegistry.analyzeFile({
+                filename: file.filename,
+                content: content,
+                prTitle: prContext.title,
+                repoFullName: prContext.repoFullName,
+                prNumber: prContext.prNumber
+            });
+            findings.push(...pluginResult.findings);
+        } catch (error) {
+            logger.error('Plugin execution failed', error instanceof Error ? error : undefined, {
+                filename: file.filename
+            });
+        }
     } else if (content) {
         block += `\n${content}\n`;
     }
 
     block += `\n---\n\n`;
-    return block;
+    return { block, findings };
 }
 
 /**
@@ -418,6 +445,8 @@ export interface ReviewChunksResult {
     globalContext: string;
     /** All reviewable filenames (for the synthesizer payload) */
     allFiles: string[];
+    /** Findings generated by local plugins */
+    pluginFindings: ReviewFinding[];
 }
 
 /**
@@ -433,11 +462,14 @@ export interface ReviewChunksResult {
 export async function buildReviewChunks(
     classified: ClassifiedFiles,
     token: string,
-    maxChunkChars: number
+    maxChunkChars: number,
+    env: Env,
+    prContext: { title: string; repoFullName: string; prNumber: number }
 ): Promise<ReviewChunksResult> {
     const { tier1, tier2, skipped } = classified;
     const globalContext = buildGlobalContext(classified);
     const allFiles = [...tier1, ...tier2].map(f => f.filename);
+    const pluginFindings: ReviewFinding[] = [];
 
     const chunks: string[] = [];
     let currentChunkText = '';
@@ -461,7 +493,8 @@ export async function buildReviewChunks(
 
     // ── Process Tier 1 files (full content, uses subrequests) ──
     for (const file of tier1) {
-        const fileBlock = await buildTier1Block(file, token);
+        const { block: fileBlock, findings } = await buildTier1Block(file, token, env, prContext);
+        pluginFindings.push(...findings);
 
         if (fileBlock.length > effectiveMax) {
             // File is larger than a single chunk — split it safely
@@ -506,6 +539,7 @@ export async function buildReviewChunks(
         chunks: finalChunks,
         globalContext,
         allFiles,
+        pluginFindings,
     };
 }
 

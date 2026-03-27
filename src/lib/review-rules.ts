@@ -5,6 +5,7 @@
  * and prompt templates that override the defaults.
  */
 
+/** Canonical ReviewType definition — re-exported for use across the codebase */
 export type ReviewType = 'general' | 'security' | 'performance' | 'style' | 'accessibility';
 
 export interface ReviewRule {
@@ -235,8 +236,8 @@ function mergeConfig(base: ReviewConfig, override: Partial<ReviewConfig>): Revie
         reviewTypes: override.reviewTypes ?? base.reviewTypes,
         globalRules: [...base.globalRules, ...(override.globalRules ?? [])],
         excludePatterns: [...base.excludePatterns, ...(override.excludePatterns ?? [])],
-        includePatterns: override.includePatterns?.length 
-            ? override.includePatterns 
+        includePatterns: override.includePatterns?.length
+            ? override.includePatterns
             : base.includePatterns,
         severityOverrides: { ...base.severityOverrides, ...override.severityOverrides },
         customPrompts: { ...base.customPrompts, ...override.customPrompts },
@@ -266,7 +267,7 @@ export function buildCustomPrompt(config: ReviewConfig): string {
     // Add rule instructions
     const enabledRules = config.globalRules.filter(r => r.enabled);
     if (enabledRules.length > 0) {
-        parts.push('\n\nSpecific rules to enforce:\n' + 
+        parts.push('\n\nSpecific rules to enforce:\n' +
             enabledRules.map(r => `- ${r.name} (${r.severity}): ${r.description}`).join('\n')
         );
     }
@@ -275,8 +276,8 @@ export function buildCustomPrompt(config: ReviewConfig): string {
     parts.push(`\n\nConstraints:\n` +
         `- Maximum ${config.maxFindingsPerFile} findings per file\n` +
         `- Maximum ${config.maxFindingsTotal} total findings\n` +
-        (config.excludePatterns.length > 0 
-            ? `- Exclude: ${config.excludePatterns.join(', ')}\n` 
+        (config.excludePatterns.length > 0
+            ? `- Exclude: ${config.excludePatterns.join(', ')}\n`
             : '')
     );
 
@@ -288,18 +289,18 @@ export function buildCustomPrompt(config: ReviewConfig): string {
  */
 export function validateReviewConfig(config: unknown): config is ReviewConfig {
     if (!config || typeof config !== 'object') return false;
-    
+
     const c = config as Partial<ReviewConfig>;
-    
+
     // Required fields
     if (!c.version || typeof c.version !== 'string') return false;
     if (!Array.isArray(c.reviewTypes)) return false;
-    
+
     // Validate review types
     const validTypes: ReviewType[] = ['general', 'security', 'performance', 'style', 'accessibility'];
     for (const type of c.reviewTypes) {
         if (!validTypes.includes(type as ReviewType)) return false;
     }
-    
+
     return true;
 }

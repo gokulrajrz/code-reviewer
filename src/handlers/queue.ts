@@ -14,6 +14,7 @@ import { callChunkReview, callSynthesizer, getModelName } from '../lib/llm/index
 import { buildPRUsageMetrics, storePRUsageMetrics } from '../lib/usage-tracker';
 import { logger } from '../lib/logger';
 import { runWithContextAsync } from '../lib/request-context';
+import { loadReviewConfig, buildCustomPrompt } from '../lib/review-rules';
 
 /** Maximum time (ms) to wait for a single LLM call before aborting. */
 const LLM_TIMEOUT_MS = 120_000;
@@ -158,334 +159,344 @@ async function processMessage(
         headSha,
     });
 
-        // Track usage metrics
-        const startTime = new Date().toISOString();
-        const llmCalls: LLMCallUsage[] = [];
-        const provider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER);
-        const modelName = getModelName(provider);
+    // Track usage metrics
+    const startTime = new Date().toISOString();
+    const llmCalls: LLMCallUsage[] = [];
+    const provider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER);
+    const modelName = getModelName(provider);
 
-        // ── Step 1: Get a fresh installation token ──
-        let token: string;
-        try {
-            token = await getInstallationToken(env);
-        } catch (error) {
-            const errMsg = error instanceof Error ? error.message : String(error);
-            logger.error('Auth failed - cannot get installation token', error instanceof Error ? error : undefined, {
-                prNumber,
-            });
+    // ── Step 1: Get a fresh installation token ──
+    let token: string;
+    try {
+        token = await getInstallationToken(env);
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        logger.error('Auth failed - cannot get installation token', error instanceof Error ? error : undefined, {
+            prNumber,
+        });
+        message.ack();
+        return;
+    }
+
+    try {
+        // ── Step 1.5: Load Custom Review Rules ──
+        logger.info('Loading review configuration', { repoFullName });
+        const reviewConfig = await loadReviewConfig(repoFullName);
+        const customSystemPrompt = buildCustomPrompt(reviewConfig);
+
+        // ── Step 2: Fetch ALL changed files (paginated) ──
+        logger.info('Fetching changed files', { prNumber });
+        const allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+        logger.info('Fetched changed files', { prNumber, count: allFiles.length });
+
+        if (allFiles.length === 0) {
+            logger.warn('No changed files found, skipping review', { prNumber });
+            if (checkRunId) {
+                await updateCheckRun(repoFullName, checkRunId, token, 'neutral',
+                    '## No Files to Review\n\nThis PR has no reviewable file changes.');
+            }
             message.ack();
             return;
         }
 
-        try {
-            // ── Step 2: Fetch ALL changed files (paginated) ──
-            logger.info('Fetching changed files', { prNumber });
-            const allFiles = await fetchChangedFiles(repoFullName, prNumber, token);
-            logger.info('Fetched changed files', { prNumber, count: allFiles.length });
+        // ── Step 3: Classify files into tiers ──
+        const classified = classifyFiles(allFiles);
+        logger.info('Classified files', {
+            prNumber,
+            tier1: classified.tier1.length,
+            tier2: classified.tier2.length,
+            skipped: classified.skipped.length,
+        });
 
-            if (allFiles.length === 0) {
-                logger.warn('No changed files found, skipping review', { prNumber });
-                if (checkRunId) {
-                    await updateCheckRun(repoFullName, checkRunId, token, 'neutral',
-                        '## No Files to Review\n\nThis PR has no reviewable file changes.');
-                }
-                message.ack();
-                return;
-            }
-
-            // ── Step 3: Classify files into tiers ──
-            const classified = classifyFiles(allFiles);
-            logger.info('Classified files', {
+        if (classified.tier1.length === 0 && classified.tier2.length === 0) {
+            logger.warn('All files classified as noise, skipping review', {
                 prNumber,
-                tier1: classified.tier1.length,
-                tier2: classified.tier2.length,
-                skipped: classified.skipped.length,
+                totalFiles: allFiles.length,
             });
-
-            if (classified.tier1.length === 0 && classified.tier2.length === 0) {
-                logger.warn('All files classified as noise, skipping review', {
-                    prNumber,
-                    totalFiles: allFiles.length,
-                });
-                if (checkRunId) {
-                    await updateCheckRun(repoFullName, checkRunId, token, 'neutral',
-                        `## No Reviewable Files\n\nAll ${allFiles.length} files in this PR are auto-generated, vendor, or noise files.\n\n` +
-                        `Skipped: ${classified.skipped.slice(0, 20).join(', ')}${classified.skipped.length > 20 ? '...' : ''}`);
-                }
-                message.ack();
-                return;
+            if (checkRunId) {
+                await updateCheckRun(repoFullName, checkRunId, token, 'neutral',
+                    `## No Reviewable Files\n\nAll ${allFiles.length} files in this PR are auto-generated, vendor, or noise files.\n\n` +
+                    `Skipped: ${classified.skipped.slice(0, 20).join(', ')}${classified.skipped.length > 20 ? '...' : ''}`);
             }
+            message.ack();
+            return;
+        }
 
-            // ── Step 4: Build size-limited chunks with global context ──
-            logger.info('Building review chunks', {
-                prNumber,
-                maxChunkChars: MAX_CHUNK_CHARS,
-            });
-            const { chunks: rawChunks, globalContext, allFiles: reviewableFiles } =
-                await buildReviewChunks(classified, token, MAX_CHUNK_CHARS);
-
-            let chunks = rawChunks;
-            logger.info('Generated chunks', {
-                prNumber,
-                chunkCount: chunks.length,
-                globalContextLength: globalContext.length,
-            });
-
-            // Apply Hard Cap to prevent 50-subrequest limit exhaustion
-            // Budget: chunks × 1 (Map) + 1 (Reduce) + file fetches + auth ≤ 50
-            if (chunks.length > MAX_LLM_CHUNKS) {
-                logger.warn('Truncating chunks to prevent subrequest limit', {
-                    prNumber,
-                    original: chunks.length,
-                    max: MAX_LLM_CHUNKS,
-                });
-                chunks = chunks.slice(0, MAX_LLM_CHUNKS);
-            }
-
-            // ══════════════════════════════════════════════════════════════
-            // Step 5: MAP PHASE — Review each chunk, collect JSON findings
-            // ══════════════════════════════════════════════════════════════
-            logger.info('Starting MAP phase', {
-                prNumber,
-                chunkCount: chunks.length,
-            });
-
-            const allFindings: ReviewFinding[] = [];
-            let failedChunks = 0;
-
-            for (let i = 0; i < chunks.length; i++) {
-                const chunkContent = chunks[i];
-                const chunkLabel = `${i + 1}/${chunks.length}`;
-
-                logger.info('Processing chunk', {
-                    prNumber,
-                    chunk: chunkLabel,
-                    size: chunkContent.length,
-                });
-
-                try {
-                    const result = await withTimeout(
-                        (signal) => callChunkReview(chunkContent, title, chunkLabel, env, signal),
-                        LLM_TIMEOUT_MS,
-                        `Chunk ${chunkLabel}`
-                    );
-
-                    logger.info('Chunk processed', {
-                        prNumber,
-                        chunk: chunkLabel,
-                        findings: result.findings.length,
-                        tokens: result.usage.totalTokens,
-                    });
-                    allFindings.push(...result.findings);
-
-                    // Track usage
-                    llmCalls.push({
-                        phase: 'map',
-                        chunkLabel,
-                        model: modelName,
-                        usage: result.usage,
-                        timestamp: new Date().toISOString(),
-                    });
-                } catch (error) {
-                    failedChunks++;
-                    logger.warn('Chunk failed, continuing with remaining', {
-                        prNumber,
-                        chunk: chunkLabel,
-                        error: error instanceof Error ? error.message : String(error),
-                    });
-                    // Continue processing remaining chunks — graceful degradation
-                }
-            }
-
-            logger.info('MAP phase complete', {
-                prNumber,
-                totalFindings: allFindings.length,
-                failedChunks,
-                totalChunks: chunks.length,
-            });
-
-            // ══════════════════════════════════════════════════════════════
-            // Step 6: Deduplicate findings (simple: same file + same title)
-            // ══════════════════════════════════════════════════════════════
-            const seen = new Set<string>();
-            const deduplicated: ReviewFinding[] = [];
-            for (const f of allFindings) {
-                const key = `${f.file}::${f.title.toLowerCase().trim()}`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    deduplicated.push(f);
-                }
-            }
-
-            if (deduplicated.length < allFindings.length) {
-                logger.info('Deduplicated findings', {
-                    prNumber,
-                    before: allFindings.length,
-                    after: deduplicated.length,
-                });
-            }
-
-            // ══════════════════════════════════════════════════════════════
-            // Step 7: REDUCE PHASE — Synthesize final review
-            // ══════════════════════════════════════════════════════════════
-            logger.info('Starting REDUCE phase', {
-                prNumber,
-                findingsCount: deduplicated.length,
-            });
-
-            let finalReview: string;
-
-            const synthesizerPayload = buildSynthesizerPayload(
+        // ── Step 4: Build size-limited chunks with global context ──
+        logger.info('Building review chunks', {
+            prNumber,
+            maxChunkChars: MAX_CHUNK_CHARS,
+        });
+        const { chunks: rawChunks, globalContext, allFiles: reviewableFiles, pluginFindings } =
+            await buildReviewChunks(classified, token, MAX_CHUNK_CHARS, env, {
                 title,
-                reviewableFiles,
-                classified.skipped.length,
-                deduplicated,
-                chunks.length,
-                failedChunks
-            );
+                repoFullName,
+                prNumber
+            });
+
+        let chunks = rawChunks;
+        logger.info('Generated chunks', {
+            prNumber,
+            chunkCount: chunks.length,
+            globalContextLength: globalContext.length,
+        });
+
+        // Apply Hard Cap to prevent 50-subrequest limit exhaustion
+        // Budget: chunks × 1 (Map) + 1 (Reduce) + file fetches + auth ≤ 50
+        if (chunks.length > MAX_LLM_CHUNKS) {
+            logger.warn('Truncating chunks to prevent subrequest limit', {
+                prNumber,
+                original: chunks.length,
+                max: MAX_LLM_CHUNKS,
+            });
+            chunks = chunks.slice(0, MAX_LLM_CHUNKS);
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // Step 5: MAP PHASE — Review each chunk, collect JSON findings
+        // ══════════════════════════════════════════════════════════════
+        logger.info('Starting MAP phase', {
+            prNumber,
+            chunkCount: chunks.length,
+        });
+
+        const allFindings: ReviewFinding[] = [...pluginFindings];
+        let failedChunks = 0;
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunkContent = chunks[i];
+            const chunkLabel = `${i + 1}/${chunks.length}`;
+
+            logger.info('Processing chunk', {
+                prNumber,
+                chunk: chunkLabel,
+                size: chunkContent.length,
+            });
 
             try {
                 const result = await withTimeout(
-                    (signal) => callSynthesizer(synthesizerPayload, env, signal),
+                    (signal) => callChunkReview(chunkContent, title, chunkLabel, env, signal, customSystemPrompt),
                     LLM_TIMEOUT_MS,
-                    'Synthesizer'
+                    `Chunk ${chunkLabel}`
                 );
-                finalReview = result.review;
-                logger.info('Synthesized review', {
+
+                logger.info('Chunk processed', {
                     prNumber,
-                    reviewLength: finalReview.length,
+                    chunk: chunkLabel,
+                    findings: result.findings.length,
                     tokens: result.usage.totalTokens,
                 });
+                allFindings.push(...result.findings);
 
                 // Track usage
                 llmCalls.push({
-                    phase: 'reduce',
+                    phase: 'map',
+                    chunkLabel,
                     model: modelName,
                     usage: result.usage,
                     timestamp: new Date().toISOString(),
                 });
             } catch (error) {
-                const errMsg = error instanceof Error ? error.message : String(error);
-                logger.error('Synthesizer failed', error instanceof Error ? error : undefined, {
+                failedChunks++;
+                logger.warn('Chunk failed, continuing with remaining', {
                     prNumber,
+                    chunk: chunkLabel,
+                    error: error instanceof Error ? error.message : String(error),
                 });
-                throw new Error(`Synthesizer failed to generate review: ${errMsg}`);
+                // Continue processing remaining chunks — graceful degradation
             }
+        }
 
-            // Add metadata banner for multi-chunk reviews
-            if (chunks.length > 1 || failedChunks > 0) {
-                const banner = `> ℹ️ **Review Pipeline:** ${chunks.length} chunks processed` +
-                    `${failedChunks > 0 ? ` (${failedChunks} failed)` : ''}, ` +
-                    `${deduplicated.length} findings synthesized from ` +
-                    `${classified.tier1.length} full-context + ${classified.tier2.length} diff-only files.\n\n`;
-                finalReview = banner + finalReview;
+        logger.info('MAP phase complete', {
+            prNumber,
+            totalFindings: allFindings.length,
+            failedChunks,
+            totalChunks: chunks.length,
+        });
+
+        // ══════════════════════════════════════════════════════════════
+        // Step 6: Deduplicate findings (simple: same file + same title)
+        // ══════════════════════════════════════════════════════════════
+        const seen = new Set<string>();
+        const deduplicated: ReviewFinding[] = [];
+        for (const f of allFindings) {
+            const key = `${f.file}::${f.title.toLowerCase().trim()}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                deduplicated.push(f);
             }
+        }
 
-            logger.info('Final review ready, posting to PR', {
+        if (deduplicated.length < allFindings.length) {
+            logger.info('Deduplicated findings', {
+                prNumber,
+                before: allFindings.length,
+                after: deduplicated.length,
+            });
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // Step 7: REDUCE PHASE — Synthesize final review
+        // ══════════════════════════════════════════════════════════════
+        logger.info('Starting REDUCE phase', {
+            prNumber,
+            findingsCount: deduplicated.length,
+        });
+
+        let finalReview: string;
+
+        const synthesizerPayload = buildSynthesizerPayload(
+            title,
+            reviewableFiles,
+            classified.skipped.length,
+            deduplicated,
+            chunks.length,
+            failedChunks
+        );
+
+        try {
+            const result = await withTimeout(
+                (signal) => callSynthesizer(synthesizerPayload, env, signal, customSystemPrompt),
+                LLM_TIMEOUT_MS,
+                'Synthesizer'
+            );
+            finalReview = result.review;
+            logger.info('Synthesized review', {
                 prNumber,
                 reviewLength: finalReview.length,
+                tokens: result.usage.totalTokens,
             });
 
-            // ── Step 8: Post review comment to PR ──
-            try {
-                await postPRComment(repoFullName, prNumber, finalReview, token);
-                logger.info('Review comment posted', { prNumber });
-            } catch (error) {
-                logger.error('Failed to post review comment', error instanceof Error ? error : undefined, {
-                    prNumber,
-                });
-            }
-
-            // ── Step 9: Determine conclusion and update Check Run ──
-            const allChunksFailed = failedChunks === chunks.length && chunks.length > 0;
-            const hasRequestedChanges = finalReview.includes('**Request Changes**');
-            const conclusion = allChunksFailed ? 'failure' : hasRequestedChanges ? 'failure' : 'success';
-
-            if (checkRunId) {
-                try {
-                    await updateCheckRun(repoFullName, checkRunId, token, conclusion, finalReview);
-                    logger.info('Check run updated', {
-                        prNumber,
-                        checkRunId,
-                        conclusion,
-                    });
-                } catch (error) {
-                    logger.error('Failed to update Check Run', error instanceof Error ? error : undefined, {
-                        prNumber,
-                        checkRunId,
-                    });
-                }
-            } else {
-                logger.warn('No checkRunId available, skipping Check Run update', { prNumber });
-            }
-
-            logger.info('Pipeline complete', {
-                prNumber,
-                conclusion,
+            // Track usage
+            llmCalls.push({
+                phase: 'reduce',
+                model: modelName,
+                usage: result.usage,
+                timestamp: new Date().toISOString(),
             });
-
-            // ── Step 10: Store usage metrics ──
-            try {
-                const usageMetrics = buildPRUsageMetrics(
-                    prNumber,
-                    repoFullName,
-                    headSha,
-                    provider,
-                    startTime,
-                    llmCalls,
-                    reviewableFiles.length,
-                    chunks.length,
-                    deduplicated.length,
-                    allChunksFailed ? 'failed' : failedChunks > 0 ? 'partial' : 'success'
-                );
-                await storePRUsageMetrics(usageMetrics, env);
-            } catch (error) {
-                logger.error('Failed to store usage metrics', error instanceof Error ? error : undefined, {
-                    prNumber,
-                });
-                // Non-fatal: don't fail the entire review
-            }
-
-            message.ack();
-
         } catch (error) {
             const errMsg = error instanceof Error ? error.message : String(error);
-            logger.error('Pipeline failed', error instanceof Error ? error : undefined, {
+            logger.error('Synthesizer failed', error instanceof Error ? error : undefined, {
                 prNumber,
             });
+            throw new Error(`Synthesizer failed to generate review: ${errMsg}`);
+        }
 
+        // Add metadata banner for multi-chunk reviews
+        if (chunks.length > 1 || failedChunks > 0) {
+            const banner = `> ℹ️ **Review Pipeline:** ${chunks.length} chunks processed` +
+                `${failedChunks > 0 ? ` (${failedChunks} failed)` : ''}, ` +
+                `${deduplicated.length} findings synthesized from ` +
+                `${classified.tier1.length} full-context + ${classified.tier2.length} diff-only files.\n\n`;
+            finalReview = banner + finalReview;
+        }
+
+        logger.info('Final review ready, posting to PR', {
+            prNumber,
+            reviewLength: finalReview.length,
+        });
+
+        // ── Step 8: Post review comment to PR ──
+        try {
+            await postPRComment(repoFullName, prNumber, finalReview, token);
+            logger.info('Review comment posted', { prNumber });
+        } catch (error) {
+            logger.error('Failed to post review comment', error instanceof Error ? error : undefined, {
+                prNumber,
+            });
+        }
+
+        // ── Step 9: Determine conclusion and update Check Run ──
+        const allChunksFailed = failedChunks === chunks.length && chunks.length > 0;
+        // Robust verdict detection: case-insensitive regex to handle LLM formatting variations
+        const hasRequestedChanges = /\*{1,3}request\s+changes\*{1,3}/i.test(finalReview);
+        const conclusion = allChunksFailed ? 'failure' : hasRequestedChanges ? 'failure' : 'success';
+
+        if (checkRunId) {
             try {
-                await postPRComment(
-                    repoFullName,
+                await updateCheckRun(repoFullName, checkRunId, token, conclusion, finalReview);
+                logger.info('Check run updated', {
                     prNumber,
-                    `> ⚠️ **Code Reviewer Agent Error**\n` +
-                    `> The automated review failed unexpectedly.\n\n` +
-                    `**Error:** \`${errMsg}\`\n\n` +
-                    `> You can trigger another review by closing and reopening this PR.`,
-                    token
+                    checkRunId,
+                    conclusion,
+                });
+            } catch (error) {
+                logger.error('Failed to update Check Run', error instanceof Error ? error : undefined, {
+                    prNumber,
+                    checkRunId,
+                });
+            }
+        } else {
+            logger.warn('No checkRunId available, skipping Check Run update', { prNumber });
+        }
+
+        logger.info('Pipeline complete', {
+            prNumber,
+            conclusion,
+        });
+
+        // ── Step 10: Store usage metrics ──
+        try {
+            const usageMetrics = buildPRUsageMetrics(
+                prNumber,
+                repoFullName,
+                headSha,
+                provider,
+                startTime,
+                llmCalls,
+                reviewableFiles.length,
+                chunks.length,
+                deduplicated.length,
+                allChunksFailed ? 'failed' : failedChunks > 0 ? 'partial' : 'success'
+            );
+            await storePRUsageMetrics(usageMetrics, env);
+        } catch (error) {
+            logger.error('Failed to store usage metrics', error instanceof Error ? error : undefined, {
+                prNumber,
+            });
+            // Non-fatal: don't fail the entire review
+        }
+
+        message.ack();
+
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        logger.error('Pipeline failed', error instanceof Error ? error : undefined, {
+            prNumber,
+        });
+
+        try {
+            await postPRComment(
+                repoFullName,
+                prNumber,
+                `> ⚠️ **Code Reviewer Agent Error**\n` +
+                `> The automated review failed unexpectedly.\n\n` +
+                `**Error:** \`${errMsg}\`\n\n` +
+                `> You can trigger another review by closing and reopening this PR.`,
+                token
+            );
+        } catch {
+            logger.error('Could not post error comment to PR', undefined, { prNumber });
+        }
+
+        if (checkRunId) {
+            try {
+                await updateCheckRun(
+                    repoFullName,
+                    checkRunId,
+                    token,
+                    'failure',
+                    `## ❌ Review Pipeline Error\n\n**Error:** \`${errMsg}\`\n\n` +
+                    `You can trigger another review by closing and reopening this PR.`
                 );
             } catch {
-                logger.error('Could not post error comment to PR', undefined, { prNumber });
+                logger.error('Could not update Check Run with error status', undefined, {
+                    prNumber,
+                    checkRunId,
+                });
             }
-
-            if (checkRunId) {
-                try {
-                    await updateCheckRun(
-                        repoFullName,
-                        checkRunId,
-                        token,
-                        'failure',
-                        `## ❌ Review Pipeline Error\n\n**Error:** \`${errMsg}\`\n\n` +
-                        `You can trigger another review by closing and reopening this PR.`
-                    );
-                } catch {
-                    logger.error('Could not update Check Run with error status', undefined, {
-                        prNumber,
-                        checkRunId,
-                    });
-                }
-            }
-
-            message.ack();
         }
+
+        message.ack();
     }
+}

@@ -149,9 +149,9 @@ export async function getOperationalMetrics(
     let totalFindings = 0;
 
     try {
-        // Try to get metrics from the last 24 hours
-        // This is a simplified approach - in production you'd have proper time-series aggregation
-        const keys = await env.USAGE_METRICS.list({ limit: 100 });
+        // Filter to only usage metrics keys — the KV namespace is shared with
+        // rate limit buckets (ratelimit:*), dedup keys (delivery:*), and cache (github:*)
+        const keys = await env.USAGE_METRICS.list({ prefix: 'usage:', limit: 100 });
 
         for (const key of keys.keys) {
             try {

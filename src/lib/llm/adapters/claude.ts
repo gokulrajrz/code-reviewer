@@ -1,5 +1,6 @@
 import { LLMProviderAdapter, type LLMProviderConfig, type LLMResponse, type ChunkReviewRequest, type SynthesisRequest } from '../adapter';
 import { CHUNK_REVIEWER_PROMPT, SYNTHESIZER_PROMPT } from '../../../config/system-prompt';
+import { MODELS } from '../../../config/constants';
 import { logger } from '../../logger';
 import { RateLimitError } from '../../errors';
 import type { TokenUsage } from '../../../types/usage';
@@ -15,7 +16,7 @@ export class ClaudeAdapter extends LLMProviderAdapter {
 
     constructor(config: LLMProviderConfig) {
         super(config);
-        this.model = config.model ?? 'claude-haiku-4-5-20251001';
+        this.model = config.model ?? MODELS.claude;
         this.maxTokens = config.maxTokens ?? 4096;
         this.temperature = config.temperature ?? 0.1;
     }
@@ -51,7 +52,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                 model: this.model,
                 max_tokens: this.maxTokens,
                 temperature: this.temperature,
-                system: CHUNK_REVIEWER_PROMPT,
+                system: request.systemPrompt || CHUNK_REVIEWER_PROMPT,
                 messages: [{ role: 'user', content: userPrompt }],
             }),
             signal,
@@ -83,7 +84,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         };
 
         const content = data.content.find(c => c.type === 'text')?.text ?? '';
-        
+
         const usage: TokenUsage = {
             inputTokens: data.usage.input_tokens,
             outputTokens: data.usage.output_tokens,
@@ -118,7 +119,7 @@ ${payload}`;
                 model: this.model,
                 max_tokens: this.maxTokens,
                 temperature: this.temperature,
-                system: SYNTHESIZER_PROMPT,
+                system: request.systemPrompt || SYNTHESIZER_PROMPT,
                 messages: [{ role: 'user', content: userPrompt }],
             }),
             signal,
@@ -150,7 +151,7 @@ ${payload}`;
         };
 
         const content = data.content.find(c => c.type === 'text')?.text ?? '';
-        
+
         const usage: TokenUsage = {
             inputTokens: data.usage.input_tokens,
             outputTokens: data.usage.output_tokens,

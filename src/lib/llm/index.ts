@@ -1,7 +1,7 @@
 import type { AIProvider, Env } from '../../types/env';
 import type { ReviewFinding } from '../../types/review';
 import type { TokenUsage } from '../../types/usage';
-import { DEFAULT_AI_PROVIDER } from '../../config/constants';
+import { DEFAULT_AI_PROVIDER, MODELS } from '../../config/constants';
 import { parseFindings } from './parse-findings';
 import { retryWithBackoff, circuitBreakers } from '../retry';
 import { logger } from '../logger';
@@ -32,7 +32,8 @@ export async function callChunkReview(
     prTitle: string,
     chunkLabel: string,
     env: Env,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    systemPrompt?: string
 ): Promise<ChunkReviewResult> {
     const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
@@ -50,7 +51,7 @@ export async function callChunkReview(
 
     const executeReview = async (): Promise<ChunkReviewResult> => {
         const result = await adapter.reviewChunk(
-            { chunkContent, prTitle, chunkLabel },
+            { chunkContent, prTitle, chunkLabel, systemPrompt },
             signal
         );
         const findings = parseFindings(result.content);
@@ -108,7 +109,8 @@ export interface SynthesisResult {
 export async function callSynthesizer(
     synthesizerPayload: string,
     env: Env,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    systemPrompt?: string
 ): Promise<SynthesisResult> {
     const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
@@ -125,7 +127,7 @@ export async function callSynthesizer(
     const adapter = LLMProviderFactory.createProvider(provider, config);
 
     const executeSynthesis = async (): Promise<SynthesisResult> => {
-        const result = await adapter.synthesize({ payload: synthesizerPayload }, signal);
+        const result = await adapter.synthesize({ payload: synthesizerPayload, systemPrompt }, signal);
         return { review: result.content, usage: result.usage };
     };
 
@@ -161,18 +163,11 @@ export async function callSynthesizer(
 }
 
 /**
- * Get the model name for the current provider
+ * Get the model name for the current provider.
+ * Uses the single source of truth in constants.ts.
  */
 export function getModelName(provider: AIProvider): string {
-    // Use factory to get adapter and query its model name
-    const config: LLMProviderConfig = { apiKey: 'dummy' };
-    try {
-        const adapter = LLMProviderFactory.createProvider(provider, config);
-        return adapter.getModelName();
-    } catch {
-        // Fallback to default models if adapter not found
-        return provider === 'gemini' ? 'gemini-1.5-flash' : 'claude-haiku-4-5-20251001';
-    }
+    return MODELS[provider];
 }
 
 /**

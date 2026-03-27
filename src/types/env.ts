@@ -1,5 +1,4 @@
 export type AIProvider = 'claude' | 'gemini';
-export type ReviewType = 'general' | 'security' | 'performance' | 'style' | 'accessibility';
 
 /**
  * Cloudflare Worker environment bindings.
@@ -28,8 +27,10 @@ export interface Env {
   ALLOWED_TARGET_BRANCHES?: string;
   /** Optional API key for usage endpoints. If set, requires Bearer token authentication. */
   USAGE_API_KEY?: string;
-  /** Comma-separated list of review types to run (e.g., "general,security,performance"). Defaults to "general". */
-  REVIEW_TYPES?: string;
+  /** Dashboard username (set via wrangler secret). Defaults to 'admin' if not set. */
+  DASHBOARD_USERNAME?: string;
+  /** Dashboard password (set via wrangler secret). Required for dashboard login. */
+  DASHBOARD_PASSWORD?: string;
 
   // --- Queues ---
   /** The Queue responsible for processing reviews in the background */
@@ -46,13 +47,10 @@ export interface Env {
 export interface ReviewMessage {
   prNumber: number;
   title: string;
-  diffUrl: string;
   repoFullName: string;
   headSha: string;
   /** The Check Run ID created by the webhook, so the queue consumer can update it */
   checkRunId: number;
   /** Request ID for distributed tracing across webhook → queue → LLM calls */
   requestId?: string;
-  /** Review types to run for this PR (e.g., ["general", "security"]) */
-  reviewTypes?: string[];
 }

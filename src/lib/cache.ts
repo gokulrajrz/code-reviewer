@@ -11,6 +11,7 @@
 
 import type { Env } from '../types/env';
 import { logger } from './logger';
+import { RateLimitError } from './errors';
 
 export interface CacheConfig {
     /** Time-to-live in seconds */
@@ -82,7 +83,7 @@ export async function getCachedData<T>(
         if (!stored) return null;
 
         const entry = JSON.parse(stored) as CacheEntry<T>;
-        
+
         if (!isCacheUsable(entry, allowStale)) {
             // Entry expired and not in grace period
             return null;
@@ -118,7 +119,7 @@ export async function setCachedData<T>(
         await env.USAGE_METRICS.put(cacheKey, JSON.stringify(entry), {
             expirationTtl: ttlSeconds * 2, // Store for 2x TTL to enable stale-while-revalidate
         });
-        
+
         logger.debug('Cache stored', { cacheKey, ttlSeconds });
     } catch (error) {
         logger.warn('Cache write error', { cacheKey, error: String(error) });
@@ -136,11 +137,11 @@ export async function invalidateCache(
     try {
         // List keys matching pattern and delete them
         const keys = await env.USAGE_METRICS.list({ prefix: pattern });
-        
+
         for (const key of keys.keys) {
             await env.USAGE_METRICS.delete(key.name);
         }
-        
+
         logger.info('Cache invalidated', { pattern, count: keys.keys.length });
     } catch (error) {
         logger.error('Cache invalidation error', error instanceof Error ? error : undefined, {
@@ -157,7 +158,8 @@ export async function cachedGitHubFetch<T>(
     url: string,
     init: RequestInit,
     cacheConfig: CacheConfig,
-    fetchFn: (url: string, init: RequestInit) => Promise<Response>
+    fetchFn: (url: string, init: RequestInit) => Promise<Response>,
+    responseType: 'json' | 'text' = 'json'
 ): Promise<T> {
     const cacheKey = generateCacheKey(
         inferCacheType(url),
@@ -166,7 +168,7 @@ export async function cachedGitHubFetch<T>(
 
     // Try cache first
     const cached = await getCachedData<T>(env, cacheKey, cacheConfig.staleWhileRevalidate);
-    
+
     if (cached && isCacheFresh(cached)) {
         // Fresh cache hit - return immediately
         return cached.data;
@@ -194,11 +196,21 @@ export async function cachedGitHubFetch<T>(
         }
 
         if (!response.ok) {
-            throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `GitHub API error: ${response.status} ${response.statusText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
         }
 
-        const data = await response.json() as T;
-        
+        const data = responseType === 'text'
+            ? await response.text() as unknown as T
+            : await response.json() as T;
+
         // Store in cache with ETag
         const etag = response.headers.get('ETag') || undefined;
         await setCachedData(env, cacheKey, data, cacheConfig.ttlSeconds, etag);

@@ -45,7 +45,7 @@ export class Logger {
     constructor(
         private readonly service: string = 'usage-tracker',
         private readonly minLevel: LogLevel = 'info'
-    ) {}
+    ) { }
 
     private shouldLog(level: LogLevel): boolean {
         const levels: LogLevel[] = ['debug', 'info', 'warn', 'error'];
@@ -121,7 +121,7 @@ export class Logger {
     child(additionalContext: LogContext): Logger {
         const childLogger = new Logger(this.service, this.minLevel);
         const originalLog = childLogger.log.bind(childLogger);
-        
+
         childLogger.log = (level: LogLevel, message: string, context?: LogContext, error?: Error) => {
             originalLog(level, message, { ...additionalContext, ...context }, error);
         };
@@ -131,4 +131,4 @@ export class Logger {
 }
 
 // Singleton instance
-export const logger = new Logger('usage-tracker', 'info');
+export const logger = new Logger('code-reviewer', 'info');
