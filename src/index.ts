@@ -242,10 +242,17 @@ export default {
                                 const limit = validateLimit(searchParams.get('limit'));
 
                                 const metrics = await listRepoUsageMetrics(repoFullName, env, limit);
+                                
+                                // Transform metrics to match dashboard expectations
+                                const transformedMetrics = metrics.map(m => ({
+                                    ...m,
+                                    repository: m.repoFullName,
+                                    model: m.calls && m.calls.length > 0 ? m.calls[0].model : 'N/A',
+                                }));
 
                                 response = createCorsJsonResponse(
                                     request,
-                                    metrics,
+                                    transformedMetrics,
                                     200,
                                     { allowedOrigins: '*' },
                                     getRateLimitHeaders(rateLimitResult)
@@ -2530,56 +2537,58 @@ const dashboardHtml = `<!DOCTYPE html>
             const content = document.getElementById('detailContent');
             const title = document.getElementById('detailTitle');
             
-            title.textContent = \`PR #\${review.prNumber} Details\`;
-            content.innerHTML = \`
-                <div style="display: grid; gap: 1rem;">
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-                        <div>
-                            <strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Repository</strong>
-                            <p>\${review.repository}</p>
-                        </div>
-                        <div>
-                            <strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Provider</strong>
-                            <p>\${review.provider}</p>
-                        </div>
-                        <div>
-                            <strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Status</strong>
-                            <p><span class="provider-badge">\${review.status}</span></p>
-                        </div>
-                        <div>
-                            <strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Cost</strong>
-                            <p style="color: var(--accent-green); font-weight: 600;">$\${review.estimatedCost.toFixed(4)}</p>
-                        </div>
-                    </div>
-                    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; padding: 1rem; background: var(--bg-primary); border-radius: var(--radius-md);">
-                        <div style="text-align: center;">
-                            <div style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">\${formatNumber(review.totalTokens)}</div>
-                            <div style="font-size: 0.75rem; color: var(--text-muted);">Tokens</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <div style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">\${review.filesReviewed}</div>
-                            <div style="font-size: 0.75rem; color: var(--text-muted);">Files</div>
-                        </div>
-                        <div style="text-align: center;">
-                            <div style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">\${review.findingsCount}</div>
-                            <div style="font-size: 0.75rem; color: var(--text-muted);">Findings</div>
-                        </div>
-                    </div>
-                    <div>
-                        <strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Timeline</strong>
-                        <p>Started: \${new Date(review.startTime).toLocaleString()}</p>
-                        <p>Duration: \${formatDuration(review.durationMs)}</p>
-                    </div>
-                    <div>
-                        <a href="https://github.com/\${review.repository}/pull/\${review.prNumber}" 
-                           target="_blank" 
-                           class="btn btn-primary"
-                           style="display: inline-flex; text-decoration: none;">
-                            🔗 Open on GitHub
-                        </a>
-                    </div>
-                </div>
-            \`;
+            title.textContent = 'PR #' + review.prNumber + ' Details';
+            content.innerHTML = '<div style="display: grid; gap: 1rem;">' +
+                '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">' +
+                    '<div>' +
+                        '<strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Repository</strong>' +
+                        '<p>' + escapeHtml(review.repository) + '</p>' +
+                    '</div>' +
+                    '<div>' +
+                        '<strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Provider</strong>' +
+                        '<p>' + escapeHtml(review.provider) + '</p>' +
+                    '</div>' +
+                    '<div>' +
+                        '<strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Model</strong>' +
+                        '<p>' + escapeHtml(review.model || 'N/A') + '</p>' +
+                    '</div>' +
+                    '<div>' +
+                        '<strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Status</strong>' +
+                        '<p><span class="provider-badge">' + escapeHtml(review.status) + '</span></p>' +
+                    '</div>' +
+                    '<div>' +
+                        '<strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Cost</strong>' +
+                        '<p style="color: var(--accent-green); font-weight: 600;">$' + review.estimatedCost.toFixed(4) + '</p>' +
+                    '</div>' +
+                '</div>' +
+                '<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; padding: 1rem; background: var(--bg-primary); border-radius: var(--radius-md);">' +
+                    '<div style="text-align: center;">' +
+                        '<div style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">' + formatNumber(review.totalTokens) + '</div>' +
+                        '<div style="font-size: 0.75rem; color: var(--text-muted);">Tokens</div>' +
+                    '</div>' +
+                    '<div style="text-align: center;">' +
+                        '<div style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">' + review.filesReviewed + '</div>' +
+                        '<div style="font-size: 0.75rem; color: var(--text-muted);">Files</div>' +
+                    '</div>' +
+                    '<div style="text-align: center;">' +
+                        '<div style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary);">' + review.findingsCount + '</div>' +
+                        '<div style="font-size: 0.75rem; color: var(--text-muted);">Findings</div>' +
+                    '</div>' +
+                '</div>' +
+                '<div>' +
+                    '<strong style="color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase;">Timeline</strong>' +
+                    '<p>Started: ' + new Date(review.startTime).toLocaleString() + '</p>' +
+                    '<p>Duration: ' + formatDuration(review.durationMs) + '</p>' +
+                '</div>' +
+                '<div>' +
+                    '<a href="https://github.com/' + review.repository + '/pull/' + review.prNumber + '"' +
+                       ' target="_blank"' +
+                       ' class="btn btn-primary"' +
+                       ' style="display: inline-flex; text-decoration: none;">' +
+                        '🔗 Open on GitHub' +
+                    '</a>' +
+                '</div>' +
+            '</div>';
             
             document.getElementById('detailModal').classList.add('active');
         }

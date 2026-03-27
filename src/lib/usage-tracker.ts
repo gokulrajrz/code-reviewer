@@ -371,8 +371,17 @@ export function buildPRUsageMetrics(
         const totalOutputTokens = calls.reduce((sum, c) => sum + c.usage.outputTokens, 0);
         const totalTokens = totalInputTokens + totalOutputTokens;
 
+        // Get the primary model used (most calls)
+        const modelCounts = calls.reduce((acc, call) => {
+            acc[call.model] = (acc[call.model] || 0) + 1;
+            return acc;
+        }, {} as Record<string, number>);
+        const primaryModel = Object.entries(modelCounts)
+            .sort((a, b) => b[1] - a[1])[0]?.[0] || provider;
+
         const estimatedCost = calculateCost(
             provider as 'claude' | 'gemini',
+            primaryModel,
             totalInputTokens,
             totalOutputTokens
         );
