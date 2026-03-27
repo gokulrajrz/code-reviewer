@@ -40,12 +40,18 @@ export const CACHE_TTLS = {
 
 /**
  * Generate a cache key for a GitHub API request.
+ * Keys are truncated to stay within KV's 512-byte limit.
  */
 export function generateCacheKey(
     type: 'file' | 'pr-files' | 'repo' | 'user' | 'check-run',
     identifier: string
 ): string {
-    return `github:${type}:${identifier}`;
+    // KV keys have a 512-byte limit. Truncate long identifiers.
+    const maxIdentifierLength = 480 - `github:${type}:`.length;
+    const safeIdentifier = identifier.length > maxIdentifierLength
+        ? identifier.substring(0, maxIdentifierLength)
+        : identifier;
+    return `github:${type}:${safeIdentifier}`;
 }
 
 /**

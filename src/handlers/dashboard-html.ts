@@ -1,4 +1,5 @@
 // — Dashboard HTML Templates —
+import { WORKER_VERSION } from '../config/constants';
 
 export function loginHtml(error?: string): string {
     return `<!DOCTYPE html>
@@ -417,7 +418,7 @@ export function loginHtml(error?: string): string {
                 </div>
             </div>
             
-            <div class="version-tag">v2.0.0 // BUILD_2024</div>
+            <div class="version-tag">v${WORKER_VERSION} // BUILD_2024</div>
         </div>
     </div>
 </body>

@@ -2,12 +2,15 @@ import { LLMProviderAdapter, type LLMProviderConfig, type LLMResponse, type Chun
 import { CHUNK_REVIEWER_PROMPT, SYNTHESIZER_PROMPT } from '../../../config/system-prompt';
 import { MODELS } from '../../../config/constants';
 import { logger } from '../../logger';
-import { RateLimitError } from '../../errors';
+import { handleLLMErrorResponse } from '../error-handler';
 import type { TokenUsage } from '../../../types/usage';
 
 /**
  * Google Gemini LLM Provider Adapter
  * Implements the adapter pattern for Google's Gemini API.
+ * 
+ * Uses the `systemInstruction` field for proper system prompt handling
+ * instead of faking it as a conversation turn.
  */
 export class GeminiAdapter extends LLMProviderAdapter {
     private readonly model: string;
@@ -51,9 +54,11 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                     'content-type': 'application/json',
                 },
                 body: JSON.stringify({
+                    // Use systemInstruction for proper system prompt handling
+                    systemInstruction: {
+                        parts: [{ text: request.systemPrompt || CHUNK_REVIEWER_PROMPT }],
+                    },
                     contents: [
-                        { role: 'user', parts: [{ text: request.systemPrompt || CHUNK_REVIEWER_PROMPT }] },
-                        { role: 'model', parts: [{ text: 'I understand. I will analyze code chunks and return findings as JSON.' }] },
                         { role: 'user', parts: [{ text: userPrompt }] },
                     ],
                     generationConfig: {
@@ -66,23 +71,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         );
 
         if (!response.ok) {
-            const errorText = await response.text();
-            // Extract retry-after header for rate limit errors
-            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
-            // Sanitize error message to prevent potential API key leaks
-            const sanitizedError = errorText
-                .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
-                .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
-                .substring(0, 500); // Limit error text length
-            const errorMessage = `Gemini API error: ${response.status} ${response.statusText} - ${sanitizedError}`;
-            // Throw RateLimitError for 429 responses with retry-after header
-            if (response.status === 429 && retryAfter) {
-                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
-                if (!isNaN(retryAfterMs)) {
-                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
-                }
-            }
-            throw new Error(errorMessage);
+            await handleLLMErrorResponse(response, 'Gemini');
         }
 
         const data = await response.json() as {
@@ -126,9 +115,10 @@ ${payload}`;
                     'content-type': 'application/json',
                 },
                 body: JSON.stringify({
+                    systemInstruction: {
+                        parts: [{ text: request.systemPrompt || SYNTHESIZER_PROMPT }],
+                    },
                     contents: [
-                        { role: 'user', parts: [{ text: request.systemPrompt || SYNTHESIZER_PROMPT }] },
-                        { role: 'model', parts: [{ text: 'I understand. I will synthesize code review findings into markdown.' }] },
                         { role: 'user', parts: [{ text: userPrompt }] },
                     ],
                     generationConfig: {
@@ -141,23 +131,7 @@ ${payload}`;
         );
 
         if (!response.ok) {
-            const errorText = await response.text();
-            // Extract retry-after header for rate limit errors
-            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
-            // Sanitize error message to prevent potential API key leaks
-            const sanitizedError = errorText
-                .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
-                .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
-                .substring(0, 500); // Limit error text length
-            const errorMessage = `Gemini API error: ${response.status} ${response.statusText} - ${sanitizedError}`;
-            // Throw RateLimitError for 429 responses with retry-after header
-            if (response.status === 429 && retryAfter) {
-                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
-                if (!isNaN(retryAfterMs)) {
-                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
-                }
-            }
-            throw new Error(errorMessage);
+            await handleLLMErrorResponse(response, 'Gemini');
         }
 
         const data = await response.json() as {

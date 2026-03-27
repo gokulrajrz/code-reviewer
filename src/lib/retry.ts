@@ -368,6 +368,11 @@ export class CircuitBreaker {
 
 /**
  * Global circuit breakers for external services.
+ * 
+ * WARNING: These are in-memory and therefore local to the current Worker instance.
+ * If the instance is recycled, the circuit breaker state resets to 'closed',
+ * meaning a cascading failure might not be fully prevented across all edge nodes.
+ * For true global circuit breaking, use Durable Objects or KV.
  */
 export const circuitBreakers = {
     github: new CircuitBreaker('github-api', { failureThreshold: 5, cooldownMs: 30000 }),

@@ -56,9 +56,9 @@ let lastCleanupTime = Date.now();
  * Uses CF-Connecting-IP header (provided by Cloudflare) or falls back to other headers.
  * Returns a hashed identifier to ensure fixed key length for KV storage.
  */
-function getClientId(request: Request): string {
+async function getClientId(request: Request): Promise<string> {
     let clientId: string;
-    
+
     // Cloudflare-specific headers (most reliable)
     const cfIp = request.headers.get('CF-Connecting-IP');
     if (cfIp) {
@@ -82,23 +82,22 @@ function getClientId(request: Request): string {
             }
         }
     }
-    
-    // Hash the client ID to ensure fixed length (prevent KV key limit issues)
+
+    // Hash the client ID with SHA-256 for fixed length and uniform distribution
     // KV has a 512 character key limit
-    return `ratelimit:${hashString(clientId)}`;
+    const hash = await hashStringSHA256(clientId);
+    return `ratelimit:${hash}`;
 }
 
 /**
- * Simple string hash for fingerprinting.
+ * SHA-256 hash for reliable, collision-resistant client fingerprinting.
  */
-function hashString(str: string): string {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32bit integer
-    }
-    return Math.abs(hash).toString(16);
+async function hashStringSHA256(str: string): Promise<string> {
+    const data = new TextEncoder().encode(str);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuffer))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
 }
 
 /**
@@ -121,17 +120,24 @@ function hasValidApiKey(request: Request, env: Env): boolean {
 
 /**
  * Check rate limit for a request using in-memory token bucket.
- * This is suitable for single-worker deployments or when strict distributed limiting isn't required.
+ * 
+ * WARNING: Cloudflare Workers are stateless and instances are recycled frequently.
+ * This in-memory rate limiter will:
+ * 1. Reset on every cold start (allowing potential burst abuse).
+ * 2. Not limit requests spread across multiple edge nodes/instances.
+ * 
+ * Use `checkRateLimitDistributed` (KV-backed) for accurate global rate limiting.
+ * This local version is only suitable for advisory/best-effort protection.
  */
-export function checkRateLimitLocal(
+export async function checkRateLimitLocal(
     request: Request,
     config: Partial<RateLimitConfig> = {}
-): RateLimitResult {
+): Promise<RateLimitResult> {
     // Lazy cleanup of old buckets
     cleanupOldBuckets();
-    
+
     const cfg = { ...DEFAULT_CONFIG, ...config };
-    const clientId = getClientId(request);
+    const clientId = await getClientId(request);
     const now = Date.now();
     const windowMs = cfg.windowSeconds * 1000;
 
@@ -184,7 +190,7 @@ export async function checkRateLimitDistributed(
     config: Partial<RateLimitConfig> = {}
 ): Promise<RateLimitResult> {
     const cfg = { ...DEFAULT_CONFIG, ...config };
-    const clientId = getClientId(request);
+    const clientId = await getClientId(request);
     const now = Date.now();
     const windowMs = cfg.windowSeconds * 1000;
 
@@ -309,9 +315,9 @@ function cleanupOldBuckets(): void {
     const now = Date.now();
     // Only run cleanup every 60 seconds to avoid overhead
     if (now - lastCleanupTime < 60000) return;
-    
+
     lastCleanupTime = now;
-    
+
     for (const [key, bucket] of localBuckets.entries()) {
         if (now - bucket.lastRefill > LOCAL_BUCKET_MAX_AGE) {
             localBuckets.delete(key);

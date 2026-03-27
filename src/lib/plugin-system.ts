@@ -83,7 +83,7 @@ export class PluginRegistry {
      */
     findPluginsForFile(filename: string): AnalyzerPlugin[] {
         const ext = filename.slice(filename.lastIndexOf('.')).toLowerCase();
-        return this.getAll().filter(p => 
+        return this.getAll().filter(p =>
             p.fileExtensions.length === 0 || p.fileExtensions.includes(ext)
         );
     }
@@ -238,5 +238,8 @@ export class DependencyAnalyzerPlugin implements AnalyzerPlugin {
 }
 
 // Register built-in plugins
+import { SecretScannerPlugin } from './plugins/secret-scanner.plugin';
+
 pluginRegistry.register(new SecurityAnalyzerPlugin());
 pluginRegistry.register(new DependencyAnalyzerPlugin());
+pluginRegistry.register(new SecretScannerPlugin());

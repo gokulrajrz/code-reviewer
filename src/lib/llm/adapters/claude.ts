@@ -2,7 +2,7 @@ import { LLMProviderAdapter, type LLMProviderConfig, type LLMResponse, type Chun
 import { CHUNK_REVIEWER_PROMPT, SYNTHESIZER_PROMPT } from '../../../config/system-prompt';
 import { MODELS } from '../../../config/constants';
 import { logger } from '../../logger';
-import { RateLimitError } from '../../errors';
+import { handleLLMErrorResponse } from '../error-handler';
 import type { TokenUsage } from '../../../types/usage';
 
 /**
@@ -59,23 +59,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         });
 
         if (!response.ok) {
-            const errorText = await response.text();
-            // Extract retry-after header for rate limit errors
-            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
-            // Sanitize error message to prevent potential API key leaks
-            const sanitizedError = errorText
-                .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
-                .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
-                .substring(0, 500); // Limit error text length
-            const errorMessage = `Claude API error: ${response.status} ${response.statusText} - ${sanitizedError}`;
-            // Throw RateLimitError for 429 responses with retry-after header
-            if (response.status === 429 && retryAfter) {
-                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
-                if (!isNaN(retryAfterMs)) {
-                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
-                }
-            }
-            throw new Error(errorMessage);
+            await handleLLMErrorResponse(response, 'Claude');
         }
 
         const data = await response.json() as {
@@ -126,23 +110,7 @@ ${payload}`;
         });
 
         if (!response.ok) {
-            const errorText = await response.text();
-            // Extract retry-after header for rate limit errors
-            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
-            // Sanitize error message to prevent potential API key leaks
-            const sanitizedError = errorText
-                .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
-                .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
-                .substring(0, 500); // Limit error text length
-            const errorMessage = `Claude API error: ${response.status} ${response.statusText} - ${sanitizedError}`;
-            // Throw RateLimitError for 429 responses with retry-after header
-            if (response.status === 429 && retryAfter) {
-                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
-                if (!isNaN(retryAfterMs)) {
-                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
-                }
-            }
-            throw new Error(errorMessage);
+            await handleLLMErrorResponse(response, 'Claude');
         }
 
         const data = await response.json() as {

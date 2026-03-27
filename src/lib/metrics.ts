@@ -36,7 +36,11 @@ export interface OperationalMetrics {
 
 /**
  * In-memory metrics storage for the current worker instance.
- * In production, these would be aggregated externally (e.g., Cloudflare Analytics, DataDog).
+ * 
+ * WARNING: Cloudflare Workers are stateless. This data is lost on every cold start
+ * and only represents the metrics for a single isolate/edge node.
+ * In production, these should be aggregated externally (e.g., Datadog, Prometheus)
+ * or stored in Durable Objects for accurate global counters.
  */
 class MetricsCollector {
     private requestCounts = new Map<string, number>();

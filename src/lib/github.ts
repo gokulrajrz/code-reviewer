@@ -2,6 +2,7 @@ import type { GitHubPRFile } from '../types/github';
 import type { Env } from '../types/env';
 import type { ReviewFinding } from '../types/review';
 import { cachedGitHubFetch, CACHE_TTLS } from './cache';
+import { createProgressiveChunks } from './progressive-chunking';
 import { pluginRegistry } from './plugin-system';
 import {
     MAX_FILE_SIZE_BYTES,
@@ -377,28 +378,21 @@ function splitLargeFileBlock(
 
 /**
  * Builds a file block for a Tier 1 file (full content + diff patch).
+ * Uses progressive-chunking to safely split large files along AST boundaries
+ * before formatting as markdown, ensuring code fences remain intact.
  */
 async function buildTier1Block(
     file: GitHubPRFile,
     token: string,
     env: Env,
-    prContext: { title: string; repoFullName: string; prNumber: number }
-): Promise<{ block: string; findings: ReviewFinding[] }> {
-    let block = `## 🔍 FILE CHANGED: \`${file.filename}\` (${file.status}) — *Full Review*\n`;
+    prContext: { title: string; repoFullName: string; prNumber: number },
+    effectiveMax: number
+): Promise<{ blocks: string[]; findings: ReviewFinding[] }> {
     const findings: ReviewFinding[] = [];
-
-    if (file.patch) {
-        block += `### DIFF PATCH\n\`\`\`diff\n${file.patch}\n\`\`\`\n`;
-    } else {
-        block += `_(No diff patch available)_\n`;
-    }
-
     const content = await fetchFileContent(file.raw_url, token, env);
-    if (content && !content.startsWith('[File too large')) {
-        const ext = file.filename.split('.').pop() ?? '';
-        block += `\n### FULL FILE CONTENT\n\`\`\`${ext}\n${content}\n\`\`\`\n`;
 
-        // Run analyzer plugins on the full file content
+    // Run analyzer plugins on the full file content before chunking
+    if (content && !content.startsWith('[File too large')) {
         try {
             const pluginResult = await pluginRegistry.analyzeFile({
                 filename: file.filename,
@@ -413,12 +407,49 @@ async function buildTier1Block(
                 filename: file.filename
             });
         }
-    } else if (content) {
-        block += `\n${content}\n`;
     }
 
-    block += `\n---\n\n`;
-    return { block, findings };
+    // Determine how to chunk the file content
+    const ext = file.filename.split('.').pop() ?? '';
+    let contentChunks = [content || ''];
+
+    if (content && !content.startsWith('[File too large')) {
+        // Estimate the overhead of the wrapper (diff patch, headers, fences)
+        const wrapperOverhead = (file.patch?.length || 0) + 500;
+        const maxCodeChars = effectiveMax - wrapperOverhead;
+
+        if (content.length > maxCodeChars && maxCodeChars > 1000) {
+            // Use advanced progressive chunking
+            contentChunks = createProgressiveChunks(content, maxCodeChars);
+        }
+    }
+
+    // Wrap each content chunk in markdown
+    const blocks: string[] = [];
+    const isMultiPart = contentChunks.length > 1;
+
+    for (let i = 0; i < contentChunks.length; i++) {
+        const chunkContent = contentChunks[i];
+        const partLabel = isMultiPart ? ` — Part ${i + 1} of ${contentChunks.length}` : '';
+        let block = `## 🔍 FILE CHANGED: \`${file.filename}\` (${file.status})${partLabel} — *Full Review*\n`;
+
+        if (file.patch) {
+            block += `### DIFF PATCH\n\`\`\`diff\n${file.patch}\n\`\`\`\n`;
+        } else {
+            block += `_(No diff patch available)_\n`;
+        }
+
+        if (chunkContent && !chunkContent.startsWith('[File too large')) {
+            block += `\n### FULL FILE CONTENT${partLabel}\n\`\`\`${ext}\n${chunkContent}\n\`\`\`\n`;
+        } else if (chunkContent) {
+            block += `\n${chunkContent}\n`;
+        }
+
+        block += `\n---\n\n`;
+        blocks.push(block);
+    }
+
+    return { blocks, findings };
 }
 
 /**
@@ -493,22 +524,21 @@ export async function buildReviewChunks(
 
     // ── Process Tier 1 files (full content, uses subrequests) ──
     for (const file of tier1) {
-        const { block: fileBlock, findings } = await buildTier1Block(file, token, env, prContext);
+        const { blocks, findings } = await buildTier1Block(file, token, env, prContext, effectiveMax);
         pluginFindings.push(...findings);
 
-        if (fileBlock.length > effectiveMax) {
-            // File is larger than a single chunk — split it safely
-            flushChunk();
-            const parts = splitLargeFileBlock(file.filename, fileBlock, effectiveMax);
-            for (const part of parts) {
-                chunks.push(globalContext + part);
+        for (const fileBlock of blocks) {
+            if (fileBlock.length > effectiveMax) {
+                // Failsafe: if still too large, flush current and put it alone
+                flushChunk();
+                chunks.push(globalContext + fileBlock);
+            } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
+                // Adding this file would exceed the chunk limit — start a new chunk
+                flushChunk();
+                currentChunkText = fileBlock;
+            } else {
+                currentChunkText += fileBlock;
             }
-        } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
-            // Adding this file would exceed the chunk limit — start a new chunk
-            flushChunk();
-            currentChunkText = fileBlock;
-        } else {
-            currentChunkText += fileBlock;
         }
     }
 

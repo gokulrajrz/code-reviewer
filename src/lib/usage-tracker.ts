@@ -15,30 +15,30 @@ async function retryKVOperation<T>(
     maxRetries: number = KV_CONFIG.MAX_RETRIES
 ): Promise<T> {
     let lastError: Error | undefined;
-    
+
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
             return await operation();
         } catch (error) {
             lastError = error instanceof Error ? error : new Error(String(error));
-            
+
             if (attempt < maxRetries) {
                 const delay = Math.min(
                     KV_CONFIG.INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt),
                     KV_CONFIG.MAX_RETRY_DELAY_MS
                 );
-                
+
                 logger.warn(`${operationName} failed, retrying in ${delay}ms`, {
                     attempt: attempt + 1,
                     maxRetries,
                     error: lastError.message,
                 });
-                
+
                 await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
     }
-    
+
     throw new StorageError(
         `${operationName} failed after ${maxRetries} retries`,
         { lastError: lastError?.message }
@@ -56,20 +56,24 @@ export async function storePRUsageMetrics(
     try {
         // Validate metrics before storage
         const validatedMetrics = validatePRUsageMetrics(metrics);
-        
+
         const key = `${KV_KEY_PREFIXES.USAGE}:${validatedMetrics.repoFullName}:${validatedMetrics.prNumber}:${validatedMetrics.headSha}`;
         const prKey = `${KV_KEY_PREFIXES.USAGE}:${validatedMetrics.repoFullName}:${validatedMetrics.prNumber}:${KV_KEY_PREFIXES.LATEST}`;
-        
+
         const serialized = JSON.stringify(validatedMetrics);
-        
+
         // Store with retry logic
+        // We store the validatedMetrics as metadata too! This allows O(1) bulk fetching
+        // without N+1 individual .get() calls. The metadata limit is 1024 bytes which
+        // easily fits this object.
         await retryKVOperation(
             () => env.USAGE_METRICS.put(key, serialized, {
                 expirationTtl: KV_CONFIG.METRICS_TTL_SECONDS,
+                metadata: validatedMetrics
             }),
             'KV put (main key)'
         );
-        
+
         // Store latest key (best effort, don't fail if this fails)
         try {
             await retryKVOperation(
@@ -95,12 +99,12 @@ export async function storePRUsageMetrics(
         if (error instanceof ValidationError) {
             throw error;
         }
-        
+
         logger.error('Failed to store usage metrics', error instanceof Error ? error : undefined, {
             prNumber: metrics.prNumber,
             repoFullName: metrics.repoFullName,
         });
-        
+
         throw new StorageError(
             'Failed to store usage metrics',
             { originalError: error instanceof Error ? error.message : String(error) }
@@ -124,14 +128,14 @@ export async function getPRUsageMetrics(
         validateRepoIdentifier(repo, 'repo');
         validatePRNumber(prNumber);
         validateCommitSha(headSha);
-        
+
         const key = `${KV_KEY_PREFIXES.USAGE}:${repoFullName}:${prNumber}:${headSha}`;
-        
+
         const data = await retryKVOperation(
             () => env.USAGE_METRICS.get(key),
             'KV get'
         );
-        
+
         if (!data) {
             return null;
         }
@@ -142,13 +146,13 @@ export async function getPRUsageMetrics(
         if (error instanceof ValidationError) {
             throw error;
         }
-        
+
         logger.error('Failed to retrieve PR usage metrics', error instanceof Error ? error : undefined, {
             repoFullName,
             prNumber,
             headSha,
         });
-        
+
         throw new StorageError(
             'Failed to retrieve usage metrics',
             { originalError: error instanceof Error ? error.message : String(error) }
@@ -170,14 +174,14 @@ export async function getLatestPRUsageMetrics(
         validateRepoIdentifier(owner, 'owner');
         validateRepoIdentifier(repo, 'repo');
         validatePRNumber(prNumber);
-        
+
         const prKey = `${KV_KEY_PREFIXES.USAGE}:${repoFullName}:${prNumber}:${KV_KEY_PREFIXES.LATEST}`;
-        
+
         const data = await retryKVOperation(
             () => env.USAGE_METRICS.get(prKey),
             'KV get (latest)'
         );
-        
+
         if (!data) {
             return null;
         }
@@ -188,12 +192,12 @@ export async function getLatestPRUsageMetrics(
         if (error instanceof ValidationError) {
             throw error;
         }
-        
+
         logger.error('Failed to retrieve latest PR usage metrics', error instanceof Error ? error : undefined, {
             repoFullName,
             prNumber,
         });
-        
+
         throw new StorageError(
             'Failed to retrieve latest usage metrics',
             { originalError: error instanceof Error ? error.message : String(error) }
@@ -216,54 +220,68 @@ export async function listRepoUsageMetrics(
         validateRepoIdentifier(owner, 'owner');
         validateRepoIdentifier(repo, 'repo');
         const validatedLimit = validateLimit(limit, KV_CONFIG.MAX_LIST_LIMIT);
-        
+
         const prefix = `${KV_KEY_PREFIXES.USAGE}:${repoFullName}:`;
-        
-        const list = await retryKVOperation(
-            () => env.USAGE_METRICS.list({ prefix, limit: validatedLimit }),
-            'KV list'
-        );
-        
         const metrics: PRUsageMetrics[] = [];
-        
-        for (const key of list.keys) {
-            // Skip "latest" keys to avoid duplicates
-            if (key.name.endsWith(`:${KV_KEY_PREFIXES.LATEST}`)) {
-                continue;
-            }
-            
-            try {
-                const data = await retryKVOperation(
-                    () => env.USAGE_METRICS.get(key.name),
-                    `KV get (${key.name})`
-                );
-                if (data) {
-                    const parsed = JSON.parse(data);
-                    metrics.push(validatePRUsageMetrics(parsed));
+
+        // H7/H8 Fix: Implement pagination (cursor) and use metadata to eliminate N+1 reads
+        let cursor: string | undefined;
+        let listComplete = false;
+
+        while (!listComplete && metrics.length < validatedLimit) {
+            const batchLimit = Math.min(1000, validatedLimit - metrics.length);
+            const list = await retryKVOperation(
+                () => env.USAGE_METRICS.list({ prefix, limit: batchLimit, cursor }),
+                'KV list'
+            );
+
+            for (const key of list.keys) {
+                // Skip "latest" keys to avoid duplicates
+                if (key.name.endsWith(`:${KV_KEY_PREFIXES.LATEST}`)) {
+                    continue;
                 }
-            } catch (error) {
-                logger.warn('Failed to parse metrics entry, skipping', {
-                    key: key.name,
-                    error: error instanceof Error ? error.message : String(error),
-                });
-                // Continue processing other entries
+
+                // Read from metadata if available (the new fast path), fallback to get() for old keys
+                try {
+                    if (key.metadata) {
+                        metrics.push(validatePRUsageMetrics(key.metadata));
+                    } else {
+                        // Legacy path for keys saved before metadata was added
+                        const data = await retryKVOperation(
+                            () => env.USAGE_METRICS.get(key.name),
+                            `KV get (${key.name})`
+                        );
+                        if (data) {
+                            const parsed = JSON.parse(data);
+                            metrics.push(validatePRUsageMetrics(parsed));
+                        }
+                    }
+                } catch (error) {
+                    logger.warn('Failed to parse metrics entry, skipping', {
+                        key: key.name,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
+                }
             }
+
+            listComplete = list.list_complete;
+            cursor = list.list_complete ? undefined : list.cursor;
         }
 
         // Sort by timestamp (most recent first)
         metrics.sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime());
-        
+
         return metrics;
     } catch (error) {
         if (error instanceof ValidationError) {
             throw error;
         }
-        
+
         logger.error('Failed to list repo usage metrics', error instanceof Error ? error : undefined, {
             repoFullName,
             limit,
         });
-        
+
         throw new StorageError(
             'Failed to list usage metrics',
             { originalError: error instanceof Error ? error.message : String(error) }
@@ -290,9 +308,9 @@ export async function getRepoUsageStats(
         const [owner, repo] = repoFullName.split('/');
         validateRepoIdentifier(owner, 'owner');
         validateRepoIdentifier(repo, 'repo');
-        
+
         const metrics = await listRepoUsageMetrics(repoFullName, env, KV_CONFIG.MAX_LIST_LIMIT);
-        
+
         const stats = {
             totalReviews: metrics.length,
             totalTokens: 0,
@@ -324,11 +342,11 @@ export async function getRepoUsageStats(
         if (error instanceof ValidationError) {
             throw error;
         }
-        
+
         logger.error('Failed to calculate repo usage stats', error instanceof Error ? error : undefined, {
             repoFullName,
         });
-        
+
         throw new StorageError(
             'Failed to calculate usage statistics',
             { originalError: error instanceof Error ? error.message : String(error) }
@@ -358,15 +376,15 @@ export function buildPRUsageMetrics(
         validateRepoIdentifier(owner, 'owner');
         validateRepoIdentifier(repo, 'repo');
         validateCommitSha(headSha);
-        
+
         if (!['claude', 'gemini'].includes(provider)) {
             throw new ValidationError('Invalid provider', { provider });
         }
-        
+
         if (!Array.isArray(calls) || calls.length === 0) {
             throw new ValidationError('calls must be a non-empty array');
         }
-        
+
         const totalInputTokens = calls.reduce((sum, c) => sum + c.usage.inputTokens, 0);
         const totalOutputTokens = calls.reduce((sum, c) => sum + c.usage.outputTokens, 0);
         const totalTokens = totalInputTokens + totalOutputTokens;
@@ -418,11 +436,11 @@ export function buildPRUsageMetrics(
             prNumber,
             repoFullName,
         });
-        
+
         if (error instanceof ValidationError) {
             throw error;
         }
-        
+
         throw new ValidationError(
             'Failed to build usage metrics',
             { originalError: error instanceof Error ? error.message : String(error) }

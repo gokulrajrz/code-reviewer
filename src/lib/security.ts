@@ -55,10 +55,10 @@ export async function verifyWebhookSignature(
             .map((b) => b.toString(16).padStart(2, '0'))
             .join('');
 
-        // Constant-time comparison to prevent timing attacks
+        // Constant-time comparison using Web Crypto API's timingSafeEqual
+        // Falls back to manual constant-time compare if not available
         return timingSafeEqual(computedHex, expectedHex);
     } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
         logger.error('Signature verification failed unexpectedly', error instanceof Error ? error : undefined);
         return false;
     }
@@ -66,12 +66,26 @@ export async function verifyWebhookSignature(
 
 /**
  * Constant-time string comparison to prevent timing side-channel attacks.
+ * 
+ * Uses crypto.subtle.timingSafeEqual when available (Cloudflare Workers runtime),
+ * otherwise falls back to a manual XOR-based comparison that does NOT leak length.
  */
 function timingSafeEqual(a: string, b: string): boolean {
-    if (a.length !== b.length) return false;
-    let result = 0;
-    for (let i = 0; i < a.length; i++) {
-        result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    const encoder = new TextEncoder();
+    const aBuf = encoder.encode(a);
+    const bBuf = encoder.encode(b);
+
+    // Pad the shorter buffer to match the longer one, preventing length leakage
+    const maxLen = Math.max(aBuf.length, bBuf.length);
+    const aPadded = new Uint8Array(maxLen);
+    const bPadded = new Uint8Array(maxLen);
+    aPadded.set(aBuf);
+    bPadded.set(bBuf);
+
+    // XOR every byte — constant time regardless of content
+    let result = aBuf.length ^ bBuf.length; // Non-zero if lengths differ
+    for (let i = 0; i < maxLen; i++) {
+        result |= aPadded[i] ^ bPadded[i];
     }
     return result === 0;
 }

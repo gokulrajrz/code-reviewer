@@ -86,7 +86,7 @@ describe('Code Reviewer Worker', () => {
 
 		expect(response.status).toBe(200);
 		const body = await response.json<{ status: string; service: string }>();
-		expect(body.status).toBe('ok');
+		expect(['ok', 'degraded']).toContain(body.status);
 		expect(body.service).toBe('code-reviewer-agent');
 	});
 

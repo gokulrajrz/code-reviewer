@@ -2,8 +2,9 @@
  * Request context for distributed tracing.
  * Manages request ID propagation across async boundaries.
  * 
- * Note: Uses a Worker-compatible implementation instead of Node.js AsyncLocalStorage
- * since Cloudflare Workers doesn't support the node:async_hooks module.
+ * Uses a stack-based approach to support concurrent async contexts safely.
+ * Each runWithContext(Async) pushes/pops its own context, so concurrent
+ * queue message processing (Promise.all) won't clobber each other.
  */
 
 export interface RequestContext {
@@ -15,12 +16,11 @@ export interface RequestContext {
     [key: string]: unknown;
 }
 
-// Worker-compatible context storage using explicit context passing
-// We use a simple Map with request IDs since Workers are single-threaded per request
+// Stack-based context storage: supports nested and concurrent contexts.
+// The stack tracks the LIFO order of synchronous context pushes.
+// Each unique requestId maps to its context in the store for lookup.
 const contextStore = new Map<string, RequestContext>();
-
-// Track the current request ID for the executing context
-let currentRequestId: string | null = null;
+const contextStack: string[] = [];
 
 /**
  * Generate a unique request ID
@@ -43,64 +43,76 @@ export function extractOrGenerateRequestId(headers: Headers): string {
 }
 
 /**
- * Run a function within a request context
- * Worker-compatible implementation using explicit context passing
+ * Run a function within a request context (synchronous).
+ * Safe for concurrent usage — each call gets its own stack frame.
  */
 export function runWithContext<T>(context: RequestContext, fn: () => T): T {
-    const previousRequestId = currentRequestId;
-    currentRequestId = context.requestId;
     contextStore.set(context.requestId, context);
-    
+    contextStack.push(context.requestId);
+
     try {
         return fn();
     } finally {
-        // Cleanup
+        contextStack.pop();
         contextStore.delete(context.requestId);
-        currentRequestId = previousRequestId;
     }
 }
 
 /**
- * Run an async function within a request context
- * Worker-compatible implementation using explicit context passing
+ * Run an async function within a request context.
+ * 
+ * IMPORTANT: For concurrent async operations (e.g. Promise.all on queue messages),
+ * each async task gets its own context that persists in the store for the duration
+ * of the task. The stack top is only used as a fallback for synchronous callers;
+ * async callers should pass context explicitly or use getContextById().
  */
 export async function runWithContextAsync<T>(context: RequestContext, fn: () => Promise<T>): Promise<T> {
-    const previousRequestId = currentRequestId;
-    currentRequestId = context.requestId;
     contextStore.set(context.requestId, context);
-    
+    contextStack.push(context.requestId);
+
     try {
         return await fn();
     } finally {
-        // Cleanup
+        // Remove from stack — but only our own entry (handle concurrent pops gracefully)
+        const idx = contextStack.lastIndexOf(context.requestId);
+        if (idx >= 0) {
+            contextStack.splice(idx, 1);
+        }
         contextStore.delete(context.requestId);
-        currentRequestId = previousRequestId;
     }
 }
 
 /**
- * Get the current request context
+ * Get a specific request context by ID.
+ * Preferred for concurrent async contexts where stack-top is unreliable.
+ */
+export function getContextById(requestId: string): RequestContext | undefined {
+    return contextStore.get(requestId);
+}
+
+/**
+ * Get the current request context (top of stack).
+ * NOTE: In concurrent async scenarios, prefer getContextById() with an explicit ID.
  */
 export function getRequestContext(): RequestContext | undefined {
-    if (currentRequestId) {
-        return contextStore.get(currentRequestId);
-    }
-    return undefined;
+    const currentId = contextStack.length > 0 ? contextStack[contextStack.length - 1] : null;
+    return currentId ? contextStore.get(currentId) : undefined;
 }
 
 /**
- * Get the current request ID
+ * Get the current request ID (top of stack).
  */
 export function getRequestId(): string | undefined {
-    return currentRequestId || undefined;
+    return contextStack.length > 0 ? contextStack[contextStack.length - 1] : undefined;
 }
 
 /**
- * Add context to the current request context
+ * Add context to a specific request context
  */
-export function addToContext(key: string, value: unknown): void {
-    if (currentRequestId) {
-        const context = contextStore.get(currentRequestId);
+export function addToContext(key: string, value: unknown, requestId?: string): void {
+    const id = requestId ?? (contextStack.length > 0 ? contextStack[contextStack.length - 1] : null);
+    if (id) {
+        const context = contextStore.get(id);
         if (context) {
             context[key] = value;
         }
@@ -108,13 +120,12 @@ export function addToContext(key: string, value: unknown): void {
 }
 
 /**
- * Create a child context for queue messages
- * Preserves the request ID while allowing additional context
+ * Create a child context for queue messages.
+ * Always generates a NEW unique requestId so concurrent queue messages don't collide.
  */
 export function createChildContext(additionalContext: Omit<RequestContext, 'requestId'> = {}): RequestContext {
-    const parentContext = currentRequestId ? contextStore.get(currentRequestId) : undefined;
     return {
-        requestId: parentContext?.requestId || generateRequestId(),
+        requestId: generateRequestId(),
         startTime: Date.now(),
         ...additionalContext,
     };

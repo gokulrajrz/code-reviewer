@@ -122,7 +122,8 @@ export class Logger {
         const childLogger = new Logger(this.service, this.minLevel);
         const originalLog = childLogger.log.bind(childLogger);
 
-        childLogger.log = (level: LogLevel, message: string, context?: LogContext, error?: Error) => {
+        // Override the log method safely on the instance without modifying the prototype
+        childLogger.log = function (this: Logger, level: LogLevel, message: string, context?: LogContext, error?: Error): void {
             originalLog(level, message, { ...additionalContext, ...context }, error);
         };
 

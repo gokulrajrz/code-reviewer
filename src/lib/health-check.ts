@@ -123,13 +123,23 @@ async function checkLLMHealth(env: Env): Promise<DependencyHealth> {
                 },
             });
 
-            if (response.ok || response.status === 401) {
-                // 401 means key is valid but we need to authenticate properly
-                // That's fine for a health check - the API is reachable
+            // Always consume response body to prevent socket/connection leaks
+            await response.body?.cancel();
+
+            if (response.ok) {
                 return {
                     name,
                     status: 'healthy',
                     latencyMs: Date.now() - startTime,
+                    lastChecked: new Date().toISOString(),
+                };
+            } else if (response.status === 401) {
+                // 401 means API key is invalid/expired — API is reachable but reviewer can't function
+                return {
+                    name,
+                    status: 'degraded',
+                    latencyMs: Date.now() - startTime,
+                    message: 'API key is invalid or expired',
                     lastChecked: new Date().toISOString(),
                 };
             } else {
@@ -147,11 +157,22 @@ async function checkLLMHealth(env: Env): Promise<DependencyHealth> {
                 { method: 'GET' }
             );
 
+            // Always consume response body to prevent socket/connection leaks
+            await response.body?.cancel();
+
             if (response.ok) {
                 return {
                     name,
                     status: 'healthy',
                     latencyMs: Date.now() - startTime,
+                    lastChecked: new Date().toISOString(),
+                };
+            } else if (response.status === 401 || response.status === 403) {
+                return {
+                    name,
+                    status: 'degraded',
+                    latencyMs: Date.now() - startTime,
+                    message: 'API key is invalid or expired',
                     lastChecked: new Date().toISOString(),
                 };
             } else {
