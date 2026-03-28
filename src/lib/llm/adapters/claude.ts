@@ -67,9 +67,14 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         const data = await response.json() as {
             content: Array<{ type: string; text: string }>;
             usage: { input_tokens: number; output_tokens: number };
+            stop_reason?: string;
         };
 
-        const content = data.content.find(c => c.type === 'text')?.text ?? '';
+        let content = data.content.find(c => c.type === 'text')?.text ?? '';
+
+        if (data.stop_reason === 'max_tokens') {
+            content += '\n\n---\n\n> ⚠️ **AI Generation Truncated** — The model reached its maximum output token limit. The rest of this chunk could not be analyzed.';
+        }
 
         const usage: TokenUsage = {
             inputTokens: data.usage.input_tokens,
@@ -100,6 +105,7 @@ ${payload}`;
             headers: {
                 'x-api-key': this.config.apiKey,
                 'anthropic-version': '2023-06-01',
+                'anthropic-beta': 'max-tokens-3-5-sonnet-2024-07-15',
                 'content-type': 'application/json',
             },
             body: JSON.stringify({
@@ -121,9 +127,16 @@ ${payload}`;
         const data = await response.json() as {
             content: Array<{ type: string; text: string }>;
             usage: { input_tokens: number; output_tokens: number };
+            stop_reason?: string;
         };
 
-        const content = data.content.find(c => c.type === 'text')?.text ?? '';
+        let content = data.content.find(c => c.type === 'text')?.text ?? '';
+
+        if (data.stop_reason === 'max_tokens') {
+            const openFences = (content.match(/```/g) || []).length;
+            const needsClose = openFences % 2 !== 0;
+            content += (needsClose ? '\n```\n' : '\n') + '\n---\n\n> ⚠️ **AI Generation Truncated** — The model reached its maximum output token limit (`max_tokens`). The remainder of the review has been abruptly cut off. Consider reviewing the raw findings data or breaking the PR into smaller chunks.';
+        }
 
         const usage: TokenUsage = {
             inputTokens: data.usage.input_tokens,

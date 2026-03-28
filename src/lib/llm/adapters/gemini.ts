@@ -81,11 +81,16 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         const data = await response.json() as {
             candidates: Array<{
                 content: { parts: Array<{ text: string }> };
+                finishReason?: string;
             }>;
             usageMetadata: { promptTokenCount: number; candidatesTokenCount: number };
         };
 
-        const content = data.candidates[0]?.content?.parts[0]?.text ?? '';
+        let content = data.candidates[0]?.content?.parts[0]?.text ?? '';
+
+        if (data.candidates[0]?.finishReason === 'MAX_TOKENS') {
+            content += '\n\n---\n\n> ⚠️ **AI Generation Truncated** — The model reached its maximum output token limit. The rest of this chunk could not be analyzed.';
+        }
 
         const usage: TokenUsage = {
             inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
@@ -146,11 +151,18 @@ ${payload}`;
         const data = await response.json() as {
             candidates: Array<{
                 content: { parts: Array<{ text: string }> };
+                finishReason?: string;
             }>;
             usageMetadata: { promptTokenCount: number; candidatesTokenCount: number };
         };
 
-        const content = data.candidates[0]?.content?.parts[0]?.text ?? '';
+        let content = data.candidates[0]?.content?.parts[0]?.text ?? '';
+
+        if (data.candidates[0]?.finishReason === 'MAX_TOKENS') {
+            const openFences = (content.match(/```/g) || []).length;
+            const needsClose = openFences % 2 !== 0;
+            content += (needsClose ? '\n```\n' : '\n') + '\n---\n\n> ⚠️ **AI Generation Truncated** — The model reached its maximum output token limit (`max_tokens`). The remainder of the review has been abruptly cut off. Consider reviewing the raw findings data or breaking the PR into smaller chunks.';
+        }
 
         const usage: TokenUsage = {
             inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
