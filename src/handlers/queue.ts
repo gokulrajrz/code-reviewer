@@ -1,5 +1,5 @@
 import type { Env, ReviewMessage } from '../types/env';
-import type { ReviewFinding, SynthesizerInput } from '../types/review';
+import type { ReviewFinding, SynthesizerInput, AnnotatedFinding } from '../types/review';
 import type { LLMCallUsage } from '../types/usage';
 import { MAX_CHUNK_CHARS, MAX_LLM_CHUNKS, MAX_SYNTHESIZER_INPUT_CHARS, DEFAULT_AI_PROVIDER } from '../config/constants';
 import {
@@ -15,6 +15,10 @@ import { buildPRUsageMetrics, storePRUsageMetrics } from '../lib/usage-tracker';
 import { logger } from '../lib/logger';
 import { runWithContextAsync } from '../lib/request-context';
 import { loadReviewConfig, buildCustomPrompt } from '../lib/review-rules';
+import { clusterFindings, flattenClusters } from '../lib/finding-clusters';
+import type { FindingCluster } from '../lib/finding-clusters';
+import { deriveVerdict, verdictToConclusion, countBySeverity } from '../lib/verdict';
+import { formatFindingsAsMarkdown } from '../lib/review-formatter';
 
 /** Maximum time (ms) to wait for a single LLM call before aborting. */
 const LLM_TIMEOUT_MS = 120_000;
@@ -46,47 +50,106 @@ async function withTimeout<T>(
     }
 }
 
+
+
 /**
- * Builds the JSON payload string for the synthesizer (Reduce phase).
- * Includes PR metadata and all findings from the Map phase.
+ * Severity sort order (lower = more severe).
+ */
+const SEVERITY_SORT: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+
+/**
+ * Convert clustered findings into a FLAT, severity-sorted array of AnnotatedFinding[].
+ *
+ * Cluster metadata (similar patterns) is preserved as inline
+ * annotations on each finding — the LLM sees individual findings, not groups.
+ * This prevents the LLM from consolidating similar findings into one block.
+ */
+function flattenClustersToAnnotated(clusters: FindingCluster[]): AnnotatedFinding[] {
+    const annotated: AnnotatedFinding[] = [];
+
+    for (const cluster of clusters) {
+        const isMultiFile = new Set(cluster.findings.map(f => f.file)).size > 1;
+        const fileCount = new Set(cluster.findings.map(f => f.file)).size;
+
+        for (let i = 0; i < cluster.findings.length; i++) {
+            const f = cluster.findings[i];
+            const notes: string[] = [];
+
+
+            // Similar-pattern annotations (only on the first finding to avoid noise)
+            if (cluster.groupReason === 'similar-pattern' && isMultiFile && i === 0) {
+                notes.push(`🔄 This pattern repeats across ${fileCount} files — consider a systematic fix`);
+            }
+
+            annotated.push({
+                ...f,
+                ...(notes.length > 0 ? { annotations: notes } : {}),
+            });
+        }
+    }
+
+    // Sort by severity (critical first), then by file for consistent ordering
+    annotated.sort((a, b) => {
+        const sevDiff = (SEVERITY_SORT[a.severity] ?? 3) - (SEVERITY_SORT[a.severity] ?? 3);
+        if (sevDiff !== 0) return sevDiff;
+        return a.file.localeCompare(b.file);
+    });
+
+    return annotated;
+}
+
+/**
+ * Builds the JSON payload for the synthesizer LLM.
+ *
+ * Findings are FLAT and severity-sorted — not nested in clusters.
+ * This prevents the LLM from consolidating similar findings.
+ * Uses compact JSON to save tokens.
  */
 function buildSynthesizerPayload(
     prTitle: string,
     allFiles: string[],
     skippedCount: number,
-    allFindings: ReviewFinding[],
+    clusters: FindingCluster[],
     totalChunks: number,
-    failedChunks: number
-): string {
+    failedChunks: number,
+    failedChunkFiles: string[]
+): { payload: string; droppedFindingsCount: number } {
+    const allAnnotated = flattenClustersToAnnotated(clusters);
+    const totalFindingsCount = allAnnotated.length;
+
     const input: SynthesizerInput = {
         prTitle,
         allFiles,
         skippedCount,
-        findings: allFindings,
+        findings: allAnnotated,
+        totalFindingsCount,
         totalChunks,
         failedChunks,
+        droppedFindingsCount: 0,
+        failedChunkFiles,
     };
 
-    let payload = JSON.stringify(input, null, 2);
+    // Compact JSON — saves ~30% tokens vs pretty-printed
+    let payload = JSON.stringify(input);
+    let droppedFindingsCount = 0;
 
     // Guard against massive payloads that would blow the LLM context window
     if (payload.length > MAX_SYNTHESIZER_INPUT_CHARS) {
-        logger.warn('Synthesizer payload too large, truncating findings', {
+        logger.warn('Synthesizer payload too large, truncating findings by severity', {
             originalLength: payload.length,
             maxAllowed: MAX_SYNTHESIZER_INPUT_CHARS,
+            totalFindings: totalFindingsCount,
         });
 
-        // Sort findings: critical > high > medium > low, then truncate
-        const severityOrder: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
-        const sorted = [...allFindings].sort(
-            (a, b) => (severityOrder[a.severity] ?? 4) - (severityOrder[b.severity] ?? 4)
-        );
-
-        // Binary search for how many findings fit
-        let lo = 1, hi = sorted.length;
+        // Binary search for how many findings fit (they're already severity-sorted)
+        let lo = 1, hi = allAnnotated.length;
         while (lo < hi) {
             const mid = Math.ceil((lo + hi) / 2);
-            const test: SynthesizerInput = { ...input, findings: sorted.slice(0, mid) };
+            const test: SynthesizerInput = {
+                ...input,
+                findings: allAnnotated.slice(0, mid),
+                droppedFindingsCount: totalFindingsCount - mid,
+            };
             if (JSON.stringify(test).length <= MAX_SYNTHESIZER_INPUT_CHARS) {
                 lo = mid;
             } else {
@@ -94,20 +157,41 @@ function buildSynthesizerPayload(
             }
         }
 
+        droppedFindingsCount = totalFindingsCount - lo;
         const truncated: SynthesizerInput = {
             ...input,
-            findings: sorted.slice(0, lo),
+            findings: allAnnotated.slice(0, lo),
+            droppedFindingsCount,
         };
-        payload = JSON.stringify(truncated, null, 2);
+        payload = JSON.stringify(truncated);
         logger.info('Truncated findings by severity', {
-            kept: lo,
-            total: allFindings.length,
+            keptFindings: lo,
+            totalFindings: totalFindingsCount,
+            droppedFindings: droppedFindingsCount,
         });
     }
 
-    return payload;
+    return { payload, droppedFindingsCount };
 }
 
+/**
+ * Improved deduplication using composite key:
+ * file + normalized title + line number.
+ * Prevents merging genuinely different findings with similar titles.
+ */
+function deduplicateFindings(findings: ReviewFinding[]): ReviewFinding[] {
+    const seen = new Set<string>();
+    const deduplicated: ReviewFinding[] = [];
+    for (const f of findings) {
+        const normalizedTitle = f.title.toLowerCase().trim().replace(/\s+/g, ' ');
+        const key = `${f.file}::${normalizedTitle}::${f.line ?? ''}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            deduplicated.push(f);
+        }
+    }
+    return deduplicated;
+}
 
 
 /**
@@ -115,9 +199,10 @@ function buildSynthesizerPayload(
  * Implements a Map-Reduce pipeline:
  *   Step 1-4: Fetch files, classify, build chunks (unchanged)
  *   Step 5: MAP — Each chunk → LLM → structured JSON findings
- *   Step 6: Flatten & deduplicate findings
- *   Step 7: REDUCE — All findings → LLM → final cohesive markdown
- *   Step 8: Post to GitHub & update Check Run
+ *   Step 6: Deduplicate findings (composite key)
+ *   Step 7: Cluster findings (category-file, similarity)
+ *   Step 8: REDUCE — Clustered findings → LLM → final markdown (tiered fallback)
+ *   Step 9: Post to GitHub & update Check Run (data-driven verdict)
  */
 export async function queueHandler(
     batch: MessageBatch<ReviewMessage>,
@@ -242,7 +327,7 @@ async function processMessage(
         });
 
         // Apply Hard Cap to prevent 50-subrequest limit exhaustion
-        // Budget: chunks × 1 (Map) + 1 (Reduce) + file fetches + auth ≤ 50
+        // Budget: chunks × 1 (Map) + 1-2 (Reduce with fallback) + file fetches + auth ≤ 50
         if (chunks.length > MAX_LLM_CHUNKS) {
             logger.warn('Truncating chunks to prevent subrequest limit', {
                 prNumber,
@@ -262,6 +347,7 @@ async function processMessage(
 
         const allFindings: ReviewFinding[] = [...pluginFindings];
         let failedChunks = 0;
+        const failedChunkFiles: string[] = []; // Track which files lacked coverage
 
         for (let i = 0; i < chunks.length; i++) {
             const chunkContent = chunks[i];
@@ -303,6 +389,17 @@ async function processMessage(
                     chunk: chunkLabel,
                     error: error instanceof Error ? error.message : String(error),
                 });
+
+                // Extract file paths from the chunk content for coverage tracking
+                const fileMatches = chunkContent.match(/(?:File|---)\s*[:`]\s*([^\s`\n]+\.\w+)/g);
+                if (fileMatches) {
+                    for (const match of fileMatches) {
+                        const filePath = match.replace(/(?:File|---)\s*[:`]\s*/, '').trim();
+                        if (filePath && !failedChunkFiles.includes(filePath)) {
+                            failedChunkFiles.push(filePath);
+                        }
+                    }
+                }
                 // Continue processing remaining chunks — graceful degradation
             }
         }
@@ -315,17 +412,9 @@ async function processMessage(
         });
 
         // ══════════════════════════════════════════════════════════════
-        // Step 6: Deduplicate findings (simple: same file + same title)
+        // Step 6: Deduplicate findings (composite key with line numbers)
         // ══════════════════════════════════════════════════════════════
-        const seen = new Set<string>();
-        const deduplicated: ReviewFinding[] = [];
-        for (const f of allFindings) {
-            const key = `${f.file}::${f.title.toLowerCase().trim()}`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                deduplicated.push(f);
-            }
-        }
+        const deduplicated = deduplicateFindings(allFindings);
 
         if (deduplicated.length < allFindings.length) {
             logger.info('Deduplicated findings', {
@@ -336,57 +425,116 @@ async function processMessage(
         }
 
         // ══════════════════════════════════════════════════════════════
-        // Step 7: REDUCE PHASE — Synthesize final review
+        // Step 7: Cluster findings (category, similarity)
         // ══════════════════════════════════════════════════════════════
+        const clusters = clusterFindings(deduplicated);
+        logger.info('Clustered findings', {
+            prNumber,
+            findingsCount: deduplicated.length,
+            clusterCount: clusters.length,
+        });
+
+        // ══════════════════════════════════════════════════════════════
+        // Step 8: REDUCE PHASE — Synthesize final review (tiered fallback)
+        // ══════════════════════════════════════════════════════════════
+        const allChunksFailed = failedChunks === chunks.length && chunks.length > 0;
+
+        // Derive verdict from data BEFORE synthesis — this is deterministic
+        const verdict = deriveVerdict(deduplicated, allChunksFailed);
+        const conclusion = verdictToConclusion(verdict);
+        const severityCounts = countBySeverity(deduplicated);
+
         logger.info('Starting REDUCE phase', {
             prNumber,
             findingsCount: deduplicated.length,
+            clusterCount: clusters.length,
+            verdict,
         });
 
         let finalReview: string;
+        let isFallback = false;
 
-        const synthesizerPayload = buildSynthesizerPayload(
-            title,
-            reviewableFiles,
-            classified.skipped.length,
-            deduplicated,
-            chunks.length,
-            failedChunks
-        );
-
-        try {
-            const result = await withTimeout(
-                (signal) => callSynthesizer(synthesizerPayload, env, signal, customSystemPrompt),
-                LLM_TIMEOUT_MS,
-                'Synthesizer'
+        // Guard: all chunks failed with no findings → skip synthesizer entirely
+        if (allChunksFailed && deduplicated.length === 0) {
+            logger.warn('All chunks failed with no findings, using error review', { prNumber });
+            finalReview =
+                `## ❌ Review Pipeline Error\n\n` +
+                `All ${chunks.length} review chunks failed to process. ` +
+                `The AI reviewer could not analyze this PR.\n\n` +
+                `> You can trigger another review by closing and reopening this PR.\n\n` +
+                `Overall verdict: **Request Changes**`;
+        } else if (deduplicated.length === 0) {
+            // No findings from successful chunks — clean approval, skip LLM call
+            logger.info('Zero findings from successful chunks, producing direct approval', { prNumber });
+            finalReview = formatFindingsAsMarkdown(clusters, {
+                prTitle: title,
+                totalChunks: chunks.length,
+                failedChunks,
+                droppedFindingsCount: 0,
+                failedChunkFiles,
+                isFallback: false,
+            });
+        } else {
+            // Scale output budget based on finding count.
+            // Claude Sonnet 4 supports up to 16384 output tokens.
+            // Each cluster with code blocks needs ~300 tokens for proper rendering.
+            const dynamicMaxTokens = Math.min(16384, 3000 + clusters.length * 300);
+            const { payload: synthesizerPayload, droppedFindingsCount } = buildSynthesizerPayload(
+                title,
+                reviewableFiles,
+                classified.skipped.length,
+                clusters,
+                chunks.length,
+                failedChunks,
+                failedChunkFiles
             );
-            finalReview = result.review;
-            logger.info('Synthesized review', {
-                prNumber,
-                reviewLength: finalReview.length,
-                tokens: result.usage.totalTokens,
-            });
 
-            // Track usage
-            llmCalls.push({
-                phase: 'reduce',
-                model: modelName,
-                usage: result.usage,
-                timestamp: new Date().toISOString(),
-            });
-        } catch (error) {
-            const errMsg = error instanceof Error ? error.message : String(error);
-            logger.error('Synthesizer failed', error instanceof Error ? error : undefined, {
-                prNumber,
-            });
-            throw new Error(`Synthesizer failed to generate review: ${errMsg}`);
+            try {
+                // Tiered fallback: primary → alternate → formatter
+                const result = await withTimeout(
+                    (signal) => callSynthesizer(
+                        synthesizerPayload, env, signal, customSystemPrompt, dynamicMaxTokens
+                    ),
+                    LLM_TIMEOUT_MS,
+                    'Synthesizer'
+                );
+                finalReview = result.review;
+                logger.info('Synthesized review', {
+                    prNumber,
+                    reviewLength: finalReview.length,
+                    tokens: result.usage.totalTokens,
+                });
+
+                // Track usage
+                llmCalls.push({
+                    phase: 'reduce',
+                    model: modelName,
+                    usage: result.usage,
+                    timestamp: new Date().toISOString(),
+                });
+            } catch (error) {
+                // Both LLM providers failed — use fallback formatter
+                const errMsg = error instanceof Error ? error.message : String(error);
+                logger.error('All synthesizer providers failed, using fallback formatter',
+                    error instanceof Error ? error : undefined, { prNumber });
+
+                isFallback = true;
+                finalReview = formatFindingsAsMarkdown(clusters, {
+                    prTitle: title,
+                    totalChunks: chunks.length,
+                    failedChunks,
+                    droppedFindingsCount,
+                    failedChunkFiles,
+                    isFallback: true,
+                });
+            }
         }
 
         // Add metadata banner for multi-chunk reviews
-        if (chunks.length > 1 || failedChunks > 0) {
+        if ((chunks.length > 1 || failedChunks > 0) && !isFallback) {
             const banner = `> ℹ️ **Review Pipeline:** ${chunks.length} chunks processed` +
                 `${failedChunks > 0 ? ` (${failedChunks} failed)` : ''}, ` +
-                `${deduplicated.length} findings synthesized from ` +
+                `${deduplicated.length} findings in ${clusters.length} clusters from ` +
                 `${classified.tier1.length} full-context + ${classified.tier2.length} diff-only files.\n\n`;
             finalReview = banner + finalReview;
         }
@@ -394,9 +542,10 @@ async function processMessage(
         logger.info('Final review ready, posting to PR', {
             prNumber,
             reviewLength: finalReview.length,
+            isFallback,
         });
 
-        // ── Step 8: Post review comment to PR ──
+        // ── Step 9: Post review comment to PR ──
         try {
             await postPRComment(repoFullName, prNumber, finalReview, token);
             logger.info('Review comment posted', { prNumber });
@@ -406,12 +555,7 @@ async function processMessage(
             });
         }
 
-        // ── Step 9: Determine conclusion and update Check Run ──
-        const allChunksFailed = failedChunks === chunks.length && chunks.length > 0;
-        // Robust verdict detection: case-insensitive regex to handle LLM formatting variations
-        const hasRequestedChanges = /\*{1,3}request\s+changes\*{1,3}/i.test(finalReview);
-        const conclusion = allChunksFailed ? 'failure' : hasRequestedChanges ? 'failure' : 'success';
-
+        // ── Step 10: Update Check Run with data-driven verdict ──
         if (checkRunId) {
             try {
                 await updateCheckRun(repoFullName, checkRunId, token, conclusion, finalReview);
@@ -419,6 +563,8 @@ async function processMessage(
                     prNumber,
                     checkRunId,
                     conclusion,
+                    verdict,
+                    severityCounts,
                 });
             } catch (error) {
                 logger.error('Failed to update Check Run', error instanceof Error ? error : undefined, {
@@ -433,9 +579,11 @@ async function processMessage(
         logger.info('Pipeline complete', {
             prNumber,
             conclusion,
+            verdict,
+            isFallback,
         });
 
-        // ── Step 10: Store usage metrics ──
+        // ── Step 11: Store usage metrics ──
         try {
             const usageMetrics = buildPRUsageMetrics(
                 prNumber,

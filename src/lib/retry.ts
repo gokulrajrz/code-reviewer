@@ -376,8 +376,10 @@ export class CircuitBreaker {
  */
 export const circuitBreakers = {
     github: new CircuitBreaker('github-api', { failureThreshold: 5, cooldownMs: 30000 }),
-    anthropic: new CircuitBreaker('anthropic-llm', { failureThreshold: 3, cooldownMs: 60000 }),
-    gemini: new CircuitBreaker('gemini-llm', { failureThreshold: 3, cooldownMs: 60000 }),
+    anthropicMap: new CircuitBreaker('anthropic-map', { failureThreshold: 3, cooldownMs: 60000 }),
+    anthropicSynth: new CircuitBreaker('anthropic-synth', { failureThreshold: 2, cooldownMs: 45000 }),
+    geminiMap: new CircuitBreaker('gemini-map', { failureThreshold: 3, cooldownMs: 60000 }),
+    geminiSynth: new CircuitBreaker('gemini-synth', { failureThreshold: 2, cooldownMs: 45000 }),
 };
 
 /**

@@ -28,6 +28,8 @@ export interface ChunkReviewRequest {
 export interface SynthesisRequest {
     payload: string;
     systemPrompt?: string;
+    /** Dynamic output budget — overrides the adapter default when set. */
+    maxTokens?: number;
 }
 
 /**
@@ -102,19 +104,5 @@ export class LLMProviderFactory {
             throw new Error(`Unknown LLM provider: ${name}. Available: ${Array.from(this.adapters.keys()).join(', ')}`);
         }
         return new AdapterClass(config);
-    }
-
-    /**
-     * Get list of available provider names.
-     */
-    static getAvailableProviders(): string[] {
-        return Array.from(this.adapters.keys());
-    }
-
-    /**
-     * Check if a provider is registered.
-     */
-    static isProviderRegistered(name: string): boolean {
-        return this.adapters.has(name.toLowerCase());
     }
 }

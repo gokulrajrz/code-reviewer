@@ -20,6 +20,46 @@ import { RateLimitError } from './errors';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 
+/**
+ * GitHub limits comment/check-run text to 65,535 characters.
+ * This constant leaves room for the truncation notice we append.
+ */
+const GITHUB_MAX_BODY_CHARS = 64_000;
+
+/**
+ * Structure-aware markdown truncation.
+ *
+ * Instead of slicing mid-sentence or mid-code-block, finds the last
+ * clean section boundary (`---`, `## `, or `### `) within the limit
+ * and appends a truncation notice.
+ */
+function truncateMarkdown(text: string, maxChars: number = GITHUB_MAX_BODY_CHARS): string {
+    if (text.length <= maxChars) return text;
+
+    // Search for the last section boundary within the limit
+    const searchRegion = text.slice(0, maxChars);
+
+    // Try progressively less granular boundaries
+    let cutPoint = searchRegion.lastIndexOf('\n---');
+    if (cutPoint < maxChars * 0.5) cutPoint = searchRegion.lastIndexOf('\n## ');
+    if (cutPoint < maxChars * 0.5) cutPoint = searchRegion.lastIndexOf('\n### ');
+    if (cutPoint < maxChars * 0.5) cutPoint = searchRegion.lastIndexOf('\n\n');
+    if (cutPoint < maxChars * 0.3) cutPoint = maxChars; // Fallback: hard cut
+
+    const truncated = text.slice(0, cutPoint);
+
+    // Close any unclosed code fences
+    const openFences = (truncated.match(/```/g) || []).length;
+    const needsClose = openFences % 2 !== 0;
+
+    return truncated
+        + (needsClose ? '\n```' : '')
+        + '\n\n---\n\n'
+        + '> ⚠️ **Review truncated** — the full review exceeded GitHub\'s character limit. '
+        + `Showing ${Math.round(cutPoint / text.length * 100)}% of the review. `
+        + 'Lower-priority findings may be omitted.\n';
+}
+
 function githubHeaders(token: string): HeadersInit {
     return {
         Authorization: `Bearer ${token}`,
@@ -596,10 +636,7 @@ export async function postPRComment(
     const executePost = async (): Promise<void> => {
         const url = `${GITHUB_API_BASE}/repos/${repoFullName}/issues/${prNumber}/comments`;
 
-        // GitHub limits the body field to 65536 characters
-        const truncatedBody = body.length > 65000
-            ? body.slice(0, 65000) + '\n\n_[Comment truncated due to GitHub length limits]_'
-            : body;
+        const truncatedBody = truncateMarkdown(body);
 
         const response = await fetch(url, {
             method: 'POST',
@@ -803,10 +840,7 @@ export async function updateCheckRun(
                 ? 'Changes Requested'
                 : 'AI Code Review';
 
-        // GitHub limits the summary field to 65535 characters
-        const truncatedSummary = summary.length > 65000
-            ? summary.slice(0, 65000) + '\n\n_[Summary truncated due to length]_'
-            : summary;
+        const truncatedSummary = truncateMarkdown(summary);
 
         const response = await fetch(url, {
             method: 'PATCH',

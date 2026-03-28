@@ -163,7 +163,7 @@ export async function getOperationalMetrics(
                 if (data) {
                     const metrics = JSON.parse(data);
                     prsReviewed++;
-                    if (metrics.pipelineStatus === 'failed') {
+                    if (metrics.status === 'failed') {
                         reviewsFailed++;
                     }
                     totalChunks += metrics.chunksProcessed || 0;

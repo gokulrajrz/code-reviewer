@@ -24,9 +24,10 @@ export const MAX_FINDINGS_PER_CHUNK = 50;
 
 /**
  * Maximum characters for the synthesizer input payload.
- * The synthesizer receives JSON findings, not raw code, so this is generous.
+ * 70K tokens ≈ 280K chars. Safe for Claude (200K ctx) and Gemini (1M ctx).
+ * The synthesizer receives clustered JSON findings, not raw code.
  */
-export const MAX_SYNTHESIZER_INPUT_CHARS = 120_000;
+export const MAX_SYNTHESIZER_INPUT_CHARS = 280_000;
 
 /**
  * Character budget for the global PR context prepended to every chunk.

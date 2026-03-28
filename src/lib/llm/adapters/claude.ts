@@ -52,7 +52,9 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                 model: this.model,
                 max_tokens: this.maxTokens,
                 temperature: this.temperature,
-                system: request.systemPrompt || CHUNK_REVIEWER_PROMPT,
+                system: request.systemPrompt
+                    ? `${CHUNK_REVIEWER_PROMPT}\n\n---\n\nADDITIONAL REVIEW CONTEXT:\n${request.systemPrompt}`
+                    : CHUNK_REVIEWER_PROMPT,
                 messages: [{ role: 'user', content: userPrompt }],
             }),
             signal,
@@ -87,8 +89,9 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
 
     async synthesize(request: SynthesisRequest, signal?: AbortSignal): Promise<LLMResponse> {
         const { payload } = request;
+        const outputBudget = request.maxTokens ?? this.maxTokens;
 
-        const userPrompt = `Synthesize these code review findings into a cohesive markdown report:
+        const userPrompt = `Synthesize these code review findings into a final markdown report following the EXACT format in your system instructions:
 
 ${payload}`;
 
@@ -101,9 +104,11 @@ ${payload}`;
             },
             body: JSON.stringify({
                 model: this.model,
-                max_tokens: this.maxTokens,
+                max_tokens: outputBudget,
                 temperature: this.temperature,
-                system: request.systemPrompt || SYNTHESIZER_PROMPT,
+                system: request.systemPrompt
+                    ? `${SYNTHESIZER_PROMPT}\n\n---\n\nADDITIONAL REVIEW CONTEXT:\n${request.systemPrompt}`
+                    : SYNTHESIZER_PROMPT,
                 messages: [{ role: 'user', content: userPrompt }],
             }),
             signal,
