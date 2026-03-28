@@ -69,7 +69,14 @@ export async function storePRUsageMetrics(
         await retryKVOperation(
             () => env.USAGE_METRICS.put(key, serialized, {
                 expirationTtl: KV_CONFIG.METRICS_TTL_SECONDS,
-                metadata: validatedMetrics
+                // CRITICAL: Metadata is strictly limited to 1024 bytes in Cloudflare KV.
+                // Never pass the entire validatedMetrics object as it contains the `calls` array.
+                metadata: {
+                    prNumber: validatedMetrics.prNumber,
+                    repoFullName: validatedMetrics.repoFullName,
+                    totalTokens: validatedMetrics.totalTokens,
+                    estimatedCost: validatedMetrics.estimatedCost,
+                }
             }),
             'KV put (main key)'
         );
