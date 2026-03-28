@@ -185,8 +185,23 @@ Your job is to:
 REQUIRED OUTPUT FORMAT — MARKDOWN, FOLLOW EXACTLY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## 🔍 PR Summary
-> One paragraph: what this PR does, what files it touches, and the overall quality verdict.
+## 📊 Code Review Report
+
+| Metric | Details |
+|--------|---------|
+| **PR Title** | [Insert PR Title] |
+| **Total Findings** | [N] |
+| **Severity Breakdown** | 🔴 [N] Critical &nbsp;\|&nbsp; 🟠 [N] High &nbsp;\|&nbsp; 🟡 [N] Medium &nbsp;\|&nbsp; 🟢 [N] Low |
+| **Coverage Notes** | [If droppedFindingsCount > 0, state: "⚠️ N lower-priority findings omitted" else "Full coverage"] |
+| **Overall Verdict** | **Approve** / **Request Changes** / **Needs Discussion** |
+
+<details>
+<summary>📂 <b>View Analyzed Files ([Total number of files])</b></summary>
+
+[Insert bulleted list of all files in backticks, e.g. - \`path/to/file.tsx\`]
+</details>
+
+> **Architectural Summary:** One paragraph explaining what this PR does, its overall quality, and the most critical risks identified.
 
 ---
 
@@ -220,7 +235,7 @@ For EVERY SINGLE FINDING in the payload, you MUST output this EXACT block struct
 
 ---
 
-### � Critical Issues
+### 🔴 Critical Issues
 
 (Output finding blocks here using the exact format defined above)
 
@@ -236,18 +251,6 @@ For EVERY SINGLE FINDING in the payload, you MUST output this EXACT block struct
 
 (Output finding blocks here using the exact format defined above)
 
----
-
-## ✅ Summary
-| Category | Count |
-|---|---|
-| 🔴 Critical | N |
-| 🟠 High | N |
-| 🟡 Medium | N |
-| 🟢 Low | N |
-
-Overall verdict: **Approve** / **Request Changes** / **Needs Discussion**
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -257,6 +260,6 @@ RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 - NEVER consolidate: if 5 files have the same bug, output 5 separate blocks.
 - NEVER write "same issue as above" or "see above" — each block must be self-contained.
 - Severity sections must be in order: 🔴 Critical → 🟠 High → 🟡 Medium → 🟢 Low.
-- If zero findings were reported in total across all files, just write a short approval message.
-- If some chunks failed, note it but do NOT penalize the PR for missing coverage.
+- If zero findings were reported in total across all files, just write a short approval message following the Summary table.
+- If some chunks failed, note it in Coverage Notes but do NOT penalize the PR for missing coverage.
 `.trim();

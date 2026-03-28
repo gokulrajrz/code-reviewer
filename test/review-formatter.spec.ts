@@ -22,6 +22,7 @@ function makeFinding(opts: Partial<ReviewFinding> & { file: string; category: Re
 }
 
 const defaultOptions: FormatterOptions = {
+    allFiles: ['src/App.tsx', 'src/utils.ts'],
     prTitle: 'Test PR',
     totalChunks: 2,
     failedChunks: 0,
@@ -58,14 +59,13 @@ describe('formatFindingsAsMarkdown', () => {
         const clusters = clusterFindings(findings);
         const md = formatFindingsAsMarkdown(clusters, defaultOptions);
 
-        expect(md).toContain('## 🔍 PR Summary');
+        expect(md).toContain('## 📊 Code Review Report');
         expect(md).toContain('## 🐛 Findings');
-        expect(md).toContain('## ✅ Summary');
         expect(md).toContain('Missing error boundary');
         expect(md).toContain('Unused variable');
-        expect(md).toContain('🔴 Critical | 0');
-        expect(md).toContain('🟠 High | 1');
-        expect(md).toContain('🟢 Low | 1');
+        expect(md).toContain('🔴 0 Critical');
+        expect(md).toContain('🟠 1 High');
+        expect(md).toContain('🟢 1 Low');
         expect(md).toContain('**Request Changes**');
     });
 
@@ -113,7 +113,7 @@ describe('Metadata reporting', () => {
             droppedFindingsCount: 5,
         });
 
-        expect(md).toContain('5 low-priority findings omitted');
+        expect(md).toContain('⚠️ 5 lower-priority findings omitted');
     });
 
     it('reports failed chunk files', () => {
@@ -125,24 +125,12 @@ describe('Metadata reporting', () => {
             failedChunkFiles: ['src/broken.ts', 'src/missing.ts'],
         });
 
-        expect(md).toContain('Incomplete Coverage');
+        expect(md).toContain('Incomplete Coverage Details');
         expect(md).toContain('src/broken.ts');
         expect(md).toContain('src/missing.ts');
     });
 
-    it('reports pipeline metadata for multi-chunk reviews', () => {
-        const clusters = clusterFindings([
-            makeFinding({ file: 'a.ts', category: 'typescript', title: 'Issue' }),
-        ]);
-        const md = formatFindingsAsMarkdown(clusters, {
-            ...defaultOptions,
-            totalChunks: 5,
-            failedChunks: 1,
-        });
-
-        expect(md).toContain('5 chunks processed');
-        expect(md).toContain('1 failed');
-    });
+    // Removed obsolete check for `totalChunks` metadata, as we now only report `failedChunkFiles` for coverage.
 });
 
 // ---------------------------------------------------------------------------

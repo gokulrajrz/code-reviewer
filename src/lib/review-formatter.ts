@@ -42,6 +42,8 @@ const SEVERITY_EMOJI_INLINE: Record<FindingSeverity, string> = {
 // ---------------------------------------------------------------------------
 
 export interface FormatterOptions {
+    /** List of all files analyzed. */
+    allFiles: string[];
     /** PR title for the summary section. */
     prTitle: string;
     /** Total chunks that were processed. */
@@ -101,41 +103,54 @@ export function formatFindingsAsMarkdown(
 
     const sections: string[] = [];
 
-    // ── Fallback Banner ──
+    // ── Code Review Report Table ──
+    sections.push(`## 📊 Code Review Report\n`);
+
+    const sevCounts = countBySeverity(allFindings);
+    const severityBreakdown = `🔴 ${sevCounts.critical} Critical &nbsp;\\|&nbsp; 🟠 ${sevCounts.high} High &nbsp;\\|&nbsp; 🟡 ${sevCounts.medium} Medium &nbsp;\\|&nbsp; 🟢 ${sevCounts.low} Low`;
+
+    let coverageNotes = 'Full coverage';
+    if (options.droppedFindingsCount > 0) {
+        coverageNotes = `⚠️ ${options.droppedFindingsCount} lower-priority findings omitted`;
+    }
+    if (options.failedChunkFiles.length > 0) {
+        coverageNotes += ` (Missing coverage for ${options.failedChunkFiles.length} file${options.failedChunkFiles.length > 1 ? 's' : ''})`;
+    }
+
+    const verdictLabel = verdict === 'approve' ? 'Approve' : (verdict === 'request_changes' ? 'Request Changes' : 'Needs Discussion');
+
+    sections.push(`| Metric | Details |`);
+    sections.push(`|--------|---------|`);
+    sections.push(`| **PR Title** | ${options.prTitle} |`);
+    sections.push(`| **Total Findings** | ${allFindings.length} |`);
+    sections.push(`| **Severity Breakdown** | ${severityBreakdown} |`);
+    sections.push(`| **Coverage Notes** | ${coverageNotes} |`);
+    sections.push(`| **Overall Verdict** | **${verdictLabel}** |\n`);
+
+    // ── Analyzed Files List ──
+    sections.push(`<details>`);
+    sections.push(`<summary>📂 <b>View Analyzed Files (${options.allFiles.length})</b></summary>\n`);
+    sections.push(options.allFiles.map(f => `- \`${f}\``).join('\n') + '\n');
+    sections.push(`</details>\n`);
+
+    // ── Summary Blockquote ──
     if (options.isFallback) {
         sections.push(
             '> ⚠️ **Fallback Mode** — Both AI providers were unavailable. ' +
             'This review was generated from structured findings without LLM synthesis. ' +
             'Cross-file analysis and prose commentary are not included.\n'
         );
-    }
-
-    // ── Pipeline Metadata ──
-    if (options.totalChunks > 1 || options.failedChunks > 0 || options.droppedFindingsCount > 0) {
-        const parts = [`${options.totalChunks} chunks processed`];
-        if (options.failedChunks > 0) {
-            parts.push(`${options.failedChunks} failed`);
-        }
-        if (options.droppedFindingsCount > 0) {
-            parts.push(`${options.droppedFindingsCount} low-priority findings omitted`);
-        }
-        sections.push(`> ℹ️ **Review Pipeline:** ${parts.join(', ')}\n`);
-    }
-
-    // ── PR Summary ──
-    sections.push(`## 🔍 PR Summary\n`);
-    sections.push(
-        `> Review of **"${options.prTitle}"** — ` +
-        `${allFindings.length} finding${allFindings.length !== 1 ? 's' : ''} detected.\n`
-    );
-
-    // ── Failed Chunk Coverage ──
-    if (options.failedChunkFiles.length > 0) {
-        sections.push(`---\n`);
-        sections.push(`## ⚠️ Incomplete Coverage\n`);
+    } else {
         sections.push(
-            `The following files were in chunks that failed to process:\n` +
-            options.failedChunkFiles.map(f => `- \`${f}\``).join('\n') + '\n'
+            `> **Architectural Summary:** Review of "${options.prTitle}" — ${allFindings.length} finding${allFindings.length !== 1 ? 's' : ''} detected.\n`
+        );
+    }
+
+    // ── Failed Chunk Detail ──
+    if (options.failedChunkFiles.length > 0) {
+        sections.push(
+            `**⚠️ Incomplete Coverage Details:** The following files were in chunks that failed to process: ` +
+            options.failedChunkFiles.map(f => `\`${f}\``).join(', ') + '\n'
         );
     }
 
@@ -195,26 +210,6 @@ export function formatFindingsAsMarkdown(
             sections.push(`---\n`);
         }
     }
-
-    // ── Summary Table ──
-    sections.push(`## ✅ Summary\n`);
-    sections.push(
-        `| Category | Count |\n` +
-        `|---|---|\n` +
-        `| 🔴 Critical | ${counts.critical} |\n` +
-        `| 🟠 High | ${counts.high} |\n` +
-        `| 🟡 Medium | ${counts.medium} |\n` +
-        `| 🟢 Low | ${counts.low} |\n`
-    );
-
-    // ── Verdict ──
-    const verdictLabel = verdict === 'approve'
-        ? '**Approve**'
-        : verdict === 'request_changes'
-            ? '**Request Changes**'
-            : '**Needs Discussion**';
-
-    sections.push(`\nOverall verdict: ${verdictLabel}\n`);
 
     return sections.join('\n');
 }

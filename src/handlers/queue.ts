@@ -467,6 +467,7 @@ async function processMessage(
             // No findings from successful chunks — clean approval, skip LLM call
             logger.info('Zero findings from successful chunks, producing direct approval', { prNumber });
             finalReview = formatFindingsAsMarkdown(clusters, {
+                allFiles: reviewableFiles,
                 prTitle: title,
                 totalChunks: chunks.length,
                 failedChunks,
@@ -520,6 +521,7 @@ async function processMessage(
 
                 isFallback = true;
                 finalReview = formatFindingsAsMarkdown(clusters, {
+                    allFiles: reviewableFiles,
                     prTitle: title,
                     totalChunks: chunks.length,
                     failedChunks,
