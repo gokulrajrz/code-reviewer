@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Reviewer - Usage Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            padding: 2rem;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { margin-bottom: 2rem; color: #60a5fa; }
+        .config {
+            background: #1e293b;
+            padding: 1.5rem;
+            border-radius: 8px;
+            margin-bottom: 2rem;
+        }
+        .config input {
+            background: #334155;
+            border: 1px solid #475569;
+            color: #e2e8f0;
+            padding: 0.5rem;
+            border-radius: 4px;
+            margin-right: 0.5rem;
+            width: 200px;
+        }
+        .config button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .config button:hover { background: #2563eb; }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .stat-card {
+            background: #1e293b;
+            padding: 1.5rem;
+            border-radius: 8px;
+            border-left: 4px solid #3b82f6;
+        }
+        .stat-label { color: #94a3b8; font-size: 0.875rem; margin-bottom: 0.5rem; }
+        .stat-value { font-size: 2rem; font-weight: bold; color: #60a5fa; }
+        .stat-sub { color: #64748b; font-size: 0.875rem; margin-top: 0.25rem; }
+        .reviews {
+            background: #1e293b;
+            padding: 1.5rem;
+            border-radius: 8px;
+        }
+        .review-item {
+            background: #334155;
+            padding: 1rem;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+            border-left: 3px solid #10b981;
+        }
+        .review-item.partial { border-left-color: #f59e0b; }
+        .review-item.failed { border-left-color: #ef4444; }
+        .review-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+        .review-title { font-weight: 600; color: #e2e8f0; }
+        .review-cost { color: #10b981; font-weight: bold; }
+        .review-meta { color: #94a3b8; font-size: 0.875rem; }
+        .loading { text-align: center; padding: 2rem; color: #64748b; }
+        .error {
+            background: #7f1d1d;
+            color: #fca5a5;
+            padding: 1rem;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Code Reviewer Usage Dashboard</h1>
+        
+        <div class="config">
+            <input type="text" id="workerUrl" placeholder="Worker URL" value="https://code-reviewer.workers.dev">
+            <input type="text" id="owner" placeholder="Owner (e.g., myorg)">
+            <input type="text" id="repo" placeholder="Repo (e.g., myrepo)">
+            <input type="password" id="apiKey" placeholder="API Key (optional)">
+            <button onclick="loadData()">Load Data</button>
+            <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #64748b;">API key required if worker has USAGE_API_KEY set</div>
+        </div>
+
+        <div id="error" class="error" style="display: none;"></div>
+        <div id="loading" class="loading" style="display: none;">Loading...</div>
+
+        <div id="stats" class="stats" style="display: none;">
+            <div class="stat-card">
+                <div class="stat-label">Total Reviews</div>
+                <div class="stat-value" id="totalReviews">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Cost</div>
+                <div class="stat-value" id="totalCost">-</div>
+                <div class="stat-sub" id="avgCost">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Tokens</div>
+                <div class="stat-value" id="totalTokens">-</div>
+                <div class="stat-sub" id="avgTokens">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">By Provider</div>
+                <div id="byProvider" style="font-size: 0.875rem; margin-top: 0.5rem;"></div>
+            </div>
+        </div>
+
+        <div id="reviews" class="reviews" style="display: none;">
+            <h2 style="margin-bottom: 1rem;">Recent Reviews</h2>
+            <div id="reviewsList"></div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchData(endpoint) {
+            const workerUrl = document.getElementById('workerUrl').value;
+            const owner = document.getElementById('owner').value;
+            const repo = document.getElementById('repo').value;
+            const apiKey = document.getElementById('apiKey').value;
+            
+            const headers = { 'Accept': 'application/json' };
+            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+            
+            const response = await fetch(`${workerUrl}/usage/${owner}/${repo}${endpoint}`, { headers });
+            if (response.status === 401) throw new Error('Invalid API key');
+            if (response.status === 429) {
+                const retry = response.headers.get('Retry-After') || '60';
+                throw new Error(`Rate limited. Retry after ${retry}s`);
+            }
+            if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            return response.json();
+        }
+
+        async function loadData() {
+            const workerUrl = document.getElementById('workerUrl').value.trim();
+            const owner = document.getElementById('owner').value.trim();
+            const repo = document.getElementById('repo').value.trim();
+
+            if (!workerUrl || !owner || !repo) {
+                showError('Please fill in all fields');
+                return;
+            }
+
+            hideError();
+            showLoading();
+
+            try {
+                // Load stats
+                const stats = await fetchData('/stats');
+
+                // Load reviews list
+                const reviews = await fetchData('?limit=20');
+
+                displayStats(stats);
+                displayReviews(reviews);
+                hideLoading();
+            } catch (error) {
+                hideLoading();
+                showError(`Failed to load data: ${error.message}`);
+            }
+        }
+
+        function displayStats(stats) {
+            document.getElementById('totalReviews').textContent = stats.totalReviews;
+            document.getElementById('totalCost').textContent = `$${stats.totalCost.toFixed(2)}`;
+            document.getElementById('avgCost').textContent = `Avg: $${stats.avgCostPerReview.toFixed(4)} per review`;
+            document.getElementById('totalTokens').textContent = formatNumber(stats.totalTokens);
+            document.getElementById('avgTokens').textContent = `Avg: ${formatNumber(Math.round(stats.avgTokensPerReview))} per review`;
+
+            const providerHtml = Object.entries(stats.byProvider)
+                .map(([provider, data]) => `
+                    <div style="margin-bottom: 0.5rem;">
+                        <strong>${provider}:</strong> ${data.reviews} reviews, $${data.cost.toFixed(2)}
+                    </div>
+                `)
+                .join('');
+            document.getElementById('byProvider').innerHTML = providerHtml || 'No data';
+
+            document.getElementById('stats').style.display = 'grid';
+        }
+
+        function displayReviews(reviews) {
+            const html = reviews.map(review => {
+                const date = new Date(review.startTime).toLocaleString();
+                const duration = (review.durationMs / 1000).toFixed(1);
+                return `
+                    <div class="review-item ${review.status}">
+                        <div class="review-header">
+                            <div class="review-title">PR #${review.prNumber}</div>
+                            <div class="review-cost">$${review.estimatedCost.toFixed(4)}</div>
+                        </div>
+                        <div class="review-meta">
+                            ${date} • ${duration}s • 
+                            ${formatNumber(review.totalTokens)} tokens • 
+                            ${review.filesReviewed} files • 
+                            ${review.chunksProcessed} chunks • 
+                            ${review.findingsCount} findings • 
+                            ${review.provider}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            document.getElementById('reviewsList').innerHTML = html || '<p>No reviews found</p>';
+            document.getElementById('reviews').style.display = 'block';
+        }
+
+        function formatNumber(num) {
+            return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+        }
+
+        function showLoading() {
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('stats').style.display = 'none';
+            document.getElementById('reviews').style.display = 'none';
+        }
+
+        function hideLoading() {
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        function showError(message) {
+            const errorEl = document.getElementById('error');
+            errorEl.textContent = message;
+            errorEl.style.display = 'block';
+        }
+
+        function hideError() {
+            document.getElementById('error').style.display = 'none';
+        }
+    </script>
+</body>
+</html>

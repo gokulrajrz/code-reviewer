@@ -25,10 +25,20 @@ export interface Env {
   AI_PROVIDER: AIProvider;
   /** Comma-separated list of target branches to review (e.g., "dev,main"). If unset, all branches are reviewed. */
   ALLOWED_TARGET_BRANCHES?: string;
+  /** Optional API key for usage endpoints. If set, requires Bearer token authentication. */
+  USAGE_API_KEY?: string;
+  /** Dashboard username (set via wrangler secret). Defaults to 'admin' if not set. */
+  DASHBOARD_USERNAME?: string;
+  /** Dashboard password (set via wrangler secret). Required for dashboard login. */
+  DASHBOARD_PASSWORD?: string;
 
   // --- Queues ---
   /** The Queue responsible for processing reviews in the background */
   REVIEW_QUEUE: Queue<ReviewMessage>;
+
+  // --- KV Namespaces ---
+  /** KV namespace for storing usage metrics and cost tracking */
+  USAGE_METRICS: KVNamespace;
 }
 
 /**
@@ -37,9 +47,10 @@ export interface Env {
 export interface ReviewMessage {
   prNumber: number;
   title: string;
-  diffUrl: string;
   repoFullName: string;
   headSha: string;
   /** The Check Run ID created by the webhook, so the queue consumer can update it */
   checkRunId: number;
+  /** Request ID for distributed tracing across webhook → queue → LLM calls */
+  requestId?: string;
 }

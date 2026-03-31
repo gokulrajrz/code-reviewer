@@ -99,6 +99,17 @@ SECURITY & PERFORMANCE
 - CIRCULAR DEPENDENCIES: Flag any mutual imports between files/slices.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SEVERITY GUIDELINES (EXTRAPOLATE FOR UNLISTED ISSUES)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+You MUST flag ANY valid issue you find, even if it is not explicitly listed anywhere in this prompt. Use the following baseline to categorize any issue you discover:
+
+- **critical**: Security vulnerabilities (XSS, SQLi, exposed secrets), data loss risks, race conditions, infinite loops, and strict architectural boundary violations (e.g., FSD cross-slice imports).
+- **high**: Serious React violations (Rules of Hooks), missing Error Boundaries, heavy performance bottlenecks (unnecessary re-renders of massive lists), and implicit \`any\` usage.
+- **medium**: Missing loading/error states in React Query, dead code, unused variables, improper Tailwind usage, missing ARIA labels.
+- **low**: Minor clean-code violations, \`console.error\` logs left in production code, missing comments, etc.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REVIEW INSTRUCTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -153,13 +164,19 @@ You are producing the FINAL review for a GitHub Pull Request.
 You receive a JSON payload containing:
 - The PR title
 - A list of ALL files changed in the PR
-- A complete array of findings that were extracted by automated code inspectors who reviewed the PR in parts
+- A FLAT array of findings, already sorted by severity (critical first)
+- Each finding has: severity, file, line, title, issue, currentCode, suggestedCode, category
+- Some findings have "annotations" — inline notes about similar patterns
+- Metadata: totalFindingsCount, droppedFindingsCount, failedChunkFiles
 
 Your job is to:
-1. DEDUPLICATE: Remove findings that describe the same issue in the same file (keep the most detailed one).
-2. CROSS-FILE ANALYSIS: Look at the full file list and the findings together. Identify cross-file architectural violations (especially FSD layer breaches, circular dependencies, or shared state misuse) that individual inspectors could not see.
-3. SYNTHESIZE: Write ONE cohesive, well-structured markdown review. You MUST list EVERY SINGLE actionable finding provided in the JSON payload under the 'Findings' section (unless it is an exact duplicate in the SAME file). Group similar findings if needed, but DO NOT silently drop any issues.
-4. VERDICT: Determine a single overall verdict based on the findings:
+1. GROUP BY SEVERITY: Output findings grouped under 4 severity sections (Critical → High → Medium → Low).
+2. ONE BLOCK PER FINDING: Each finding in the payload MUST get its own "#### File:" block in the output. NEVER merge, consolidate, or summarize multiple findings into one block — even if they describe the same pattern across different files.
+3. DETECT LOGICAL DEPENDENCIES: Analyze all findings to detect logical dependencies (e.g., Finding A updates an interface that Finding B uses, or a bug in Finding A causes the issue in Finding B). Add a blockquote note to both findings (e.g., \`> ⚠️ Fix this before addressing [file]\` or \`> 🔗 Depends on fix in [file]\`).
+4. ANNOTATIONS: If a finding has payload "annotations" (e.g. pattern repetition), include them as blockquotes below the issue description.
+5. COVERAGE: If droppedFindingsCount > 0, note: "⚠️ N additional lower-priority findings were omitted due to payload limits."
+6. COVERAGE: If failedChunkFiles is non-empty, note which files lack coverage.
+7. VERDICT: Determine a single overall verdict:
    - **Approve**: Zero critical or high findings.
    - **Request Changes**: Any critical or high findings exist.
    - **Needs Discussion**: Ambiguous findings that require human judgment.
@@ -168,23 +185,43 @@ Your job is to:
 REQUIRED OUTPUT FORMAT — MARKDOWN, FOLLOW EXACTLY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## 🔍 PR Summary
-> One paragraph: what this PR does, what files it touches, and the overall quality verdict.
+## 📊 Code Review Report
+
+| Metric | Details |
+|--------|---------|
+| **PR Title** | [Insert PR Title] |
+| **Total Findings** | [N] |
+| **Severity Breakdown** | 🔴 [N] Critical &nbsp;\|&nbsp; 🟠 [N] High &nbsp;\|&nbsp; 🟡 [N] Medium &nbsp;\|&nbsp; 🟢 [N] Low |
+| **Coverage Notes** | [If droppedFindingsCount > 0, state: "⚠️ N lower-priority findings omitted" else "Full coverage"] |
+| **Overall Verdict** | **Approve** / **Request Changes** / **Needs Discussion** |
+
+<details>
+<summary>📂 <b>View Analyzed Files ([Total number of files])</b></summary>
+
+[Insert bulleted list of all files in backticks, e.g. - \`path/to/file.tsx\`]
+</details>
+
+> **Architectural Summary:** One paragraph explaining what this PR does, its overall quality, and the most critical risks identified.
 
 ---
 
 ## 🏗 Architectural Review (FSD Compliance)
-List any FSD violations found across the entire PR. If fully compliant, write: ✅ No FSD violations found.
+List any FSD violations found. If fully compliant, write: ✅ No FSD violations found.
 
 ---
 
 ## 🐛 Findings
 
-Group findings by file. For each finding, use this exact block format:
+Group ALL findings by severity level. 
+CRITICAL RULE: DO NOT INCLUDE EMPTY SECTIONS! If there are ZERO findings for a severity, DO NOT output its heading at all. DO NOT write "(None found)" or "(No critical issues found.)". Just completely skip the section.
 
-### [SEVERITY] File: \`path/to/file.tsx\` — Short title
+For EVERY SINGLE FINDING in the payload, you MUST output this EXACT block structure:
+
+#### File: \`path/to/file.tsx\` — Short title
 
 **Issue:** One sentence describing the problem.
+
+> any annotations from the payload go here (if present)
 
 **Current:**
 \`\`\`tsx
@@ -198,25 +235,31 @@ Group findings by file. For each finding, use this exact block format:
 
 ---
 
-## ✅ Summary
-| Category | Count |
-|---|---|
-| 🔴 Critical | N |
-| 🟠 High | N |
-| 🟡 Medium | N |
-| 🟢 Low | N |
+### 🔴 Critical Issues
 
-Overall verdict: **Approve** / **Request Changes** / **Needs Discussion**
+(Output finding blocks here using the exact format defined above)
+
+### 🟠 High Issues
+
+(Output finding blocks here using the exact format defined above)
+
+### 🟡 Medium Issues
+
+(Output finding blocks here using the exact format defined above)
+
+### 🟢 Low Issues
+
+(Output finding blocks here using the exact format defined above)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULES
+RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-- Map severity tags: "critical" → [🔴 CRITICAL], "high" → [🟠 HIGH], "medium" → [🟡 MEDIUM], "low" → [🟢 LOW].
-- If zero findings were reported (empty array), write a short approval message.
-- If some chunks failed (indicated in metadata), note it but do NOT penalize the PR for missing coverage.
-- NEVER drop findings. You MUST output a finding block for every single deduplicated finding. If your summary counts say 10 bugs, list all 10 bugs.
-- IMPORTANT: your output must contain the literal text "**Request Changes**" in the verdict line if any critical/high issues exist. This text is parsed programmatically to determine the Check Run conclusion.
+- DO NOT output empty severity sections. If there are 0 Critical issues, the first section should be \`### 🟠 High Issues\`.
+- The payload has N findings. Your output MUST have EXACTLY N "#### File:" blocks. Count them. If you output fewer blocks than findings, your review is WRONG.
+- NEVER consolidate: if 5 files have the same bug, output 5 separate blocks.
+- NEVER write "same issue as above" or "see above" — each block must be self-contained.
+- Severity sections must be in order: 🔴 Critical → 🟠 High → 🟡 Medium → 🟢 Low.
+- If zero findings were reported in total across all files, just write a short approval message following the Summary table.
+- If some chunks failed, note it in Coverage Notes but do NOT penalize the PR for missing coverage.
 `.trim();
-
-

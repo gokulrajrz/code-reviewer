@@ -1,67 +1,246 @@
 import type { AIProvider, Env } from '../../types/env';
 import type { ReviewFinding } from '../../types/review';
-import { DEFAULT_AI_PROVIDER } from '../../config/constants';
-import { chunkReviewWithClaude, synthesizeWithClaude } from './claude';
-import { chunkReviewWithGemini, synthesizeWithGemini } from './gemini';
+import type { TokenUsage } from '../../types/usage';
+import { DEFAULT_AI_PROVIDER, MODELS } from '../../config/constants';
 import { parseFindings } from './parse-findings';
+import { retryWithBackoff, circuitBreakers } from '../retry';
+import { logger } from '../logger';
+
+// Import adapters (registers them with the factory)
+import './adapters/claude';
+import './adapters/gemini';
+import { LLMProviderFactory, type LLMProviderConfig } from './adapter';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Get the Map-phase circuit breaker for a provider. */
+function getMapBreaker(provider: AIProvider) {
+    return provider === 'gemini' ? circuitBreakers.geminiMap : circuitBreakers.anthropicMap;
+}
+
+/** Get the Synthesis-phase circuit breaker for a provider. */
+function getSynthBreaker(provider: AIProvider) {
+    return provider === 'gemini' ? circuitBreakers.geminiSynth : circuitBreakers.anthropicSynth;
+}
+
+/** Get the alternate provider for fallback. */
+function getAlternateProvider(provider: AIProvider): AIProvider {
+    return provider === 'claude' ? 'gemini' : 'claude';
+}
+
+/** Get the API key for a given provider from env. */
+function getApiKey(provider: AIProvider, env: Env): string {
+    return provider === 'gemini' ? env.GEMINI_API_KEY! : env.ANTHROPIC_API_KEY!;
+}
+
+/** Check if the alternate provider has a configured API key. */
+function isAlternateAvailable(provider: AIProvider, env: Env): boolean {
+    const alt = getAlternateProvider(provider);
+    const key = getApiKey(alt, env);
+    return !!key && key.length > 0;
+}
 
 // ---------------------------------------------------------------------------
 // Phase 1: Chunk Review (Map) — returns structured findings
 // ---------------------------------------------------------------------------
 
+export interface ChunkReviewResult {
+    findings: ReviewFinding[];
+    usage: TokenUsage;
+}
+
 /**
  * Dispatches a code chunk to the configured LLM for inspection.
- * Returns parsed, validated ReviewFinding[] (never raw text).
+ * Returns parsed, validated ReviewFinding[] (never raw text) and usage data.
  *
  * This is the Map phase of our Map-Reduce pipeline.
+ * Uses the Map-specific circuit breaker per provider.
  */
 export async function callChunkReview(
     chunkContent: string,
     prTitle: string,
     chunkLabel: string,
     env: Env,
-    signal?: AbortSignal
-): Promise<ReviewFinding[]> {
+    signal?: AbortSignal,
+    systemPrompt?: string
+): Promise<ChunkReviewResult> {
     const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
-    let rawJSON: string;
-
-    switch (provider) {
-        case 'gemini':
-            rawJSON = await chunkReviewWithGemini(chunkContent, prTitle, chunkLabel, env.GEMINI_API_KEY, signal);
-            break;
-        case 'claude':
-        default:
-            rawJSON = await chunkReviewWithClaude(chunkContent, prTitle, chunkLabel, env.ANTHROPIC_API_KEY, signal);
-            break;
+    // Check MAP circuit breaker
+    const breaker = getMapBreaker(provider);
+    if (!breaker.canExecute()) {
+        throw new Error(`LLM circuit breaker for ${provider} (map) is OPEN - too many failures`);
     }
 
-    return parseFindings(rawJSON);
+    const config: LLMProviderConfig = {
+        apiKey: getApiKey(provider, env),
+    };
+    const adapter = LLMProviderFactory.createProvider(provider, config);
+
+    const executeReview = async (): Promise<ChunkReviewResult> => {
+        const result = await adapter.reviewChunk(
+            { chunkContent, prTitle, chunkLabel, systemPrompt },
+            signal
+        );
+        const findings = parseFindings(result.content);
+        return { findings, usage: result.usage };
+    };
+
+    try {
+        const { result, attempts, totalDelayMs } = await retryWithBackoff(
+            executeReview,
+            `LLM chunk review (${provider})`,
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        breaker.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`Chunk review succeeded after ${attempts} attempts`, {
+                chunkLabel,
+                attempts,
+                totalDelayMs,
+                provider,
+            });
+        }
+
+        return result;
+    } catch (error) {
+        breaker.recordFailure();
+        throw error;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Phase 2: Synthesis (Reduce) — returns final markdown
 // ---------------------------------------------------------------------------
 
+export interface SynthesisResult {
+    review: string;
+    usage: TokenUsage;
+}
+
 /**
  * Dispatches the aggregated findings to the configured LLM for synthesis.
- * Returns the final, cohesive markdown review.
+ * Returns the final, cohesive markdown review and usage data.
  *
  * This is the Reduce phase of our Map-Reduce pipeline.
+ * Implements tiered fallback: primary provider → alternate provider.
+ * The pure-TypeScript fallback formatter is handled by the caller (queue.ts).
  */
 export async function callSynthesizer(
     synthesizerPayload: string,
     env: Env,
-    signal?: AbortSignal
-): Promise<string> {
-    const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
+    signal?: AbortSignal,
+    systemPrompt?: string,
+    maxTokens?: number
+): Promise<SynthesisResult> {
+    const primaryProvider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
-    switch (provider) {
-        case 'gemini':
-            return synthesizeWithGemini(synthesizerPayload, env.GEMINI_API_KEY, signal);
-        case 'claude':
-        default:
-            return synthesizeWithClaude(synthesizerPayload, env.ANTHROPIC_API_KEY, signal);
+    // Try primary provider first
+    try {
+        return await callSynthesizerWithProvider(
+            primaryProvider, synthesizerPayload, env, signal, systemPrompt, maxTokens
+        );
+    } catch (primaryError) {
+        const errMsg = primaryError instanceof Error ? primaryError.message : String(primaryError);
+        logger.warn(`Primary synthesizer (${primaryProvider}) failed, attempting fallback`, {
+            error: errMsg,
+        });
+
+        // Try alternate provider if available
+        if (isAlternateAvailable(primaryProvider, env)) {
+            const altProvider = getAlternateProvider(primaryProvider);
+            try {
+                logger.info(`Falling back to alternate synthesizer: ${altProvider}`);
+                return await callSynthesizerWithProvider(
+                    altProvider, synthesizerPayload, env, signal, systemPrompt, maxTokens
+                );
+            } catch (altError) {
+                const altErrMsg = altError instanceof Error ? altError.message : String(altError);
+                logger.error(`Alternate synthesizer (${altProvider}) also failed`, altError instanceof Error ? altError : undefined);
+                throw new Error(
+                    `Both synthesizer providers failed. Primary (${primaryProvider}): ${errMsg}. ` +
+                    `Alternate (${altProvider}): ${altErrMsg}`
+                );
+            }
+        }
+
+        // No alternate available — re-throw primary error
+        throw primaryError;
     }
 }
 
+/**
+ * Call a specific provider for synthesis.
+ * Checks the Synth-specific circuit breaker.
+ */
+async function callSynthesizerWithProvider(
+    provider: AIProvider,
+    synthesizerPayload: string,
+    env: Env,
+    signal?: AbortSignal,
+    systemPrompt?: string,
+    maxTokens?: number
+): Promise<SynthesisResult> {
+    const breaker = getSynthBreaker(provider);
+    if (!breaker.canExecute()) {
+        throw new Error(`LLM circuit breaker for ${provider} (synth) is OPEN - too many failures`);
+    }
+
+    const config: LLMProviderConfig = {
+        apiKey: getApiKey(provider, env),
+    };
+    const adapter = LLMProviderFactory.createProvider(provider, config);
+
+    const executeSynthesis = async (): Promise<SynthesisResult> => {
+        const result = await adapter.synthesize(
+            { payload: synthesizerPayload, systemPrompt, maxTokens },
+            signal
+        );
+        return { review: result.content, usage: result.usage };
+    };
+
+    try {
+        const { result, attempts, totalDelayMs } = await retryWithBackoff(
+            executeSynthesis,
+            `LLM synthesis (${provider})`,
+            {
+                maxAttempts: 2,  // Reduced from 3 — save subrequests for fallback
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        breaker.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`Synthesis succeeded after ${attempts} attempts`, {
+                attempts,
+                totalDelayMs,
+                provider,
+            });
+        }
+
+        return result;
+    } catch (error) {
+        breaker.recordFailure();
+        throw error;
+    }
+}
+
+/**
+ * Get the model name for the current provider.
+ * Uses the single source of truth in constants.ts.
+ */
+export function getModelName(provider: AIProvider): string {
+    return MODELS[provider];
+}

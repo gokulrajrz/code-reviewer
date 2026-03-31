@@ -1,4 +1,5 @@
 import type { Env } from '../types/env';
+import { logger } from './logger';
 
 const GITHUB_API_BASE = 'https://api.github.com';
 
@@ -168,6 +169,8 @@ export async function getInstallationToken(env: Env): Promise<string> {
     }
 
     const data: InstallationTokenResponse = await response.json();
-    console.log(`[github-auth] ✓ Installation token obtained, expires at ${data.expires_at}`);
+    logger.info('Installation token obtained', {
+        expiresAt: data.expires_at,
+    });
     return data.token;
 }

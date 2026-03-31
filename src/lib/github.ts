@@ -1,4 +1,9 @@
 import type { GitHubPRFile } from '../types/github';
+import type { Env } from '../types/env';
+import type { ReviewFinding } from '../types/review';
+import { cachedGitHubFetch, CACHE_TTLS } from './cache';
+import { createProgressiveChunks } from './progressive-chunking';
+import { pluginRegistry } from './plugin-system';
 import {
     MAX_FILE_SIZE_BYTES,
     MAX_TOTAL_FILES,
@@ -9,8 +14,51 @@ import {
     PRIORITY_EXTENSIONS,
     GLOBAL_CONTEXT_BUDGET_CHARS,
 } from '../config/constants';
+import { retryWithBackoff, circuitBreakers } from './retry';
+import { logger } from './logger';
+import { RateLimitError } from './errors';
 
 const GITHUB_API_BASE = 'https://api.github.com';
+
+/**
+ * GitHub limits comment/check-run text to 65,535 characters.
+ * This constant leaves room for the truncation notice we append.
+ */
+const GITHUB_MAX_BODY_CHARS = 64_000;
+
+/**
+ * Structure-aware markdown truncation.
+ *
+ * Instead of slicing mid-sentence or mid-code-block, finds the last
+ * clean section boundary (`---`, `## `, or `### `) within the limit
+ * and appends a truncation notice.
+ */
+function truncateMarkdown(text: string, maxChars: number = GITHUB_MAX_BODY_CHARS): string {
+    if (text.length <= maxChars) return text;
+
+    // Search for the last section boundary within the limit
+    const searchRegion = text.slice(0, maxChars);
+
+    // Try progressively less granular boundaries
+    let cutPoint = searchRegion.lastIndexOf('\n---');
+    if (cutPoint < maxChars * 0.5) cutPoint = searchRegion.lastIndexOf('\n## ');
+    if (cutPoint < maxChars * 0.5) cutPoint = searchRegion.lastIndexOf('\n### ');
+    if (cutPoint < maxChars * 0.5) cutPoint = searchRegion.lastIndexOf('\n\n');
+    if (cutPoint < maxChars * 0.3) cutPoint = maxChars; // Fallback: hard cut
+
+    const truncated = text.slice(0, cutPoint);
+
+    // Close any unclosed code fences
+    const openFences = (truncated.match(/```/g) || []).length;
+    const needsClose = openFences % 2 !== 0;
+
+    return truncated
+        + (needsClose ? '\n```' : '')
+        + '\n\n---\n\n'
+        + '> ⚠️ **Review truncated** — the full review exceeded GitHub\'s character limit. '
+        + `Showing ${Math.round(cutPoint / text.length * 100)}% of the review. `
+        + 'Lower-priority findings may be omitted.\n';
+}
 
 function githubHeaders(token: string): HeadersInit {
     return {
@@ -29,38 +77,77 @@ function githubHeaders(token: string): HeadersInit {
  * Fetches ALL files changed in a Pull Request, handling GitHub pagination.
  * GitHub returns max 100 files per page and max 3000 total.
  * We cap at MAX_TOTAL_FILES to stay practical.
+ * Includes retry logic and circuit breaker protection.
  */
 export async function fetchChangedFiles(
     repoFullName: string,
     prNumber: number,
-    token: string
+    token: string,
+    env: Env
 ): Promise<GitHubPRFile[]> {
-    const allFiles: GitHubPRFile[] = [];
-    let page = 1;
-
-    while (allFiles.length < MAX_TOTAL_FILES) {
-        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100&page=${page}`;
-        const response = await fetch(url, { headers: githubHeaders(token) });
-
-        if (!response.ok) {
-            throw new Error(`Failed to fetch PR files (page ${page}): ${response.status} ${response.statusText}`);
-        }
-
-        const files: GitHubPRFile[] = await response.json();
-
-        if (files.length === 0) break; // No more pages
-
-        allFiles.push(...files);
-        page++;
-
-        // GitHub caps at 3000 files; stop if we got fewer than 100 (last page)
-        if (files.length < 100) break;
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        throw new Error('GitHub API circuit breaker is OPEN - too many failures');
     }
 
-    // Filter out deleted files (they have no content to review)
-    return allFiles
-        .filter((f) => f.status !== 'removed')
-        .slice(0, MAX_TOTAL_FILES);
+    const executeFetch = async (): Promise<GitHubPRFile[]> => {
+        const allFiles: GitHubPRFile[] = [];
+        let page = 1;
+
+        while (allFiles.length < MAX_TOTAL_FILES) {
+            const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/files?per_page=100&page=${page}`;
+
+            // Note: cachedGitHubFetch handles the 429 extraction automatically inside cache.ts
+            const files = await cachedGitHubFetch<GitHubPRFile[]>(
+                env,
+                url,
+                { headers: githubHeaders(token) },
+                { ttlSeconds: CACHE_TTLS.PR_FILES, staleWhileRevalidate: true },
+                async (u, i) => fetch(u, i)
+            );
+
+            if (files.length === 0) break; // No more pages
+
+            allFiles.push(...files);
+            page++;
+
+            // GitHub caps at 3000 files; stop if we got fewer than 100 (last page)
+            if (files.length < 100) break;
+        }
+
+        // Filter out deleted files (they have no content to review)
+        return allFiles
+            .filter((f) => f.status !== 'removed')
+            .slice(0, MAX_TOTAL_FILES);
+    };
+
+    try {
+        const { result, attempts, totalDelayMs } = await retryWithBackoff(
+            executeFetch,
+            'GitHub fetch changed files',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`GitHub API call succeeded after ${attempts} attempts`, {
+                operation: 'fetchChangedFiles',
+                attempts,
+                totalDelayMs,
+            });
+        }
+
+        return result;
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        throw error;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,29 +255,71 @@ export function classifyFiles(files: GitHubPRFile[]): ClassifiedFiles {
 /**
  * Fetches the raw content of a file from its raw_url.
  * Returns null if the file is too large or the request fails.
+ * Includes retry logic for transient failures.
  */
-export async function fetchFileContent(rawUrl: string, token: string): Promise<string | null> {
-    try {
-        const response = await fetch(rawUrl, { headers: githubHeaders(token) });
+export async function fetchFileContent(rawUrl: string, token: string, env: Env): Promise<string | null> {
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        logger.warn('GitHub API circuit breaker is OPEN, skipping file content fetch');
+        return null;
+    }
 
-        if (!response.ok) return null;
+    const executeFetch = async (): Promise<string | null> => {
+        const text = await cachedGitHubFetch<string>(
+            env,
+            rawUrl,
+            { headers: githubHeaders(token) },
+            { ttlSeconds: CACHE_TTLS.FILE_CONTENT, staleWhileRevalidate: true },
+            async (u, i) => {
+                const response = await fetch(u, i);
 
-        // Guard against massive files
-        const contentLength = response.headers.get('Content-Length');
-        if (contentLength && parseInt(contentLength, 10) > MAX_FILE_SIZE_BYTES) {
-            return `[File too large to include — ${contentLength} bytes. Review diff only.]`;
+                // Extra safety check during fetch before reading body
+                const contentLength = response.headers.get('Content-Length');
+                if (contentLength && parseInt(contentLength, 10) > MAX_FILE_SIZE_BYTES) {
+                    // Fast abort for huge files
+                    throw new Error(`FILE_TOO_LARGE:${contentLength}`);
+                }
+                return response;
+            },
+            'text'
+        ).catch(err => {
+            if (err.message.startsWith('FILE_TOO_LARGE:')) {
+                const size = err.message.split(':')[1];
+                return `[File too large to include — ${size} bytes. Review diff only.]`;
+            }
+            throw err;
+        });
+
+        // If it was already caught for size in the fast path, return it directly
+        if (text && text.startsWith('[File too large to include')) {
+            return text;
         }
 
-        const text = await response.text();
-
-        // Secondary size check on the body itself
+        // Secondary size check on the body itself (sometimes Content-Length is missing)
         if (text.length > MAX_FILE_SIZE_BYTES) {
             return `[File too large to include — ${text.length} chars. Review diff only.]`;
         }
 
         return text;
-    } catch {
-        return null;
+    };
+
+    try {
+        const { result } = await retryWithBackoff(
+            executeFetch,
+            'GitHub fetch file content',
+            {
+                maxAttempts: 2, // Fewer retries for file content (not critical)
+                initialDelayMs: 500,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+        return result;
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        return null; // Fail gracefully - return null to use diff only
     }
 }
 
@@ -289,26 +418,78 @@ function splitLargeFileBlock(
 
 /**
  * Builds a file block for a Tier 1 file (full content + diff patch).
+ * Uses progressive-chunking to safely split large files along AST boundaries
+ * before formatting as markdown, ensuring code fences remain intact.
  */
-async function buildTier1Block(file: GitHubPRFile, token: string): Promise<string> {
-    let block = `## 🔍 FILE CHANGED: \`${file.filename}\` (${file.status}) — *Full Review*\n`;
+async function buildTier1Block(
+    file: GitHubPRFile,
+    token: string,
+    env: Env,
+    prContext: { title: string; repoFullName: string; prNumber: number },
+    effectiveMax: number
+): Promise<{ blocks: string[]; findings: ReviewFinding[] }> {
+    const findings: ReviewFinding[] = [];
+    const content = await fetchFileContent(file.raw_url, token, env);
 
-    if (file.patch) {
-        block += `### DIFF PATCH\n\`\`\`diff\n${file.patch}\n\`\`\`\n`;
-    } else {
-        block += `_(No diff patch available)_\n`;
-    }
-
-    const content = await fetchFileContent(file.raw_url, token);
+    // Run analyzer plugins on the full file content before chunking
     if (content && !content.startsWith('[File too large')) {
-        const ext = file.filename.split('.').pop() ?? '';
-        block += `\n### FULL FILE CONTENT\n\`\`\`${ext}\n${content}\n\`\`\`\n`;
-    } else if (content) {
-        block += `\n${content}\n`;
+        try {
+            const pluginResult = await pluginRegistry.analyzeFile({
+                filename: file.filename,
+                content: content,
+                prTitle: prContext.title,
+                repoFullName: prContext.repoFullName,
+                prNumber: prContext.prNumber
+            });
+            findings.push(...pluginResult.findings);
+        } catch (error) {
+            logger.error('Plugin execution failed', error instanceof Error ? error : undefined, {
+                filename: file.filename
+            });
+        }
     }
 
-    block += `\n---\n\n`;
-    return block;
+    // Determine how to chunk the file content
+    const ext = file.filename.split('.').pop() ?? '';
+    let contentChunks = [content || ''];
+
+    if (content && !content.startsWith('[File too large')) {
+        // Estimate the overhead of the wrapper (diff patch, headers, fences)
+        const wrapperOverhead = (file.patch?.length || 0) + 500;
+        const maxCodeChars = effectiveMax - wrapperOverhead;
+
+        if (content.length > maxCodeChars && maxCodeChars > 1000) {
+            // Use advanced progressive chunking
+            contentChunks = createProgressiveChunks(content, maxCodeChars);
+        }
+    }
+
+    // Wrap each content chunk in markdown
+    const blocks: string[] = [];
+    const isMultiPart = contentChunks.length > 1;
+
+    for (let i = 0; i < contentChunks.length; i++) {
+        const chunkContent = contentChunks[i];
+        const partLabel = isMultiPart ? ` — Part ${i + 1} of ${contentChunks.length}` : '';
+        let block = `## 🔍 FILE CHANGED: \`${file.filename}\` (${file.status})${partLabel} — *Full Review*\n`;
+
+        if (file.patch) {
+            block += `### DIFF PATCH\n\`\`\`diff\n${file.patch}\n\`\`\`\n`;
+        } else {
+            block += `_(No diff patch available)_\n`;
+        }
+
+        if (chunkContent && !chunkContent.startsWith('[File too large')) {
+            block += `\n### FULL FILE CONTENT${partLabel}\n\`\`\`${ext}\n${chunkContent}\n\`\`\`\n`;
+        } else if (chunkContent) {
+            block += `\n${chunkContent}\n`;
+        }
+
+        block += `\n---\n\n`;
+        blocks.push(block);
+    }
+
+    return { blocks, findings };
 }
 
 /**
@@ -335,6 +516,8 @@ export interface ReviewChunksResult {
     globalContext: string;
     /** All reviewable filenames (for the synthesizer payload) */
     allFiles: string[];
+    /** Findings generated by local plugins */
+    pluginFindings: ReviewFinding[];
 }
 
 /**
@@ -350,11 +533,14 @@ export interface ReviewChunksResult {
 export async function buildReviewChunks(
     classified: ClassifiedFiles,
     token: string,
-    maxChunkChars: number
+    maxChunkChars: number,
+    env: Env,
+    prContext: { title: string; repoFullName: string; prNumber: number }
 ): Promise<ReviewChunksResult> {
     const { tier1, tier2, skipped } = classified;
     const globalContext = buildGlobalContext(classified);
     const allFiles = [...tier1, ...tier2].map(f => f.filename);
+    const pluginFindings: ReviewFinding[] = [];
 
     const chunks: string[] = [];
     let currentChunkText = '';
@@ -370,26 +556,29 @@ export async function buildReviewChunks(
     // Effective max for content (after global context is prepended)
     const effectiveMax = maxChunkChars - globalContext.length;
     if (effectiveMax < 10_000) {
-        console.warn(`[github] Global context is very large (${globalContext.length} chars), reducing effective chunk size`);
+        logger.warn('Global context is very large, reducing effective chunk size', {
+            globalContextLength: globalContext.length,
+            effectiveMax,
+        });
     }
 
     // ── Process Tier 1 files (full content, uses subrequests) ──
     for (const file of tier1) {
-        const fileBlock = await buildTier1Block(file, token);
+        const { blocks, findings } = await buildTier1Block(file, token, env, prContext, effectiveMax);
+        pluginFindings.push(...findings);
 
-        if (fileBlock.length > effectiveMax) {
-            // File is larger than a single chunk — split it safely
-            flushChunk();
-            const parts = splitLargeFileBlock(file.filename, fileBlock, effectiveMax);
-            for (const part of parts) {
-                chunks.push(globalContext + part);
+        for (const fileBlock of blocks) {
+            if (fileBlock.length > effectiveMax) {
+                // Failsafe: if still too large, flush current and put it alone
+                flushChunk();
+                chunks.push(globalContext + fileBlock);
+            } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
+                // Adding this file would exceed the chunk limit — start a new chunk
+                flushChunk();
+                currentChunkText = fileBlock;
+            } else {
+                currentChunkText += fileBlock;
             }
-        } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
-            // Adding this file would exceed the chunk limit — start a new chunk
-            flushChunk();
-            currentChunkText = fileBlock;
-        } else {
-            currentChunkText += fileBlock;
         }
     }
 
@@ -420,6 +609,7 @@ export async function buildReviewChunks(
         chunks: finalChunks,
         globalContext,
         allFiles,
+        pluginFindings,
     };
 }
 
@@ -429,6 +619,7 @@ export async function buildReviewChunks(
 
 /**
  * Posts a review comment on a GitHub Pull Request.
+ * Includes retry logic for transient failures.
  */
 export async function postPRComment(
     repoFullName: string,
@@ -436,25 +627,64 @@ export async function postPRComment(
     body: string,
     token: string
 ): Promise<void> {
-    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/issues/${prNumber}/comments`;
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        logger.warn('GitHub API circuit breaker is OPEN, skipping PR comment');
+        throw new Error('GitHub API circuit breaker is OPEN');
+    }
 
-    // GitHub limits the body field to 65536 characters
-    const truncatedBody = body.length > 65000
-        ? body.slice(0, 65000) + '\n\n_[Comment truncated due to GitHub length limits]_'
-        : body;
+    const executePost = async (): Promise<void> => {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/issues/${prNumber}/comments`;
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            ...githubHeaders(token),
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ body: truncatedBody }),
-    });
+        const truncatedBody = truncateMarkdown(body);
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to post PR comment: ${response.status} — ${errorText}`);
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ body: truncatedBody }),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to post PR comment: ${response.status} — ${errorText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
+        }
+    };
+
+    try {
+        const { attempts, totalDelayMs } = await retryWithBackoff(
+            executePost,
+            'GitHub post PR comment',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`PR comment posted after ${attempts} attempts`, {
+                attempts,
+                totalDelayMs,
+            });
+        }
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        throw error;
     }
 }
 
@@ -480,6 +710,7 @@ interface CheckRunResponse {
 /**
  * Creates a new Check Run on a commit.
  * Returns the check run ID for later updates.
+ * Includes retry logic and circuit breaker protection.
  */
 export async function createCheckRun(
     repoFullName: string,
@@ -491,58 +722,101 @@ export async function createCheckRun(
         summary?: string;
     }
 ): Promise<number> {
-    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs`;
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        throw new Error('GitHub API circuit breaker is OPEN - too many failures');
+    }
 
-    const body: Record<string, unknown> = {
-        name: 'AI Code Reviewer',
-        head_sha: headSha,
-        status: options.status,
+    const executeCreate = async (): Promise<number> => {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs`;
+
+        const body: Record<string, unknown> = {
+            name: 'AI Code Reviewer',
+            head_sha: headSha,
+            status: options.status,
+        };
+
+        if (options.conclusion) {
+            body.conclusion = options.conclusion;
+        }
+
+        if (options.summary || options.conclusion) {
+            body.output = {
+                title: options.conclusion === 'skipped'
+                    ? 'Review Skipped'
+                    : options.conclusion === 'success'
+                        ? 'Review Approved'
+                        : options.conclusion === 'failure'
+                            ? 'Changes Requested'
+                            : 'AI Code Review',
+                summary: options.summary ?? 'AI Code Review in progress...',
+            };
+        }
+
+        // If completed, record the completion timestamp
+        if (options.status === 'completed') {
+            body.completed_at = new Date().toISOString();
+        }
+        body.started_at = new Date().toISOString();
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to create check run: ${response.status} — ${errorText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
+        }
+
+        const data: CheckRunResponse = await response.json();
+        return data.id;
     };
 
-    if (options.conclusion) {
-        body.conclusion = options.conclusion;
+    try {
+        const { result, attempts } = await retryWithBackoff(
+            executeCreate,
+            'GitHub create check run',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`Check run created after ${attempts} attempts`, {
+                checkRunId: result,
+                attempts,
+            });
+        }
+
+        return result;
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        throw error;
     }
-
-    if (options.summary || options.conclusion) {
-        body.output = {
-            title: options.conclusion === 'skipped'
-                ? 'Review Skipped'
-                : options.conclusion === 'success'
-                    ? 'Review Approved'
-                    : options.conclusion === 'failure'
-                        ? 'Changes Requested'
-                        : 'AI Code Review',
-            summary: options.summary ?? 'AI Code Review in progress...',
-        };
-    }
-
-    // If completed, record the completion timestamp
-    if (options.status === 'completed') {
-        body.completed_at = new Date().toISOString();
-    }
-    body.started_at = new Date().toISOString();
-
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            ...githubHeaders(token),
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to create check run: ${response.status} — ${errorText}`);
-    }
-
-    const data: CheckRunResponse = await response.json();
-    console.log(`[github] Created check run #${data.id} (status=${options.status}, conclusion=${options.conclusion ?? 'n/a'})`);
-    return data.id;
 }
 
 /**
  * Updates an existing Check Run with the final conclusion and summary.
+ * Includes retry logic for transient failures.
  */
 export async function updateCheckRun(
     repoFullName: string,
@@ -551,40 +825,80 @@ export async function updateCheckRun(
     conclusion: CheckRunConclusion,
     summary: string,
 ): Promise<void> {
-    const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs/${checkRunId}`;
+    // Check circuit breaker before attempting
+    if (!circuitBreakers.github.canExecute()) {
+        logger.warn('GitHub API circuit breaker is OPEN, skipping check run update');
+        return; // Non-critical: don't throw
+    }
 
-    const title = conclusion === 'success'
-        ? 'Review Approved'
-        : conclusion === 'failure'
-            ? 'Changes Requested'
-            : 'AI Code Review';
+    const executeUpdate = async (): Promise<void> => {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/check-runs/${checkRunId}`;
 
-    // GitHub limits the summary field to 65535 characters
-    const truncatedSummary = summary.length > 65000
-        ? summary.slice(0, 65000) + '\n\n_[Summary truncated due to length]_'
-        : summary;
+        const title = conclusion === 'success'
+            ? 'Review Approved'
+            : conclusion === 'failure'
+                ? 'Changes Requested'
+                : 'AI Code Review';
 
-    const response = await fetch(url, {
-        method: 'PATCH',
-        headers: {
-            ...githubHeaders(token),
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            status: 'completed',
-            conclusion,
-            completed_at: new Date().toISOString(),
-            output: {
-                title,
-                summary: truncatedSummary,
+        const truncatedSummary = truncateMarkdown(summary);
+
+        const response = await fetch(url, {
+            method: 'PATCH',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
             },
-        }),
-    });
+            body: JSON.stringify({
+                status: 'completed',
+                conclusion,
+                completed_at: new Date().toISOString(),
+                output: {
+                    title,
+                    summary: truncatedSummary,
+                },
+            }),
+        });
 
-    if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`[github] Failed to update check run: ${response.status} — ${errorText}`);
-    } else {
-        console.log(`[github] Updated check run #${checkRunId} → conclusion=${conclusion}`);
+        if (!response.ok) {
+            const errorText = await response.text();
+            // Extract retry-after header for rate limit errors
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to update check run: ${response.status} — ${errorText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
+        }
+    };
+
+    try {
+        const { attempts } = await retryWithBackoff(
+            executeUpdate,
+            'GitHub update check run',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`Check run updated after ${attempts} attempts`, {
+                checkRunId,
+                attempts,
+            });
+        }
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        logger.error('Failed to update check run', error instanceof Error ? error : undefined, {
+            checkRunId,
+        });
+        // Non-critical: don't throw
     }
 }

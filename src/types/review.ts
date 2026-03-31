@@ -2,6 +2,8 @@
 // Map-Reduce Review Types
 // ---------------------------------------------------------------------------
 
+
+
 /**
  * Severity levels for review findings.
  * Maps directly to the emoji tags in the final markdown output.
@@ -47,9 +49,24 @@ export interface ReviewFinding {
     category: FindingCategory;
 }
 
+/**
+ * A finding enriched with cluster-derived annotations for the synthesizer.
+ * This is what the LLM receives — a FLAT list, not nested clusters.
+ */
+export interface AnnotatedFinding extends ReviewFinding {
+    /** Inline annotations from cluster analysis (similar patterns, etc.) */
+    annotations?: string[];
+}
 
 /**
  * The payload sent to the synthesizer LLM (Reduce phase).
+ *
+ * Findings are presented as a FLAT, severity-sorted array — not nested
+ * inside clusters. This prevents the LLM from consolidating similar
+ * findings into a single discussion block.
+ *
+ * Cluster metadata (similar patterns) is preserved as
+ * inline annotations on individual findings.
  */
 export interface SynthesizerInput {
     /** PR title from GitHub */
@@ -58,10 +75,16 @@ export interface SynthesizerInput {
     allFiles: string[];
     /** Number of files skipped as noise */
     skippedCount: number;
-    /** All findings collected from Map phase */
-    findings: ReviewFinding[];
+    /** All findings, flattened and sorted by severity (critical first) */
+    findings: AnnotatedFinding[];
+    /** Total number of unique findings (before any payload truncation) */
+    totalFindingsCount: number;
     /** Total chunks processed */
     totalChunks: number;
     /** Number of chunks that failed */
     failedChunks: number;
+    /** Number of findings dropped due to payload size limits */
+    droppedFindingsCount: number;
+    /** Files that were in failed chunks (no coverage) */
+    failedChunkFiles: string[];
 }
