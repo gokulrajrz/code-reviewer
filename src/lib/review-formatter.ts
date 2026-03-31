@@ -187,23 +187,29 @@ export function formatFindingsAsMarkdown(
             findings.sort((a, b) => a.file.localeCompare(b.file));
 
             for (const finding of findings) {
-                sections.push(
-                    `#### File: \`${finding.file}\`${finding.line ? `:${finding.line}` : ''} — ${finding.title}\n`
-                );
-                sections.push(`**Issue:** ${finding.issue}\n`);
-
-                // Inject similar-pattern annotations
                 const findingKey = `${finding.file}::${finding.title}`;
                 const simNote = similarAnnotations.get(findingKey);
-                if (simNote) {
-                    sections.push(`${simNote}\n`);
-                }
 
-                if (finding.currentCode) {
-                    sections.push(`**Current:**\n\`\`\`\n${finding.currentCode}\n\`\`\`\n`);
-                }
-                if (finding.suggestedCode) {
-                    sections.push(`**Suggested:**\n\`\`\`\n${finding.suggestedCode}\n\`\`\`\n`);
+                if (severity === 'critical' || severity === 'high') {
+                    sections.push(
+                        `#### File: \`${finding.file}\`${finding.line ? `:${finding.line}` : ''} — ${finding.title}\n`
+                    );
+                    sections.push(`**Issue:** ${finding.issue}\n`);
+
+                    if (simNote) {
+                        sections.push(`${simNote}\n`);
+                    }
+
+                    if (finding.currentCode) {
+                        sections.push(`**Current:**\n\`\`\`\n${finding.currentCode}\n\`\`\`\n`);
+                    }
+                    if (finding.suggestedCode) {
+                        sections.push(`**Suggested:**\n\`\`\`\n${finding.suggestedCode}\n\`\`\`\n`);
+                    }
+                } else {
+                    sections.push(
+                        `* **File: \`${finding.file}\`${finding.line ? `:${finding.line}` : ''}** — **${finding.title}**: ${finding.issue}${simNote ? ` *(> ${simNote.replace(/^> /, '')})*` : ''}`
+                    );
                 }
             }
 

@@ -171,7 +171,7 @@ You receive a JSON payload containing:
 
 Your job is to:
 1. GROUP BY SEVERITY: Output findings grouped under 4 severity sections (Critical → High → Medium → Low).
-2. ONE BLOCK PER FINDING: Each finding in the payload MUST get its own "#### File:" block in the output. NEVER merge, consolidate, or summarize multiple findings into one block — even if they describe the same pattern across different files.
+2. TIERED DETAIL: To preserve token limits, you must provide full context (Issue + Current Code + Suggested Code) for Critical and High severity findings. For Medium and Low finding clusters, DO NOT output code blocks; collapse them into dense bullet-point summaries.
 3. DETECT LOGICAL DEPENDENCIES: Analyze all findings to detect logical dependencies (e.g., Finding A updates an interface that Finding B uses, or a bug in Finding A causes the issue in Finding B). Add a blockquote note to both findings (e.g., \`> ⚠️ Fix this before addressing [file]\` or \`> 🔗 Depends on fix in [file]\`).
 4. ANNOTATIONS: If a finding has payload "annotations" (e.g. pattern repetition), include them as blockquotes below the issue description.
 5. COVERAGE: If droppedFindingsCount > 0, note: "⚠️ N additional lower-priority findings were omitted due to payload limits."
@@ -215,9 +215,9 @@ List any FSD violations found. If fully compliant, write: ✅ No FSD violations 
 Group ALL findings by severity level. 
 CRITICAL RULE: DO NOT INCLUDE EMPTY SECTIONS! If there are ZERO findings for a severity, DO NOT output its heading at all. DO NOT write "(None found)" or "(No critical issues found.)". Just completely skip the section.
 
-For EVERY SINGLE FINDING in the payload, you MUST output this EXACT block structure:
+For **CRITICAL** and **HIGH** severity findings, you MUST output this EXACT block structure:
 
-#### File: \`path/to/file.tsx\` — Short title
+#### File: \`path/to/file.tsx:123\` — Short title
 
 **Issue:** One sentence describing the problem.
 
@@ -235,30 +235,35 @@ For EVERY SINGLE FINDING in the payload, you MUST output this EXACT block struct
 
 ---
 
+For **MEDIUM** and **LOW** severity findings, you MUST compress them to save tokens. Do NOT output "Current" or "Suggested" code blocks. Output them as dense bullet points:
+
+* **File: \`path/to/file.tsx:123\`** — **[Short title]**: [One-sentence issue description]. *(> annotations here if any)*
+
+---
+
 ### 🔴 Critical Issues
 
-(Output finding blocks here using the exact format defined above)
+(Output finding blocks here using the full code-block format)
 
 ### 🟠 High Issues
 
-(Output finding blocks here using the exact format defined above)
+(Output finding blocks here using the full code-block format)
 
 ### 🟡 Medium Issues
 
-(Output finding blocks here using the exact format defined above)
+(Output finding blocks here using the compressed bullet-point format)
 
 ### 🟢 Low Issues
 
-(Output finding blocks here using the exact format defined above)
+(Output finding blocks here using the compressed bullet-point format)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 - DO NOT output empty severity sections. If there are 0 Critical issues, the first section should be \`### 🟠 High Issues\`.
-- The payload has N findings. Your output MUST have EXACTLY N "#### File:" blocks. Count them. If you output fewer blocks than findings, your review is WRONG.
-- NEVER consolidate: if 5 files have the same bug, output 5 separate blocks.
-- NEVER write "same issue as above" or "see above" — each block must be self-contained.
+- NEVER write "same issue as above" or "see above" — each finding must be self-contained.
+- DO NOT INCLUDE CODE BLOCKS FOR MEDIUM AND LOW ISSUES. You must serialize them as one-line bullet points to save output tokens.
 - Severity sections must be in order: 🔴 Critical → 🟠 High → 🟡 Medium → 🟢 Low.
 - If zero findings were reported in total across all files, just write a short approval message following the Summary table.
 - If some chunks failed, note it in Coverage Notes but do NOT penalize the PR for missing coverage.
