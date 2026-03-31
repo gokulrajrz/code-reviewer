@@ -262,6 +262,7 @@ RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 - DO NOT output empty severity sections. If there are 0 Critical issues, the first section should be \`### 🟠 High Issues\`.
+- The payload has N findings. Your output MUST have EXACTLY N items (combining code blocks and bullet points). Count them. If you output fewer items than findings in the payload, your review is WRONG.
 - NEVER write "same issue as above" or "see above" — each finding must be self-contained.
 - DO NOT INCLUDE CODE BLOCKS FOR MEDIUM AND LOW ISSUES. You must serialize them as one-line bullet points to save output tokens.
 - Severity sections must be in order: 🔴 Critical → 🟠 High → 🟡 Medium → 🟢 Low.
