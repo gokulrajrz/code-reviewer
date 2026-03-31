@@ -89,7 +89,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         let content = data.candidates[0]?.content?.parts[0]?.text ?? '';
 
         if (data.candidates[0]?.finishReason === 'MAX_TOKENS') {
-            content += '\n\n---\n\n> ⚠️ **AI Generation Truncated** — The model reached its maximum output token limit. The rest of this chunk could not be analyzed.';
+            logger.warn('Gemini MAP chunk generation truncated by max_tokens', { chunkLabel });
         }
 
         const usage: TokenUsage = {

@@ -20,10 +20,17 @@ export function parseFindings(rawOutput: string): ReviewFinding[] {
     try {
         parsed = JSON.parse(cleaned);
     } catch {
-        logger.error('Failed to parse LLM JSON output', undefined, {
-            rawOutput: rawOutput.slice(0, 500),
-        });
-        return [];
+        // Attempt to salvage truncated array (max_tokens hit mid-generation)
+        const salvaged = salvageTruncatedArray(cleaned);
+        try {
+            parsed = JSON.parse(salvaged);
+            logger.info('Successfully salvaged truncated JSON array');
+        } catch {
+            logger.error('Failed to parse LLM JSON output even after salvage attempt', undefined, {
+                rawOutput: rawOutput.slice(0, 500),
+            });
+            return [];
+        }
     }
 
     // Validate top-level structure
@@ -155,3 +162,25 @@ function validateFinding(item: unknown): ReviewFinding | null {
 
     return finding;
 }
+
+/**
+ * Attempts to salvage a truncated JSON array by terminating at the last complete
+ * object brace '}' and forcibly closing the array structure.
+ */
+function salvageTruncatedArray(text: string): string {
+    const lastBraceIndex = text.lastIndexOf('}');
+    if (lastBraceIndex === -1) return text;
+
+    let salvaged = text.slice(0, lastBraceIndex + 1);
+
+    // If it was wrapped in a {"findings": [...]} structure
+    if (salvaged.includes('"findings"')) {
+        salvaged += ']}';
+    } else {
+        // Assume raw array [...]
+        salvaged += ']';
+    }
+
+    return salvaged;
+}
+

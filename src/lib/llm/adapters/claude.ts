@@ -73,7 +73,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         let content = data.content.find(c => c.type === 'text')?.text ?? '';
 
         if (data.stop_reason === 'max_tokens') {
-            content += '\n\n---\n\n> ⚠️ **AI Generation Truncated** — The model reached its maximum output token limit. The rest of this chunk could not be analyzed.';
+            logger.warn('Claude MAP chunk generation truncated by max_tokens', { chunkLabel });
         }
 
         const usage: TokenUsage = {
