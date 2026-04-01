@@ -41,6 +41,8 @@ export interface Env {
   CLIQ_BOT_NAME?: string;
   /** Zoho Cliq Target ID (Channel ID, Chat ID, or User ID) to route reviews to */
   CLIQ_CHANNEL_ID?: string;
+  /** Zoho Cliq Database name for GitHub↔Cliq user mapping (default: 'githubusermap') */
+  CLIQ_DB_NAME?: string;
 
   // --- Queues ---
   /** The Queue responsible for processing reviews in the background */

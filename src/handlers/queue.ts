@@ -599,7 +599,8 @@ async function processMessage(
                 title,
                 prAuthor ?? 'unknown',
                 conclusion,
-                severityCounts
+                severityCounts,
+                env.CLIQ_DB_NAME
             );
         }
 

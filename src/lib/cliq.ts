@@ -66,6 +66,82 @@ async function getZohoAccessToken(clientId: string, clientSecret: string, refres
 }
 
 /**
+ * Response shape from the Cliq Database Records API.
+ * We only need the `values` of each record.
+ */
+interface CliqDBRecordResponse {
+    list: Array<Record<string, string>>;
+}
+
+/**
+ * Resolves a GitHub username to a Zoho Cliq email address by querying
+ * the Cliq Database REST API.
+ *
+ * Returns `null` if no mapping exists or any error occurs (graceful degradation).
+ *
+ * Endpoint: GET /api/v2/storages/{db_name}/records?criteria=github_username=={username}
+ * Scope required: ZohoCliq.StorageData.READ
+ */
+async function resolveCliqUser(
+    accessToken: string,
+    dbName: string,
+    githubUsername: string
+): Promise<string | null> {
+    const zohoApiBase = 'https://cliq.zoho.in/api/v2';
+    const encDb = encodeURIComponent(dbName);
+    const criteria = encodeURIComponent(`githubusername==${githubUsername}`);
+    const endpoint = `${zohoApiBase}/storages/${encDb}/records?criteria=${criteria}&limit=1`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    try {
+        const response = await fetch(endpoint, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Zoho-oauthtoken ${accessToken}`,
+            },
+            signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            logger.warn('Cliq DB lookup failed', {
+                status: response.status,
+                githubUsername,
+                dbName,
+            });
+            return null;
+        }
+
+        const result = await response.json() as CliqDBRecordResponse;
+
+        if (!result.list || result.list.length === 0) {
+            logger.info('No Cliq mapping found for GitHub user', { githubUsername });
+            return null;
+        }
+
+        const cliqEmail = result.list[0].cliqemail;
+        if (!cliqEmail) {
+            logger.warn('Cliq DB record missing cliqemail field', { githubUsername, dbName });
+            return null;
+        }
+
+        logger.info('Resolved GitHub user to Cliq email', { githubUsername, cliqEmail });
+        return cliqEmail;
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error instanceof Error && error.name === 'AbortError') {
+            logger.warn('Cliq DB lookup timed out (5s)', { githubUsername });
+        } else {
+            logger.warn('Cliq DB lookup error', { githubUsername, error: error instanceof Error ? error.message : String(error) });
+        }
+        return null;
+    }
+}
+
+/**
  * Maps a standardized GitHub conclusion to a human-readable Client Chat verdict label.
  */
 function getVerdictLabel(conclusion: string): string {
@@ -93,7 +169,8 @@ export async function postToCliq(
     prTitle: string,
     prAuthor: string,
     conclusion: string,
-    severityCounts: Record<FindingSeverity, number>
+    severityCounts: Record<FindingSeverity, number>,
+    dbName?: string
 ): Promise<void> {
     if (!clientId || !clientSecret || !refreshToken || !botName || !targetId) {
         logger.warn('Skipping Cliq notification: Client ID, Secret, Refresh Token, Bot Name, or Target ID is missing');
@@ -113,9 +190,31 @@ export async function postToCliq(
 
     const verdictLabel = getVerdictLabel(conclusion);
 
+    // ── Step 0: Resolve GitHub author → Cliq user for @mention ──
+    // This runs BEFORE payload construction so we can inject the mention.
+    // OAuth token is obtained early as it's needed for both DB lookup and message post.
+    let accessToken: string;
+    try {
+        logger.info('Exchanging Zoho Refresh Token for Access Token', { prNumber, repoFullName });
+        accessToken = await getZohoAccessToken(clientId, clientSecret, refreshToken);
+    } catch (error) {
+        logger.error('Failed to obtain Zoho access token', error instanceof Error ? error : undefined, {
+            prNumber, repoFullName,
+        });
+        return;
+    }
+
+    let mentionTag = `@${prAuthor}`; // Fallback: plain GitHub username (no Cliq notification)
+    if (dbName) {
+        const cliqEmail = await resolveCliqUser(accessToken, dbName, prAuthor);
+        if (cliqEmail) {
+            mentionTag = `@${cliqEmail}`;
+        }
+    }
+
     // Strictly typed payload (API Contract)
     const payload: CliqBotPayload = {
-        text: `AI Code Review completed for **${repoFullName}#${prNumber}**`,
+        text: `${mentionTag} — AI Code Review completed for **${repoFullName}#${prNumber}**`,
         card: {
             title: `PR #${prNumber}: ${prTitle}`,
             theme: 'modern-inline',
@@ -175,11 +274,8 @@ export async function postToCliq(
     }
 
     try {
-        // Step 1: Execute Auto-Refresh OAuth flow
-        logger.info('Exchanging Zoho Refresh Token for Access Token', { prNumber, repoFullName });
-        const accessToken = await getZohoAccessToken(clientId, clientSecret, refreshToken);
-
-        // Step 2: Proceed with the Notification Dispatch (Hard 10s Timeout)
+        // Proceed with the Notification Dispatch (Hard 10s Timeout)
+        // Access token already obtained above for DB lookup + message post.
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 10000);
 
