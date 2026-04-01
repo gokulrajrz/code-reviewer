@@ -26,7 +26,7 @@
 		"AI_PROVIDER": "claude",
 		"ALLOWED_TARGET_BRANCHES": "dev",
 		"CLIQ_BOT_NAME": "codereviewbot",
-		"CLIQ_CHANNEL_ID": "PR_Web"
+		"CLIQ_CHANNEL_ID": "prweb"
 	},
 	/**
 	 * Queues
