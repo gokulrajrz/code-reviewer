@@ -169,8 +169,9 @@ export async function postToCliq(
         payload.sync_message = true;
     } else {
         // Fallback: Assume targetId is a Channel Unique Name (e.g. "engineering")
-        // Appends ?bot_unique_name to ensure the message renders as the Bot, not the App User
-        endpoint = `${zohoApiBase}/channelsbyname/${encTarget}/message?bot_unique_name=${encBotName}`;
+        // Zoho API path routing violently rejects uppercase letters. Sanitize before encoding.
+        const safeChannelName = encodeURIComponent(targetId.toLowerCase());
+        endpoint = `${zohoApiBase}/channelsbyname/${safeChannelName}/message?bot_unique_name=${encBotName}`;
     }
 
     try {
