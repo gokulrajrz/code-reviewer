@@ -11,6 +11,7 @@ import {
 } from '../lib/github';
 import { getInstallationToken } from '../lib/github-auth';
 import { callChunkReview, callSynthesizer, getModelName } from '../lib/llm/index';
+import { postToCliq } from '../lib/cliq';
 import { buildPRUsageMetrics, storePRUsageMetrics } from '../lib/usage-tracker';
 import { logger } from '../lib/logger';
 import { runWithContextAsync } from '../lib/request-context';
@@ -90,7 +91,7 @@ function flattenClustersToAnnotated(clusters: FindingCluster[]): AnnotatedFindin
 
     // Sort by severity (critical first), then by file for consistent ordering
     annotated.sort((a, b) => {
-        const sevDiff = (SEVERITY_SORT[a.severity] ?? 3) - (SEVERITY_SORT[a.severity] ?? 3);
+        const sevDiff = (SEVERITY_SORT[a.severity] ?? 3) - (SEVERITY_SORT[b.severity] ?? 3);
         if (sevDiff !== 0) return sevDiff;
         return a.file.localeCompare(b.file);
     });
@@ -235,7 +236,7 @@ async function processMessage(
     message: Message<ReviewMessage>,
     env: Env
 ): Promise<void> {
-    const { prNumber, title, repoFullName, headSha, checkRunId } = message.body;
+    const { prNumber, title, repoFullName, headSha, checkRunId, prAuthor } = message.body;
 
     logger.info('Processing PR', {
         prNumber,
@@ -584,6 +585,23 @@ async function processMessage(
             verdict,
             isFallback,
         });
+
+        // ── Step 10.5: Post notification to Zoho Cliq Bot ──
+        if (env.CLIQ_CLIENT_ID && env.CLIQ_CLIENT_SECRET && env.CLIQ_REFRESH_TOKEN && env.CLIQ_BOT_NAME && env.CLIQ_CHANNEL_ID) {
+            await postToCliq(
+                env.CLIQ_CLIENT_ID,
+                env.CLIQ_CLIENT_SECRET,
+                env.CLIQ_REFRESH_TOKEN,
+                env.CLIQ_BOT_NAME,
+                env.CLIQ_CHANNEL_ID,
+                repoFullName,
+                prNumber,
+                title,
+                prAuthor ?? 'unknown',
+                conclusion,
+                severityCounts
+            );
+        }
 
         // ── Step 11: Store usage metrics ──
         try {

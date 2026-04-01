@@ -160,7 +160,8 @@ export async function handlePRWebhook(
             title: pr.title,
             repoFullName: repository.full_name,
             headSha,
-            checkRunId: checkRunId ?? 0,
+            ...(checkRunId ? { checkRunId } : {}),
+            prAuthor: pr.user.login,
             requestId: getRequestId(),
         });
     } catch (error) {

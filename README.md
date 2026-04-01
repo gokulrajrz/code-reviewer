@@ -36,6 +36,7 @@ GitHub PR Event → Webhook POST → fetch handler
 - **Tiered Review System**: Handles massive PRs (up to 300 files) by sorting files by significance. Top 15 files (`Tier 1`) get full file content fetched for deep architectural review. Remaining files (`Tier 2`) use diff-only context to save subrequests and tokens.
 - **Smart Prioritization**: Extracted files are scored based on change size, with bonuses applied to source code (`.ts`, `.py`, etc.), newly-added files, and core application directories (`src/`).
 - **Aggressive Noise Filtering**: Automatically ignores >30 extensions (`.lock`, `.svg`, `.map`) and vendor directories (`node_modules/`, `dist/`), saving API costs and LLM context.
+- **Zoho Cliq Bot Notifications**: Automatically posts beautiful, Rich-Card PR scorecards to your team's Zoho Cliq channel using the native Bot API.
 - **Execution Limits Protection**: Hard limits on generation chunks (max 10) to mathematically prevent Cloudflare's 50-subrequest free-tier ceiling. `AbortSignal` implementation forcibly tears down hung sockets during LLM timeouts to avoid connection exhaustion cascades.
 - **Multi-LLM Support**: Switch seamlessly between Claude 3.5 Sonnet (default) and Gemini 1.5 Pro via environment variables.
 - **📊 Token Usage & Cost Tracking**: Automatic per-PR token usage tracking with detailed cost estimates, stored in Cloudflare KV. Query via REST API or view in the included dashboard. [See USAGE_TRACKING.md](./USAGE_TRACKING.md)
@@ -101,6 +102,10 @@ npx wrangler secret put GITHUB_APP_ID
 npx wrangler secret put GITHUB_APP_PRIVATE_KEY   # Paste the full PEM contents
 npx wrangler secret put GITHUB_APP_INSTALLATION_ID
 npx wrangler secret put GITHUB_WEBHOOK_SECRET
+npx wrangler secret put CLIQ_CLIENT_ID           # Zoho OAuth Client ID
+npx wrangler secret put CLIQ_CLIENT_SECRET       # Zoho OAuth Client Secret
+npx wrangler secret put CLIQ_REFRESH_TOKEN       # Zoho OAuth Refresh Token
+npx wrangler secret put CLIQ_CHANNEL_ID          # Target Channel/User ID
 ```
 
 ### 7. Generate Types
@@ -135,6 +140,11 @@ npm run deploy
 | `GITHUB_APP_PRIVATE_KEY` | Secret | GitHub App Private Key (PEM format) |
 | `GITHUB_APP_INSTALLATION_ID` | Secret | GitHub App Installation ID |
 | `GITHUB_WEBHOOK_SECRET` | Secret | Webhook HMAC signature secret |
+| `CLIQ_CLIENT_ID` | Secret | Zoho OAuth Client ID |
+| `CLIQ_CLIENT_SECRET` | Secret | Zoho OAuth Client Secret |
+| `CLIQ_REFRESH_TOKEN` | Secret | Zoho OAuth permanent refresh token (`ZohoCliq.Webhooks.CREATE` scope) |
+| `CLIQ_CHANNEL_ID` | Secret | Zoho Target ID (`ch_...` for Channels, `chat_...` for Group Chats, or email/`us_...` for DMs) |
+| `CLIQ_BOT_NAME` | Var | Unique Bot Name in `wrangler.jsonc` (e.g., `codereviewbot`) |
 | `AI_PROVIDER` | Var | `"claude"` (default) or `"gemini"` |
 | `ALLOWED_TARGET_BRANCHES` | Var | Comma-separated branches to review (e.g., `"dev,main"`) |
 

@@ -13,3 +13,10 @@ GITHUB_APP_INSTALLATION_ID=12345678
 GITHUB_WEBHOOK_SECRET=your-secret-string-here
 AI_PROVIDER=claude
 # ALLOWED_TARGET_BRANCHES=dev,main
+
+# Zoho Cliq OAuth 2.0 Notification Credentials (Optional, but required for chat alerts)
+CLIQ_CLIENT_ID=your-client-id-here
+CLIQ_CLIENT_SECRET=your-client-secret-here
+CLIQ_REFRESH_TOKEN=your-refresh-token-here
+CLIQ_BOT_NAME=codereviewbot
+CLIQ_CHANNEL_ID=your-target-id-here

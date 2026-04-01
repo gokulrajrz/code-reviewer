@@ -24,7 +24,8 @@
 	 */
 	"vars": {
 		"AI_PROVIDER": "claude",
-		"ALLOWED_TARGET_BRANCHES": "dev"
+		"ALLOWED_TARGET_BRANCHES": "dev",
+		"CLIQ_BOT_NAME": "codereviewbot"
 	},
 	/**
 	 * Queues

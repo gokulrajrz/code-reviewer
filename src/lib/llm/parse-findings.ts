@@ -173,6 +173,10 @@ function salvageTruncatedArray(text: string): string {
 
     let salvaged = text.slice(0, lastBraceIndex + 1);
 
+    // Strip any trailing comma after the last complete object
+    // e.g. '{...}, {"sev' → after slice: '{...},' → must remove the comma
+    salvaged = salvaged.replace(/,\s*$/, '');
+
     // If it was wrapped in a {"findings": [...]} structure
     if (salvaged.includes('"findings"')) {
         salvaged += ']}';
