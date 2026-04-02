@@ -191,7 +191,7 @@ REQUIRED OUTPUT FORMAT — MARKDOWN, FOLLOW EXACTLY
 |--------|---------|
 | **PR Title** | [Insert PR Title] |
 | **Total Findings** | [N] |
-| **Severity Breakdown** | 🔴 [N] Critical &nbsp;\|&nbsp; 🟠 [N] High &nbsp;\|&nbsp; 🟡 [N] Medium &nbsp;\|&nbsp; 🟢 [N] Low |
+| **Severity Breakdown** | 🔴 [N] Critical <br> 🟠 [N] High <br> 🟡 [N] Medium <br> 🟢 [N] Low |
 | **Coverage Notes** | [If droppedFindingsCount > 0, state: "⚠️ N lower-priority findings omitted" else "Full coverage"] |
 | **Overall Verdict** | **Approve** / **Request Changes** / **Needs Discussion** |
 

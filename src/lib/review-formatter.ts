@@ -107,7 +107,7 @@ export function formatFindingsAsMarkdown(
     sections.push(`## 📊 Code Review Report\n`);
 
     const sevCounts = countBySeverity(allFindings);
-    const severityBreakdown = `🔴 ${sevCounts.critical} Critical &nbsp;\\|&nbsp; 🟠 ${sevCounts.high} High &nbsp;\\|&nbsp; 🟡 ${sevCounts.medium} Medium &nbsp;\\|&nbsp; 🟢 ${sevCounts.low} Low`;
+    const severityBreakdown = `🔴 ${sevCounts.critical} Critical <br> 🟠 ${sevCounts.high} High <br> 🟡 ${sevCounts.medium} Medium <br> 🟢 ${sevCounts.low} Low`;
 
     let coverageNotes = 'Full coverage';
     if (options.droppedFindingsCount > 0) {
