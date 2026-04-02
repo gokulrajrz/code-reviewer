@@ -122,14 +122,14 @@ async function resolveCliqUser(
             return null;
         }
 
-        const cliqEmail = result.list[0].cliqemail;
-        if (!cliqEmail) {
-            logger.warn('Cliq DB record missing cliqemail field', { githubUsername, dbName });
+        const cliqZuid = result.list[0].cliqzuid;
+        if (!cliqZuid) {
+            logger.warn('Cliq DB record missing cliqzuid field', { githubUsername, dbName });
             return null;
         }
 
-        logger.info('Resolved GitHub user to Cliq email', { githubUsername, cliqEmail });
-        return cliqEmail;
+        logger.info('Resolved GitHub user to Cliq ZUID', { githubUsername, cliqZuid });
+        return cliqZuid;
     } catch (error) {
         clearTimeout(timeoutId);
         if (error instanceof Error && error.name === 'AbortError') {
@@ -206,9 +206,9 @@ export async function postToCliq(
 
     let mentionTag = `@${prAuthor}`; // Fallback: plain GitHub username (no Cliq notification)
     if (dbName) {
-        const cliqEmail = await resolveCliqUser(accessToken, dbName, prAuthor);
-        if (cliqEmail) {
-            mentionTag = `@${cliqEmail}`;
+        const cliqZuid = await resolveCliqUser(accessToken, dbName, prAuthor);
+        if (cliqZuid) {
+            mentionTag = `{@${cliqZuid}}`;
         }
     }
 
@@ -298,10 +298,7 @@ export async function postToCliq(
                     logger.warn('Zoho Cliq API rate limit exceeded. Notification dropped.');
                     return;
                 }
-                if (response.status === 401 || response.status === 403) {
-                    logger.error('Zoho Cliq API authentication failed. The integration may be unauthorized or scopes are missing.');
-                    return;
-                }
+                // Removed generic 401/403 suppression to catch exact Zoho JSON errors
 
                 const errText = await response.text();
                 throw new Error(`Cliq API error at ${endpoint} (${response.status}): ${errText}`);
