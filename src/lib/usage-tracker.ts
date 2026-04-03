@@ -72,10 +72,22 @@ export async function storePRUsageMetrics(
                 // CRITICAL: Metadata is strictly limited to 1024 bytes in Cloudflare KV.
                 // Never pass the entire validatedMetrics object as it contains the `calls` array.
                 metadata: {
+                    schemaVersion: validatedMetrics.schemaVersion,
                     prNumber: validatedMetrics.prNumber,
                     repoFullName: validatedMetrics.repoFullName,
+                    headSha: validatedMetrics.headSha,
+                    provider: validatedMetrics.provider,
+                    startTime: validatedMetrics.startTime,
+                    endTime: validatedMetrics.endTime,
+                    durationMs: validatedMetrics.durationMs,
+                    totalInputTokens: validatedMetrics.totalInputTokens,
+                    totalOutputTokens: validatedMetrics.totalOutputTokens,
                     totalTokens: validatedMetrics.totalTokens,
                     estimatedCost: validatedMetrics.estimatedCost,
+                    filesReviewed: validatedMetrics.filesReviewed,
+                    chunksProcessed: validatedMetrics.chunksProcessed,
+                    findingsCount: validatedMetrics.findingsCount,
+                    status: validatedMetrics.status,
                 }
             }),
             'KV put (main key)'
