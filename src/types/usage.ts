@@ -68,7 +68,7 @@ export const TOKEN_PRICING: Record<string, { inputPer1M: number; outputPer1M: nu
         outputPer1M: 4.00,  // $4 per 1M output tokens
     },
     // Claude Sonnet - balanced model (default)
-    'claude-sonnet-4-20250514': {
+    'claude-sonnet-4-6': {
         inputPer1M: 3.00,   // $3 per 1M input tokens
         outputPer1M: 15.00, // $15 per 1M output tokens
     },
