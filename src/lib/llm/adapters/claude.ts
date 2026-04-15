@@ -20,6 +20,15 @@ export class ClaudeAdapter extends LLMProviderAdapter {
         this.temperature = config.temperature ?? 0.1;
     }
 
+    /**
+     * Dynamically scale output token budget based on chunk content size.
+     * Larger chunks may produce more findings needing more output room.
+     * Claude Sonnet 4 supports up to 16,384 output tokens.
+     */
+    private getChunkMaxTokens(chunkContent: string): number {
+        return Math.min(8192, 2048 + Math.floor(chunkContent.length / 50));
+    }
+
     getProviderName(): string {
         return 'anthropic';
     }
@@ -52,7 +61,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             },
             body: JSON.stringify({
                 model: this.model,
-                max_tokens: this.maxTokens,
+                max_tokens: this.getChunkMaxTokens(chunkContent),
                 temperature: this.temperature,
                 system: request.systemPrompt,
                 messages: [{ role: 'user', content: userPrompt }],

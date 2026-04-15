@@ -413,6 +413,51 @@ function splitLargeFileBlock(
 }
 
 // ---------------------------------------------------------------------------
+// Diff Parsing Utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses a unified diff patch and returns the set of line numbers (1-indexed)
+ * that correspond to ADDED or MODIFIED lines in the new file.
+ *
+ * Used by the plugin system to only flag findings on changed lines,
+ * eliminating false positives from pre-existing code.
+ *
+ * Handles standard unified diff format:
+ *   @@ -oldStart,oldCount +newStart,newCount @@
+ */
+export function parseDiffAddedLines(patch: string): Set<number> {
+    const addedLines = new Set<number>();
+    const lines = patch.split('\n');
+    let currentLine = 0;
+
+    for (const line of lines) {
+        // Parse hunk headers: @@ -oldStart,oldCount +newStart,newCount @@
+        const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (hunkMatch) {
+            currentLine = parseInt(hunkMatch[1], 10);
+            continue;
+        }
+
+        if (currentLine === 0) continue; // Before first hunk
+
+        if (line.startsWith('+') && !line.startsWith('+++')) {
+            // Added line — this is a changed line in the new file
+            addedLines.add(currentLine);
+            currentLine++;
+        } else if (line.startsWith('-') && !line.startsWith('---')) {
+            // Deleted line — doesn't advance the new file line counter
+            // (this line exists only in the old version)
+        } else {
+            // Context line (unchanged) or empty — advances counter
+            currentLine++;
+        }
+    }
+
+    return addedLines;
+}
+
+// ---------------------------------------------------------------------------
 // Tiered Chunk Building (Fixed)
 // ---------------------------------------------------------------------------
 
@@ -434,12 +479,16 @@ async function buildTier1Block(
     // Run analyzer plugins on the full file content before chunking
     if (content && !content.startsWith('[File too large')) {
         try {
+            // Extract changed line numbers from the diff patch for diff-aware plugin scanning
+            const diffLines = file.patch ? parseDiffAddedLines(file.patch) : new Set<number>();
+
             const pluginResult = await pluginRegistry.analyzeFile({
                 filename: file.filename,
                 content: content,
                 prTitle: prContext.title,
                 repoFullName: prContext.repoFullName,
-                prNumber: prContext.prNumber
+                prNumber: prContext.prNumber,
+                diffLines,
             });
             findings.push(...pluginResult.findings);
         } catch (error) {
@@ -900,5 +949,209 @@ export async function updateCheckRun(
             checkRunId,
         });
         // Non-critical: don't throw
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pull Request Reviews API (Inline Comments)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single inline review comment to post on a specific line of a file.
+ */
+export interface InlineReviewComment {
+    /** Relative path to the file */
+    path: string;
+    /** The line number in the NEW file (right side of diff) */
+    line: number;
+    /** Comment body in Markdown */
+    body: string;
+}
+
+/**
+ * Maps a file line number to the corresponding position in the diff patch.
+ *
+ * GitHub's Reviews API requires a `position` parameter which is the
+ * 1-indexed line number within the diff hunk (counting from the first @@).
+ * This is NOT the same as the file line number.
+ */
+function mapLineToDiffPosition(
+    patch: string | undefined,
+    targetLine: number
+): number | null {
+    if (!patch) return null;
+
+    const lines = patch.split('\n');
+    let diffPosition = 0;
+    let currentFileLine = 0;
+
+    for (const line of lines) {
+        const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (hunkMatch) {
+            currentFileLine = parseInt(hunkMatch[1], 10);
+            diffPosition++;
+            continue;
+        }
+
+        if (currentFileLine === 0) continue;
+
+        diffPosition++;
+
+        if (line.startsWith('-') && !line.startsWith('---')) {
+            // Deleted line — doesn't map to new file
+            continue;
+        }
+
+        if (currentFileLine === targetLine) {
+            return diffPosition;
+        }
+
+        // Both added and context lines advance the new file counter
+        currentFileLine++;
+    }
+
+    return null;
+}
+
+/**
+ * Posts a Pull Request Review with inline comments via the GitHub Reviews API.
+ *
+ * This produces native GitHub review comments that appear inline next to the
+ * code, not as a wall of text in an issue comment. The review can also set
+ * an overall approval status (APPROVE, REQUEST_CHANGES, COMMENT).
+ *
+ * GitHub limits: max 50 inline comments per review. Excess findings get
+ * included in the review body instead.
+ *
+ * @param repoFullName  e.g. "owner/repo"
+ * @param prNumber      PR number
+ * @param token         Installation access token
+ * @param event         Review event: APPROVE, REQUEST_CHANGES, or COMMENT
+ * @param body          Review summary body (Markdown)
+ * @param comments      Inline review comments mapped to specific file+line
+ * @param filePatches   Map of filename → diff patch for position mapping
+ */
+export async function postPRReview(
+    repoFullName: string,
+    prNumber: number,
+    token: string,
+    event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT',
+    body: string,
+    comments: InlineReviewComment[],
+    filePatches: Map<string, string>
+): Promise<void> {
+    // Check circuit breaker
+    if (!circuitBreakers.github.canExecute()) {
+        logger.warn('GitHub API circuit breaker is OPEN, skipping PR review');
+        throw new Error('GitHub API circuit breaker is OPEN');
+    }
+
+    // GitHub caps at 50 inline comments per review
+    const MAX_INLINE_COMMENTS = 50;
+
+    // Map line numbers to diff positions and filter out unmappable comments
+    const mappedComments: Array<{ path: string; position: number; body: string }> = [];
+    const unmapped: InlineReviewComment[] = [];
+
+    for (const comment of comments) {
+        const patch = filePatches.get(comment.path);
+        const position = mapLineToDiffPosition(patch, comment.line);
+
+        if (position !== null) {
+            mappedComments.push({
+                path: comment.path,
+                position,
+                body: comment.body,
+            });
+        } else {
+            unmapped.push(comment);
+        }
+    }
+
+    // Enforce GitHub's 50-comment limit — overflow goes into review body
+    const inlineToPost = mappedComments.slice(0, MAX_INLINE_COMMENTS);
+    const overflowMapped = mappedComments.slice(MAX_INLINE_COMMENTS);
+
+    // Build overflow section for the review body
+    let reviewBody = body;
+    const overflow = [...unmapped, ...overflowMapped.map(c => ({
+        path: c.path,
+        line: 0,
+        body: c.body,
+    }))];
+
+    if (overflow.length > 0) {
+        reviewBody += '\n\n---\n\n' +
+            `> ℹ️ **${overflow.length} additional finding(s)** could not be posted as inline comments ` +
+            `(line not in diff or GitHub's 50-comment limit exceeded):\n\n`;
+        for (const item of overflow.slice(0, 20)) { // Cap at 20 to avoid massive body
+            reviewBody += `- **\`${item.path}\`**: ${item.body.split('\n')[0]}\n`;
+        }
+        if (overflow.length > 20) {
+            reviewBody += `\n_...and ${overflow.length - 20} more._\n`;
+        }
+    }
+
+    logger.info('Posting PR review with inline comments', {
+        prNumber,
+        inlineComments: inlineToPost.length,
+        unmapped: unmapped.length,
+        overflow: overflowMapped.length,
+        event,
+    });
+
+    const executeReview = async (): Promise<void> => {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/reviews`;
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                event,
+                body: truncateMarkdown(reviewBody),
+                comments: inlineToPost,
+            }),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to post PR review: ${response.status} — ${errorText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
+        }
+    };
+
+    try {
+        const { attempts } = await retryWithBackoff(
+            executeReview,
+            'GitHub post PR review',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`PR review posted after ${attempts} attempts`, {
+                prNumber,
+                attempts,
+            });
+        }
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        throw error;
     }
 }

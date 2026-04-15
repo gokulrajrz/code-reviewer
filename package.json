@@ -19,8 +19,5 @@
 		"vitest": "~3.2.0",
 		"wrangler": "^4.74.0"
 	},
-	"dependencies": {
-		"@anthropic-ai/sdk": "^0.79.0",
-		"@google/generative-ai": "^0.24.1"
-	}
+	"dependencies": {}
 }

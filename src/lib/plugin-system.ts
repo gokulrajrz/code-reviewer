@@ -14,6 +14,12 @@ export interface AnalysisContext {
     prTitle: string;
     repoFullName: string;
     prNumber: number;
+    /**
+     * Set of 1-indexed line numbers that were added/modified in the diff.
+     * If empty or undefined, the plugin runs in "full scan" mode (legacy).
+     * Plugins SHOULD only flag findings whose line is in this set.
+     */
+    diffLines?: Set<number>;
 }
 
 export interface AnalysisResult {
@@ -160,9 +166,16 @@ export class SecurityAnalyzerPlugin implements AnalyzerPlugin {
 
         for (const { pattern, title, severity } of securityPatterns) {
             if (pattern.test(context.content)) {
+                const lineNum = this.findLineNumber(context.content, pattern);
+
+                // Diff-aware: skip findings on lines NOT in the diff
+                if (context.diffLines && context.diffLines.size > 0 && !context.diffLines.has(lineNum)) {
+                    continue;
+                }
+
                 findings.push({
                     file: context.filename,
-                    line: this.findLineNumber(context.content, pattern),
+                    line: lineNum,
                     title,
                     severity,
                     issue: `${title} detected in ${context.filename}`,

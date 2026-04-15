@@ -80,7 +80,19 @@ export async function handlePRWebhook(
         );
     }
 
-    // 4. Only process reviewable actions
+    // 4a. Skip draft PRs — they aren't ready for review
+    if (payload.pull_request?.draft === true) {
+        logger.info('Skipping draft PR', {
+            prNumber: payload.pull_request.number,
+            action: payload.action,
+        });
+        return createSecureJsonResponse(
+            { message: `Ignored: PR #${payload.pull_request.number} is a draft` },
+            200
+        );
+    }
+
+    // 4b. Only process reviewable actions
     if (!REVIEWABLE_ACTIONS.has(payload.action)) {
         return createSecureJsonResponse(
             { message: `Ignored PR action: ${payload.action}` },

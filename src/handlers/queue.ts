@@ -7,15 +7,17 @@ import {
     classifyFiles,
     buildReviewChunks,
     postPRComment,
+    postPRReview,
     updateCheckRun,
 } from '../lib/github';
-import { getInstallationToken } from '../lib/github-auth';
+import type { InlineReviewComment } from '../lib/github';
+import { getInstallationToken, invalidateInstallationToken } from '../lib/github-auth';
 import { callChunkReview, callSynthesizer, getModelName } from '../lib/llm/index';
 import { postToCliq } from '../lib/cliq';
 import { buildPRUsageMetrics, storePRUsageMetrics } from '../lib/usage-tracker';
 import { logger } from '../lib/logger';
 import { runWithContextAsync } from '../lib/request-context';
-import { clusterFindings, flattenClusters } from '../lib/finding-clusters';
+import { clusterFindings } from '../lib/finding-clusters';
 import type { FindingCluster } from '../lib/finding-clusters';
 import { deriveVerdict, verdictToConclusion, countBySeverity } from '../lib/verdict';
 import { formatFindingsAsMarkdown } from '../lib/review-formatter';
@@ -116,7 +118,10 @@ function buildSynthesizerPayload(
     clusters: FindingCluster[],
     totalChunks: number,
     failedChunks: number,
-    failedChunkFiles: string[]
+    failedChunkFiles: string[],
+    verdict: 'approve' | 'request_changes' | 'needs_discussion',
+    severityCounts: { critical: number; high: number; medium: number; low: number },
+    conclusion: 'success' | 'failure' | 'neutral'
 ): { payload: string; droppedFindingsCount: number } {
     const allAnnotated = flattenClustersToAnnotated(clusters);
     const totalFindingsCount = allAnnotated.length;
@@ -131,6 +136,9 @@ function buildSynthesizerPayload(
         failedChunks,
         droppedFindingsCount: 0,
         failedChunkFiles,
+        verdict,
+        severityCounts,
+        conclusion,
     };
 
     // Compact JSON — saves ~30% tokens vs pretty-printed
@@ -213,6 +221,17 @@ export async function queueHandler(
     env: Env,
     _ctx: ExecutionContext
 ): Promise<void> {
+    // Safety guard: reject batches > 1 to prevent subrequest budget explosion.
+    // With max_batch_size: 1 in wrangler.jsonc this is a defensive assertion.
+    if (batch.messages.length > 1) {
+        logger.error('Queue batch size > 1 is not supported — would exceed subrequest limits', undefined, {
+            batchSize: batch.messages.length,
+        });
+        // Ack all and bail — retrying won't change the batch size
+        for (const msg of batch.messages) msg.ack();
+        return;
+    }
+
     // Process each message with its own request context for distributed tracing
     const processingPromises = batch.messages.map(async (message) => {
         const { prNumber, title, repoFullName, headSha, requestId } = message.body;
@@ -270,7 +289,22 @@ async function processMessage(
     try {
         // ── Step 2: Fetch ALL changed files (paginated) ──
         logger.info('Fetching changed files', { prNumber });
-        const allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+        let allFiles;
+        try {
+            allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+        } catch (fetchError) {
+            // If the cached token is expired/invalid, GitHub returns 401.
+            // Invalidate the cache, get a fresh token, and retry once.
+            const errMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
+            if (errMsg.includes('401')) {
+                logger.warn('GitHub API returned 401, invalidating cached token and retrying', { prNumber });
+                await invalidateInstallationToken(env);
+                token = await getInstallationToken(env);
+                allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+            } else {
+                throw fetchError;
+            }
+        }
         logger.info('Fetched changed files', { prNumber, count: allFiles.length });
 
         if (allFiles.length === 0) {
@@ -308,8 +342,26 @@ async function processMessage(
 
         // ── Step 3.5: Detect tech stack ──
         logger.info('Detecting tech stack', { repoFullName });
+
+        // Extract content snippets from diff patches (already fetched, zero cost)
+        // to feed the stack detector's Tier 6 import scanner.
+        const patchContents = allFiles
+            .filter(f => f.patch && (f.status === 'added' || f.status === 'modified'))
+            .slice(0, 20) // Cap to avoid excessive processing
+            .map(f => ({
+                filename: f.filename,
+                // Extract added lines from the patch (lines starting with '+')
+                content: f.patch!
+                    .split('\n')
+                    .filter(line => line.startsWith('+') && !line.startsWith('+++'))
+                    .map(line => line.slice(1)) // Remove the '+' prefix
+                    .join('\n'),
+            }))
+            .filter(f => f.content.length > 0);
+
         const stackProfile: TechStackProfile = await detectTechStack({
             changedFiles: allFiles.map(f => f.filename),
+            fileContents: patchContents.length > 0 ? patchContents : undefined,
             repoFullName,
             token,
             kvNamespace: env.USAGE_METRICS,
@@ -400,27 +452,61 @@ async function processMessage(
         let failedChunks = 0;
         const failedChunkFiles: string[] = []; // Track which files lacked coverage
 
-        for (let i = 0; i < chunks.length; i++) {
-            const chunkContent = chunks[i];
-            const chunkLabel = `${i + 1}/${chunks.length}`;
+        // Process chunks in parallel with bounded concurrency.
+        // Concurrency of 3 is the sweet spot: ~3x faster while staying
+        // well within Anthropic/Google rate limits and 128MB memory.
+        const CHUNK_CONCURRENCY = 3;
 
-            // Per-chunk prompt composition: only include rules relevant to THIS chunk's files
-            const chunkFiles = extractFileNamesFromChunk(chunkContent);
-            const chunkSystemPrompt = composeChunkPrompt(activeProfile, chunkFiles, customRulesPrompt);
+        /**
+         * Simple semaphore for bounded concurrency.
+         * Processes items from a queue with at most `limit` running at once.
+         */
+        async function processWithConcurrency<T, R>(
+            items: T[],
+            limit: number,
+            fn: (item: T, index: number) => Promise<R>
+        ): Promise<(R | Error)[]> {
+            const results: (R | Error)[] = new Array(items.length);
+            let nextIndex = 0;
 
-            // Prepend PR description for intent context (if available)
-            const prContext = prDescription
-                ? `PR Description:\n${prDescription}\n\n`
-                : '';
+            async function worker(): Promise<void> {
+                while (nextIndex < items.length) {
+                    const idx = nextIndex++;
+                    try {
+                        results[idx] = await fn(items[idx], idx);
+                    } catch (err) {
+                        results[idx] = err instanceof Error ? err : new Error(String(err));
+                    }
+                }
+            }
 
-            logger.info('Processing chunk', {
-                prNumber,
-                chunk: chunkLabel,
-                size: chunkContent.length,
-                chunkFiles: chunkFiles.slice(0, 5),
-            });
+            // Spawn `limit` workers
+            await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+            return results;
+        }
 
-            try {
+        const chunkResults = await processWithConcurrency(
+            chunks,
+            CHUNK_CONCURRENCY,
+            async (chunkContent: string, i: number) => {
+                const chunkLabel = `${i + 1}/${chunks.length}`;
+
+                // Per-chunk prompt composition: only include rules relevant to THIS chunk's files
+                const chunkFiles = extractFileNamesFromChunk(chunkContent);
+                const chunkSystemPrompt = composeChunkPrompt(activeProfile, chunkFiles, customRulesPrompt);
+
+                // Prepend PR description for intent context (if available)
+                const prContext = prDescription
+                    ? `PR Description:\n${prDescription}\n\n`
+                    : '';
+
+                logger.info('Processing chunk', {
+                    prNumber,
+                    chunk: chunkLabel,
+                    size: chunkContent.length,
+                    chunkFiles: chunkFiles.slice(0, 5),
+                });
+
                 const result = await withTimeout(
                     (signal) => callChunkReview(
                         prContext + chunkContent, title, chunkLabel, env, signal, chunkSystemPrompt
@@ -435,32 +521,38 @@ async function processMessage(
                     findings: result.findings.length,
                     tokens: result.usage.totalTokens,
                 });
-                allFindings.push(...result.findings);
 
-                // Track usage
-                llmCalls.push({
-                    phase: 'map',
-                    chunkLabel,
-                    model: modelName,
-                    usage: result.usage,
-                    timestamp: new Date().toISOString(),
-                });
-            } catch (error) {
+                return { result, chunkLabel, chunkContent };
+            }
+        );
+
+        // Collect results from parallel processing
+        for (let i = 0; i < chunkResults.length; i++) {
+            const outcome = chunkResults[i];
+            if (outcome instanceof Error) {
                 failedChunks++;
+                const chunkLabel = `${i + 1}/${chunks.length}`;
                 logger.warn('Chunk failed, continuing with remaining', {
                     prNumber,
                     chunk: chunkLabel,
-                    error: error instanceof Error ? error.message : String(error),
+                    error: outcome.message,
                 });
 
-                // Extract file paths from the chunk content for coverage tracking
-                const filePaths = extractFileNamesFromChunk(chunkContent);
+                const filePaths = extractFileNamesFromChunk(chunks[i]);
                 for (const filePath of filePaths) {
                     if (!failedChunkFiles.includes(filePath)) {
                         failedChunkFiles.push(filePath);
                     }
                 }
-                // Continue processing remaining chunks — graceful degradation
+            } else {
+                allFindings.push(...outcome.result.findings);
+                llmCalls.push({
+                    phase: 'map',
+                    chunkLabel: outcome.chunkLabel,
+                    model: modelName,
+                    usage: outcome.result.usage,
+                    timestamp: new Date().toISOString(),
+                });
             }
         }
 
@@ -547,7 +639,10 @@ async function processMessage(
                 clusters,
                 chunks.length,
                 failedChunks,
-                failedChunkFiles
+                failedChunkFiles,
+                verdict,
+                severityCounts,
+                conclusion
             );
 
             try {
@@ -610,14 +705,76 @@ async function processMessage(
             isFallback,
         });
 
-        // ── Step 9: Post review comment to PR ──
+        // ── Step 9: Post review with inline comments ──
+        // Build inline comments for critical/high findings that have file + line
+        const inlineComments: InlineReviewComment[] = [];
+        const filePatchMap = new Map<string, string>();
+
+        // Build patch map from classified files for diff position mapping
+        for (const file of [...classified.tier1, ...classified.tier2]) {
+            if (file.patch) {
+                filePatchMap.set(file.filename, file.patch);
+            }
+        }
+
+        // Only inline critical and high severity findings with valid file+line
+        for (const finding of deduplicated) {
+            if (
+                (finding.severity === 'critical' || finding.severity === 'high') &&
+                finding.file &&
+                finding.line &&
+                finding.line > 0 &&
+                filePatchMap.has(finding.file)
+            ) {
+                const emoji = finding.severity === 'critical' ? '🔴' : '🟠';
+                let commentBody = `${emoji} **${finding.severity.toUpperCase()}** — ${finding.title}\n\n${finding.issue}`;
+                if (finding.suggestedCode) {
+                    commentBody += `\n\n**Suggested fix:**\n\`\`\`\n${finding.suggestedCode}\n\`\`\``;
+                }
+                inlineComments.push({
+                    path: finding.file,
+                    line: finding.line,
+                    body: commentBody,
+                });
+            }
+        }
+
+        // Post as a native GitHub Pull Request Review (inline comments + summary)
+        const reviewEvent = verdict === 'approve'
+            ? 'APPROVE' as const
+            : verdict === 'request_changes'
+                ? 'REQUEST_CHANGES' as const
+                : 'COMMENT' as const;
+
         try {
-            await postPRComment(repoFullName, prNumber, finalReview, token);
-            logger.info('Review comment posted', { prNumber });
-        } catch (error) {
-            logger.error('Failed to post review comment', error instanceof Error ? error : undefined, {
+            await postPRReview(
+                repoFullName,
                 prNumber,
+                token,
+                reviewEvent,
+                finalReview,
+                inlineComments,
+                filePatchMap
+            );
+            logger.info('PR review posted with inline comments', {
+                prNumber,
+                inlineComments: inlineComments.length,
+                event: reviewEvent,
             });
+        } catch (error) {
+            // Fallback: if the Reviews API fails, post as a regular issue comment
+            logger.warn('PR review API failed, falling back to issue comment', {
+                prNumber,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            try {
+                await postPRComment(repoFullName, prNumber, finalReview, token);
+                logger.info('Fallback review comment posted', { prNumber });
+            } catch (commentError) {
+                logger.error('Failed to post fallback review comment', commentError instanceof Error ? commentError : undefined, {
+                    prNumber,
+                });
+            }
         }
 
         // ── Step 10: Update Check Run with data-driven verdict ──

@@ -136,7 +136,7 @@ const PYTHON_PACKAGE_MAP: Record<string, DependencySignal> = {
     'flask': { dimension: 'frameworks', value: 'flask' },
     'fastapi': { dimension: 'frameworks', value: 'fastapi' },
     'pytest': { dimension: 'testing', value: 'pytest' },
-    'pydantic': { dimension: 'validation', value: 'zod' }, // Closest equivalent
+    'pydantic': { dimension: 'validation', value: 'pydantic' },
 };
 
 /**

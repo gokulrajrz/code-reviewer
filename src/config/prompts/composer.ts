@@ -233,10 +233,9 @@ export function composeChunkPrompt(
     // ── Architecture modules ──
     if (hasFsd && isFrontendChunk) {
         sections.push(ARCHITECTURE_MODULES['fsd']);
-    } else if (hasReact && isFrontendChunk && !hasFsd) {
-        // React detected but FSD not explicitly detected yet — still enforce it
-        sections.push(ARCHITECTURE_MODULES['fsd']);
     }
+    // Note: FSD is no longer force-injected for all React projects.
+    // It only activates when detected via directory structure or .codereview.yml.
 
     // Other architecture patterns
     for (const arch of profile.architecture) {
@@ -300,7 +299,7 @@ ${customRules}
  * Verdict is pre-computed and injected — the LLM formats but doesn't decide.
  */
 export function composeSynthesizerPrompt(profile: TechStackProfile): string {
-    const hasFsd = profile.architecture.includes('fsd') || profile.frameworks.includes('react');
+    const hasFsd = profile.architecture.includes('fsd');
     const stackSummary = buildStackSummaryLine(profile);
 
     const fsdSection = hasFsd ? `

@@ -23,6 +23,15 @@ export class GeminiAdapter extends LLMProviderAdapter {
         this.temperature = config.temperature ?? 0.1;
     }
 
+    /**
+     * Dynamically scale output token budget based on chunk content size.
+     * Larger chunks may produce more findings needing more output room.
+     * Gemini 2.5 Flash supports up to 65,536 output tokens.
+     */
+    private getChunkMaxTokens(chunkContent: string): number {
+        return Math.min(8192, 2048 + Math.floor(chunkContent.length / 50));
+    }
+
     getProviderName(): string {
         return 'gemini';
     }
@@ -63,7 +72,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                         { role: 'user', parts: [{ text: userPrompt }] },
                     ],
                     generationConfig: {
-                        maxOutputTokens: this.maxTokens,
+                        maxOutputTokens: this.getChunkMaxTokens(chunkContent),
                         temperature: this.temperature,
                         responseMimeType: 'application/json',
                     },

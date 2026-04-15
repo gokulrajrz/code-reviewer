@@ -351,7 +351,7 @@ const VALID_STATE: ReadonlySet<string> = new Set(['zustand', 'redux', 'jotai', '
 const VALID_STYLING: ReadonlySet<string> = new Set(['tailwind', 'css-modules', 'styled-components', 'emotion', 'vanilla-extract']);
 const VALID_ARCH: ReadonlySet<string> = new Set(['fsd', 'clean-architecture', 'mvc', 'hexagonal']);
 const VALID_FORMS: ReadonlySet<string> = new Set(['react-hook-form', 'formik']);
-const VALID_VALIDATION: ReadonlySet<string> = new Set(['zod', 'yup', 'joi', 'valibot']);
+const VALID_VALIDATION: ReadonlySet<string> = new Set(['zod', 'yup', 'joi', 'valibot', 'pydantic']);
 const VALID_TESTING: ReadonlySet<string> = new Set(['vitest', 'jest', 'pytest', 'go-test', 'mocha']);
 const VALID_DATA_FETCHING: ReadonlySet<string> = new Set(['tanstack-query', 'swr', 'apollo', 'urql', 'trpc']);
 
@@ -404,26 +404,64 @@ export function applyConfigOverrides(
 
 /**
  * Check if a filename matches any of the ignore patterns in the config.
- * Supports basic globbing (?, *).
+ * Supports globbing: `*` (single segment), `**` (recursive), `?` (single char).
+ *
+ * Examples:
+ *   - `dist/*` matches `dist/foo.js` but NOT `dist/sub/bar.js`
+ *   - `dist/**` matches `dist/foo.js` AND `dist/sub/bar.js`
+ *   - `*.test.ts` matches `foo.test.ts`
+ *   - `src/generated/??.ts` matches `src/generated/AB.ts`
  */
 export function shouldIgnore(filename: string, ignorePatterns?: string[]): boolean {
     if (!ignorePatterns || ignorePatterns.length === 0) return false;
 
     for (const pattern of ignorePatterns) {
-        // Simple glob-to-regex conversion
-        const regexPattern = pattern
-            .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex chars
-            .replace(/\*/g, '.*')               // * -> .*
-            .replace(/\?/g, '.');               // ? -> .
-        
-        const regex = new RegExp(`^${regexPattern}$`, 'i');
+        const regex = globToRegex(pattern);
         if (regex.test(filename)) return true;
-
-        // Also check if pattern matches as a directory prefix (e.g. "dist/*")
-        if (filename.startsWith(pattern.replace(/\*$/, ''))) return true;
     }
 
     return false;
+}
+
+/**
+ * Convert a glob pattern to a RegExp with proper `**` and `*` semantics.
+ *
+ * - `**` → matches any path segment (including `/`)
+ * - `*`  → matches anything within a single path segment (no `/`)
+ * - `?`  → matches a single character (not `/`)
+ */
+function globToRegex(pattern: string): RegExp {
+    let regexStr = '';
+    let i = 0;
+
+    while (i < pattern.length) {
+        const ch = pattern[i];
+
+        if (ch === '*' && pattern[i + 1] === '*') {
+            // `**` → match any path depth
+            regexStr += '.*';
+            i += 2;
+            // Skip trailing `/` after `**` if present
+            if (pattern[i] === '/') i++;
+        } else if (ch === '*') {
+            // `*` → match within one segment only (no `/`)
+            regexStr += '[^/]*';
+            i++;
+        } else if (ch === '?') {
+            // `?` → single char, not `/`
+            regexStr += '[^/]';
+            i++;
+        } else if ('.+^${}()|[]\\'.includes(ch)) {
+            // Escape regex meta-characters
+            regexStr += '\\' + ch;
+            i++;
+        } else {
+            regexStr += ch;
+            i++;
+        }
+    }
+
+    return new RegExp(`^${regexStr}$`, 'i');
 }
 
 /**

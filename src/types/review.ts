@@ -110,4 +110,10 @@ export interface SynthesizerInput {
     droppedFindingsCount: number;
     /** Files that were in failed chunks (no coverage) */
     failedChunkFiles: string[];
+    /** Pre-computed verdict — the LLM MUST use this, not derive its own */
+    verdict: 'approve' | 'request_changes' | 'needs_discussion';
+    /** Pre-computed severity counts for the summary table */
+    severityCounts: { critical: number; high: number; medium: number; low: number };
+    /** GitHub Check Run conclusion mapped from verdict */
+    conclusion: 'success' | 'failure' | 'neutral';
 }

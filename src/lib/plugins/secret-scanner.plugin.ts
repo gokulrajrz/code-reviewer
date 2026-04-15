@@ -37,9 +37,16 @@ export class SecretScannerPlugin implements AnalyzerPlugin {
                 pattern.regex.lastIndex = 0;
 
                 while ((match = pattern.regex.exec(line)) !== null) {
+                    const lineNumber = i + 1;
+
+                    // Diff-aware: skip secrets on lines NOT in the diff
+                    if (context.diffLines && context.diffLines.size > 0 && !context.diffLines.has(lineNumber)) {
+                        continue;
+                    }
+
                     findings.push({
                         file: context.filename,
-                        line: i + 1,
+                        line: lineNumber,
                         severity: 'critical',
                         category: 'security',
                         title: `Hardcoded Secret: ${pattern.name}`,
