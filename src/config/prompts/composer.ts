@@ -474,9 +474,9 @@ function buildStackSummaryLine(profile: TechStackProfile): string {
 export function extractFileNamesFromChunk(chunkContent: string): string[] {
     const filenames: string[] = [];
     const patterns = [
-        /---\s*File:\s*([^\s\-]+)/g,
-        /File:\s*`([^`]+)`/g,
-        /File:\s*([^\s\n]+\.\w+)/g,
+        /---\s*FILE:\s*([^\s\-]+)/gi,
+        /FILE:\s*`([^`]+)`/gi,
+        /FILE:\s*([^\s\n]+\.\w+)/gi,
     ];
 
     for (const pattern of patterns) {

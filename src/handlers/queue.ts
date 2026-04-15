@@ -21,7 +21,7 @@ import { deriveVerdict, verdictToConclusion, countBySeverity } from '../lib/verd
 import { formatFindingsAsMarkdown } from '../lib/review-formatter';
 import { detectTechStack } from '../lib/stack-detector';
 import { composeChunkPrompt, composeSynthesizerPrompt, extractFileNamesFromChunk } from '../config/prompts/composer';
-import { fetchRepoConfig, applyConfigOverrides, buildCustomRulesPrompt } from '../lib/repo-config';
+import { fetchRepoConfig, applyConfigOverrides, buildCustomRulesPrompt, shouldIgnore } from '../lib/repo-config';
 import type { TechStackProfile } from '../types/stack';
 
 /** Maximum time (ms) to wait for a single LLM call before aborting. */
@@ -334,7 +334,28 @@ async function processMessage(
                 prNumber,
                 hasStack: !!repoConfig.stack,
                 rulesCount: repoConfig.rules?.length ?? 0,
+                ignoreCount: repoConfig.ignore?.length ?? 0,
             });
+
+            // Apply repo-specific ignores
+            if (repoConfig.ignore && repoConfig.ignore.length > 0) {
+                const preTier1 = classified.tier1.length;
+                const preTier2 = classified.tier2.length;
+                
+                classified.tier1 = classified.tier1.filter(f => !shouldIgnore(f.filename, repoConfig.ignore));
+                classified.tier2 = classified.tier2.filter(f => !shouldIgnore(f.filename, repoConfig.ignore));
+                
+                const ignored1 = preTier1 - classified.tier1.length;
+                const ignored2 = preTier2 - classified.tier2.length;
+                
+                if (ignored1 > 0 || ignored2 > 0) {
+                    logger.info('Applied repo-specific ignores', {
+                        prNumber,
+                        ignoredTier1: ignored1,
+                        ignoredTier2: ignored2,
+                    });
+                }
+            }
         }
 
         // ── Step 4: Build size-limited chunks with global context ──
@@ -433,13 +454,10 @@ async function processMessage(
                 });
 
                 // Extract file paths from the chunk content for coverage tracking
-                const fileMatches = chunkContent.match(/(?:File|---)\s*[:`]\s*([^\s`\n]+\.\w+)/g);
-                if (fileMatches) {
-                    for (const match of fileMatches) {
-                        const filePath = match.replace(/(?:File|---)\s*[:`]\s*/, '').trim();
-                        if (filePath && !failedChunkFiles.includes(filePath)) {
-                            failedChunkFiles.push(filePath);
-                        }
+                const filePaths = extractFileNamesFromChunk(chunkContent);
+                for (const filePath of filePaths) {
+                    if (!failedChunkFiles.includes(filePath)) {
+                        failedChunkFiles.push(filePath);
                     }
                 }
                 // Continue processing remaining chunks — graceful degradation

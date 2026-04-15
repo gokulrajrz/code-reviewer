@@ -403,6 +403,30 @@ export function applyConfigOverrides(
 }
 
 /**
+ * Check if a filename matches any of the ignore patterns in the config.
+ * Supports basic globbing (?, *).
+ */
+export function shouldIgnore(filename: string, ignorePatterns?: string[]): boolean {
+    if (!ignorePatterns || ignorePatterns.length === 0) return false;
+
+    for (const pattern of ignorePatterns) {
+        // Simple glob-to-regex conversion
+        const regexPattern = pattern
+            .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex chars
+            .replace(/\*/g, '.*')               // * -> .*
+            .replace(/\?/g, '.');               // ? -> .
+        
+        const regex = new RegExp(`^${regexPattern}$`, 'i');
+        if (regex.test(filename)) return true;
+
+        // Also check if pattern matches as a directory prefix (e.g. "dist/*")
+        if (filename.startsWith(pattern.replace(/\*$/, ''))) return true;
+    }
+
+    return false;
+}
+
+/**
  * Build a custom rules prompt string from .codereview.yml rules.
  */
 export function buildCustomRulesPrompt(config: RepoReviewConfig): string | undefined {
