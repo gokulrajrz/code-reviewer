@@ -4,7 +4,7 @@ export const DEFAULT_AI_PROVIDER: AIProvider = 'claude';
 
 export const MODELS = {
     claude: 'claude-haiku-4-5-20251001',
-    gemini: 'gemini-1.5-flash',
+    gemini: 'gemini-2.5-flash',
 } as const satisfies Record<AIProvider, string>;
 
 /** Maximum characters per LLM chunk. Guards against massive PR context windows. */

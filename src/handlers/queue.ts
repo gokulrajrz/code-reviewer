@@ -15,11 +15,14 @@ import { postToCliq } from '../lib/cliq';
 import { buildPRUsageMetrics, storePRUsageMetrics } from '../lib/usage-tracker';
 import { logger } from '../lib/logger';
 import { runWithContextAsync } from '../lib/request-context';
-import { loadReviewConfig, buildCustomPrompt } from '../lib/review-rules';
 import { clusterFindings, flattenClusters } from '../lib/finding-clusters';
 import type { FindingCluster } from '../lib/finding-clusters';
 import { deriveVerdict, verdictToConclusion, countBySeverity } from '../lib/verdict';
 import { formatFindingsAsMarkdown } from '../lib/review-formatter';
+import { detectTechStack } from '../lib/stack-detector';
+import { composeChunkPrompt, composeSynthesizerPrompt, extractFileNamesFromChunk } from '../config/prompts/composer';
+import { fetchRepoConfig, applyConfigOverrides, buildCustomRulesPrompt } from '../lib/repo-config';
+import type { TechStackProfile } from '../types/stack';
 
 /** Maximum time (ms) to wait for a single LLM call before aborting. */
 const LLM_TIMEOUT_MS = 120_000;
@@ -236,7 +239,7 @@ async function processMessage(
     message: Message<ReviewMessage>,
     env: Env
 ): Promise<void> {
-    const { prNumber, title, repoFullName, headSha, checkRunId, prAuthor } = message.body;
+    const { prNumber, title, repoFullName, headSha, checkRunId, prAuthor, prDescription } = message.body;
 
     logger.info('Processing PR', {
         prNumber,
@@ -265,11 +268,6 @@ async function processMessage(
     }
 
     try {
-        // ── Step 1.5: Load Custom Review Rules ──
-        logger.info('Loading review configuration', { repoFullName });
-        const reviewConfig = await loadReviewConfig(repoFullName);
-        const customSystemPrompt = buildCustomPrompt(reviewConfig);
-
         // ── Step 2: Fetch ALL changed files (paginated) ──
         logger.info('Fetching changed files', { prNumber });
         const allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
@@ -306,6 +304,37 @@ async function processMessage(
             }
             message.ack();
             return;
+        }
+
+        // ── Step 3.5: Detect tech stack ──
+        logger.info('Detecting tech stack', { repoFullName });
+        const stackProfile: TechStackProfile = await detectTechStack({
+            changedFiles: allFiles.map(f => f.filename),
+            repoFullName,
+            token,
+            kvNamespace: env.USAGE_METRICS,
+        });
+        logger.info('Tech stack detected', {
+            prNumber,
+            languages: stackProfile.languages,
+            frameworks: stackProfile.frameworks,
+            architecture: stackProfile.architecture,
+            confidence: stackProfile.confidence,
+            source: stackProfile.source,
+        });
+
+        // ── Step 3.6: Fetch repo config (.codereview.yml) ──
+        let activeProfile = stackProfile;
+        let customRulesPrompt: string | undefined;
+        const repoConfig = await fetchRepoConfig(repoFullName, token, env.USAGE_METRICS);
+        if (repoConfig) {
+            activeProfile = applyConfigOverrides(stackProfile, repoConfig);
+            customRulesPrompt = buildCustomRulesPrompt(repoConfig);
+            logger.info('Applied repo config overrides', {
+                prNumber,
+                hasStack: !!repoConfig.stack,
+                rulesCount: repoConfig.rules?.length ?? 0,
+            });
         }
 
         // ── Step 4: Build size-limited chunks with global context ──
@@ -354,15 +383,27 @@ async function processMessage(
             const chunkContent = chunks[i];
             const chunkLabel = `${i + 1}/${chunks.length}`;
 
+            // Per-chunk prompt composition: only include rules relevant to THIS chunk's files
+            const chunkFiles = extractFileNamesFromChunk(chunkContent);
+            const chunkSystemPrompt = composeChunkPrompt(activeProfile, chunkFiles, customRulesPrompt);
+
+            // Prepend PR description for intent context (if available)
+            const prContext = prDescription
+                ? `PR Description:\n${prDescription}\n\n`
+                : '';
+
             logger.info('Processing chunk', {
                 prNumber,
                 chunk: chunkLabel,
                 size: chunkContent.length,
+                chunkFiles: chunkFiles.slice(0, 5),
             });
 
             try {
                 const result = await withTimeout(
-                    (signal) => callChunkReview(chunkContent, title, chunkLabel, env, signal, customSystemPrompt),
+                    (signal) => callChunkReview(
+                        prContext + chunkContent, title, chunkLabel, env, signal, chunkSystemPrompt
+                    ),
                     LLM_TIMEOUT_MS,
                     `Chunk ${chunkLabel}`
                 );
@@ -492,10 +533,13 @@ async function processMessage(
             );
 
             try {
+                // Compose synthesizer prompt based on detected stack
+                const synthesizerSystemPrompt = composeSynthesizerPrompt(activeProfile);
+
                 // Tiered fallback: primary → alternate → formatter
                 const result = await withTimeout(
                     (signal) => callSynthesizer(
-                        synthesizerPayload, env, signal, customSystemPrompt, dynamicMaxTokens
+                        synthesizerPayload, env, signal, synthesizerSystemPrompt, dynamicMaxTokens
                     ),
                     LLM_TIMEOUT_MS,
                     'Synthesizer'
@@ -666,6 +710,6 @@ async function processMessage(
             }
         }
 
-        message.ack();
+        message.retry();
     }
 }

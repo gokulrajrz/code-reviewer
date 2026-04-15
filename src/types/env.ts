@@ -67,4 +67,6 @@ export interface ReviewMessage {
   prAuthor: string;
   /** Request ID for distributed tracing across webhook → queue → LLM calls */
   requestId?: string;
+  /** PR body/description for intent context. Capped at 2KB by the webhook handler. */
+  prDescription?: string;
 }

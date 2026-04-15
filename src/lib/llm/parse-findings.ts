@@ -76,9 +76,12 @@ export function parseFindings(rawOutput: string): ReviewFinding[] {
 
 const VALID_SEVERITIES = new Set(['critical', 'high', 'medium', 'low']);
 const VALID_CATEGORIES = new Set([
-    'fsd', 'react', 'typescript', 'security', 'performance',
-    'accessibility', 'zustand', 'tanstack-query', 'tailwind',
-    'forms', 'clean-code',
+    // Universal categories
+    'bug', 'security', 'performance', 'error-handling', 'type-safety',
+    'dead-code', 'naming', 'accessibility', 'architecture', 'clean-code',
+    'testing', 'documentation',
+    // Stack-specific categories (backward-compatible)
+    'fsd', 'react', 'typescript', 'zustand', 'tanstack-query', 'tailwind', 'forms',
 ]);
 
 /**

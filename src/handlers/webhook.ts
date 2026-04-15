@@ -163,6 +163,7 @@ export async function handlePRWebhook(
             ...(checkRunId ? { checkRunId } : {}),
             prAuthor: pr.user.login,
             requestId: getRequestId(),
+            prDescription: pr.body ? pr.body.slice(0, 2000) : undefined,
         });
     } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
