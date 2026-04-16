@@ -223,19 +223,15 @@ export function composeChunkPrompt(
         }
     }
 
-    // ── USER REQUIREMENT: React projects always get FSD ──
-    const hasReact = profile.frameworks.includes('react');
+    // ── Architecture: FSD only injected when explicitly detected ──
     const hasFsd = profile.architecture.includes('fsd');
     const isFrontendChunk = chunkFileNames.some(f =>
         FRONTEND_EXTENSIONS.test(f) || FRONTEND_PATH_PATTERNS.test(f)
     );
 
-    // ── Architecture modules ──
     if (hasFsd && isFrontendChunk) {
         sections.push(ARCHITECTURE_MODULES['fsd']);
     }
-    // Note: FSD is no longer force-injected for all React projects.
-    // It only activates when detected via directory structure or .codereview.yml.
 
     // Other architecture patterns
     for (const arch of profile.architecture) {
