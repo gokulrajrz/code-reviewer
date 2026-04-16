@@ -26,8 +26,9 @@ import { composeChunkPrompt, composeSynthesizerPrompt, extractFileNamesFromChunk
 import { fetchRepoConfig, applyConfigOverrides, buildCustomRulesPrompt, shouldIgnore } from '../lib/repo-config';
 import type { TechStackProfile } from '../types/stack';
 
-/** Maximum time (ms) to wait for a single LLM call before aborting. */
-const LLM_TIMEOUT_MS = 120_000;
+/** Maximum time (ms) to wait for a single LLM call before aborting.
+ * Increased to 5 minutes to accommodate rate limit (HTTP 429) retry-after sleep intervals. */
+const LLM_TIMEOUT_MS = 300_000;
 
 /**
  * Wraps an async function with a timeout guard.
@@ -455,10 +456,10 @@ async function processMessage(
         let failedChunks = 0;
         const failedChunkFiles: string[] = []; // Track which files lacked coverage
 
-        // Process chunks in parallel with bounded concurrency.
-        // Concurrency of 3 is the sweet spot: ~3x faster while staying
-        // well within Anthropic/Google rate limits and 128MB memory.
-        const CHUNK_CONCURRENCY = 3;
+        // Process chunks strictly sequentially (concurrency=1) to prevent popping
+        // the 30k tokens/minute rate limit of Anthropic Tier 1/2 boundaries.
+        // It trades a bit of speed for total execution safety on huge PRs.
+        const CHUNK_CONCURRENCY = 1;
 
         /**
          * Simple semaphore for bounded concurrency.
