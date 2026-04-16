@@ -898,6 +898,7 @@ export async function updateCheckRun(
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
+                name: 'AI Code Reviewer',
                 status: 'completed',
                 conclusion,
                 completed_at: new Date().toISOString(),
