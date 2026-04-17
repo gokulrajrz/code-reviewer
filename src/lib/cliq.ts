@@ -89,7 +89,7 @@ async function resolveCliqUser(
 ): Promise<string | null> {
     const zohoApiBase = 'https://cliq.zoho.in/api/v2';
     const encDb = encodeURIComponent(dbName);
-    const criteria = encodeURIComponent(`githubusername==${githubUsername}`);
+    const criteria = encodeURIComponent(`github_username==${githubUsername}`);
     const endpoint = `${zohoApiBase}/storages/${encDb}/records?criteria=${criteria}&limit=1`;
 
     const controller = new AbortController();
@@ -122,7 +122,7 @@ async function resolveCliqUser(
             return null;
         }
 
-        const cliqZuid = result.list[0].cliqzuid;
+        const cliqZuid = result.list[0].cliq_zuid;
         if (!cliqZuid) {
             logger.warn('Cliq DB record missing cliqzuid field', { githubUsername, dbName });
             return null;
