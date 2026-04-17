@@ -1,5 +1,4 @@
 import { LLMProviderAdapter, type LLMProviderConfig, type LLMResponse, type ChunkReviewRequest, type SynthesisRequest } from '../adapter';
-import { CHUNK_REVIEWER_PROMPT, SYNTHESIZER_PROMPT } from '../../../config/system-prompt';
 import { MODELS } from '../../../config/constants';
 import { logger } from '../../logger';
 import { handleLLMErrorResponse } from '../error-handler';
@@ -21,6 +20,15 @@ export class ClaudeAdapter extends LLMProviderAdapter {
         this.temperature = config.temperature ?? 0.1;
     }
 
+    /**
+     * Dynamically scale output token budget based on chunk content size.
+     * Larger chunks may produce more findings needing more output room.
+     * Claude Sonnet 4 supports up to 16,384 output tokens.
+     */
+    private getChunkMaxTokens(chunkContent: string): number {
+        return Math.min(8192, 2048 + Math.floor(chunkContent.length / 50));
+    }
+
     getProviderName(): string {
         return 'anthropic';
     }
@@ -30,6 +38,9 @@ export class ClaudeAdapter extends LLMProviderAdapter {
     }
 
     async reviewChunk(request: ChunkReviewRequest, signal?: AbortSignal): Promise<LLMResponse> {
+        if (!request.systemPrompt) {
+            throw new Error('Claude reviewChunk requires a composed systemPrompt — use composeChunkPrompt()');
+        }
         const { chunkContent, prTitle, chunkLabel } = request;
 
         const userPrompt = `Pull Request Title: "${prTitle}"
@@ -50,11 +61,9 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             },
             body: JSON.stringify({
                 model: this.model,
-                max_tokens: this.maxTokens,
+                max_tokens: this.getChunkMaxTokens(chunkContent),
                 temperature: this.temperature,
-                system: request.systemPrompt
-                    ? `${CHUNK_REVIEWER_PROMPT}\n\n---\n\nADDITIONAL REVIEW CONTEXT:\n${request.systemPrompt}`
-                    : CHUNK_REVIEWER_PROMPT,
+                system: request.systemPrompt,
                 messages: [{ role: 'user', content: userPrompt }],
             }),
             signal,
@@ -93,6 +102,9 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
     }
 
     async synthesize(request: SynthesisRequest, signal?: AbortSignal): Promise<LLMResponse> {
+        if (!request.systemPrompt) {
+            throw new Error('Claude synthesize requires a composed systemPrompt — use composeSynthesizerPrompt()');
+        }
         const { payload } = request;
         const outputBudget = request.maxTokens ?? this.maxTokens;
 
@@ -105,16 +117,13 @@ ${payload}`;
             headers: {
                 'x-api-key': this.config.apiKey,
                 'anthropic-version': '2023-06-01',
-                'anthropic-beta': 'max-tokens-3-5-sonnet-2024-07-15',
                 'content-type': 'application/json',
             },
             body: JSON.stringify({
                 model: this.model,
                 max_tokens: outputBudget,
                 temperature: this.temperature,
-                system: request.systemPrompt
-                    ? `${SYNTHESIZER_PROMPT}\n\n---\n\nADDITIONAL REVIEW CONTEXT:\n${request.systemPrompt}`
-                    : SYNTHESIZER_PROMPT,
+                system: request.systemPrompt,
                 messages: [{ role: 'user', content: userPrompt }],
             }),
             signal,

@@ -276,12 +276,12 @@ curl "https://your-worker.workers.dev/metrics?period=1h"
 ### Subrequest Limits
 - Cloudflare Workers: 50 subrequests per request
 - Budget: File fetches + LLM calls + KV + GitHub API
-- Large PRs automatically truncated to `MAX_LLM_CHunks`
+- Large PRs automatically truncated to `MAX_LLM_CHUNKS`
 
 ### Queue Processing
 - Messages processed concurrently
 - Each message has its own request context
-- Failed messages ack'd to prevent infinite retry
+- Failed messages use `message.retry()` for automatic redelivery
 
 ### Rate Limiting
 - Distributed rate limiting via KV

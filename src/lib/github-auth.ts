@@ -128,7 +128,13 @@ interface InstallationTokenResponse {
 /**
  * Exchanges a GitHub App JWT for a short-lived installation access token.
  * This token is used for all subsequent GitHub API calls and expires after 1 hour.
+ *
+ * Caches the token in KV (30-min TTL) to avoid burning 2 subrequests
+ * (JWT generation + HTTP exchange) on every review.
  */
+const INSTALL_TOKEN_KV_KEY = 'github-install-token';
+const INSTALL_TOKEN_TTL_SECONDS = 30 * 60; // 30 minutes (10-min safety margin before 1hr expiry)
+
 export async function getInstallationToken(env: Env): Promise<string> {
     if (!env.GITHUB_APP_INSTALLATION_ID || !env.GITHUB_APP_INSTALLATION_ID.trim()) {
         throw new Error(
@@ -137,6 +143,51 @@ export async function getInstallationToken(env: Env): Promise<string> {
         );
     }
 
+    // Check KV cache first
+    try {
+        const cached = await env.AUTH_KV.get(INSTALL_TOKEN_KV_KEY);
+        if (cached) {
+            logger.debug('Using cached installation token');
+            return cached;
+        }
+    } catch {
+        // KV read failed — fall through to generate a new token
+        logger.warn('KV cache read failed for installation token, generating fresh');
+    }
+
+    // Generate fresh token
+    const token = await generateFreshInstallationToken(env);
+
+    // Cache it with TTL
+    try {
+        await env.AUTH_KV.put(INSTALL_TOKEN_KV_KEY, token, {
+            expirationTtl: INSTALL_TOKEN_TTL_SECONDS,
+        });
+    } catch {
+        // Non-fatal: cache write failure doesn't block the review
+        logger.warn('Failed to cache installation token in KV');
+    }
+
+    return token;
+}
+
+/**
+ * Invalidate the cached installation token.
+ * Call this when a GitHub API call returns 401 to force re-authentication.
+ */
+export async function invalidateInstallationToken(env: Env): Promise<void> {
+    try {
+        await env.AUTH_KV.delete(INSTALL_TOKEN_KV_KEY);
+    } catch {
+        // Best-effort deletion
+    }
+}
+
+/**
+ * Generate a fresh installation token from GitHub.
+ * Internal — use getInstallationToken() which adds KV caching.
+ */
+async function generateFreshInstallationToken(env: Env): Promise<string> {
     const jwt = await generateAppJWT(env.GITHUB_APP_ID, env.GITHUB_APP_PRIVATE_KEY);
 
     let response: Response;

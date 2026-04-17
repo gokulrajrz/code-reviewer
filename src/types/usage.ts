@@ -68,7 +68,7 @@ export const TOKEN_PRICING: Record<string, { inputPer1M: number; outputPer1M: nu
         outputPer1M: 4.00,  // $4 per 1M output tokens
     },
     // Claude Sonnet - balanced model (default)
-    'claude-sonnet-4-20250514': {
+    'claude-sonnet-4-6': {
         inputPer1M: 3.00,   // $3 per 1M input tokens
         outputPer1M: 15.00, // $15 per 1M output tokens
     },
@@ -82,13 +82,18 @@ export const TOKEN_PRICING: Record<string, { inputPer1M: number; outputPer1M: nu
         outputPer1M: 15.00,
     },
     // Gemini models
-    'gemini-3.1-pro-preview': {
-        inputPer1M: 1.25,   // $1.25 per 1M input tokens
-        outputPer1M: 5.00,  // $5 per 1M output tokens
-    },
-    'gemini-3.1-flash': {
+    'gemini-2.5-flash-preview-04-17': {
         inputPer1M: 0.15,   // $0.15 per 1M input tokens
         outputPer1M: 0.60,  // $0.60 per 1M output tokens
+    },
+    'gemini-2.5-pro-preview-05-06': {
+        inputPer1M: 1.25,   // $1.25 per 1M input tokens
+        outputPer1M: 10.00, // $10 per 1M output tokens
+    },
+    // Legacy Gemini models
+    'gemini-1.5-flash': {
+        inputPer1M: 0.075,  // $0.075 per 1M input tokens
+        outputPer1M: 0.30,  // $0.30 per 1M output tokens
     },
 };
 
@@ -96,8 +101,8 @@ export const TOKEN_PRICING: Record<string, { inputPer1M: number; outputPer1M: nu
  * Default pricing by provider (fallback when model not found)
  */
 export const DEFAULT_PRICING = {
-    claude: { inputPer1M: 3.00, outputPer1M: 15.00 }, // Sonnet as default
-    gemini: { inputPer1M: 1.25, outputPer1M: 5.00 }, // Pro as default
+    claude: { inputPer1M: 3.00, outputPer1M: 15.00 },  // Sonnet 4 as default
+    gemini: { inputPer1M: 0.15, outputPer1M: 0.60 },   // 2.5 Flash as default (our configured model)
 };
 
 /**

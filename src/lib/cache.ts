@@ -85,7 +85,7 @@ export async function getCachedData<T>(
     allowStale: boolean = true
 ): Promise<CacheEntry<T> | null> {
     try {
-        const stored = await env.USAGE_METRICS.get(cacheKey);
+        const stored = await env.CACHE_KV.get(cacheKey);
         if (!stored) return null;
 
         const entry = JSON.parse(stored) as CacheEntry<T>;
@@ -122,7 +122,7 @@ export async function setCachedData<T>(
     };
 
     try {
-        await env.USAGE_METRICS.put(cacheKey, JSON.stringify(entry), {
+        await env.CACHE_KV.put(cacheKey, JSON.stringify(entry), {
             expirationTtl: ttlSeconds * 2, // Store for 2x TTL to enable stale-while-revalidate
         });
 
@@ -142,10 +142,10 @@ export async function invalidateCache(
 ): Promise<void> {
     try {
         // List keys matching pattern and delete them
-        const keys = await env.USAGE_METRICS.list({ prefix: pattern });
+        const keys = await env.CACHE_KV.list({ prefix: pattern });
 
         for (const key of keys.keys) {
-            await env.USAGE_METRICS.delete(key.name);
+            await env.CACHE_KV.delete(key.name);
         }
 
         logger.info('Cache invalidated', { pattern, count: keys.keys.length });
@@ -269,7 +269,7 @@ export async function getCacheStats(env: Env): Promise<CacheStats> {
     };
 
     try {
-        const keys = await env.USAGE_METRICS.list({ prefix: 'github:' });
+        const keys = await env.CACHE_KV.list({ prefix: 'github:' });
         stats.totalKeys = keys.keys.length;
 
         for (const key of keys.keys) {

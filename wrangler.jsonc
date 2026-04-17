@@ -27,7 +27,9 @@
 		"ALLOWED_TARGET_BRANCHES": "dev",
 		"CLIQ_BOT_NAME": "codereviewbot",
 		"CLIQ_CHANNEL_ID": "prweb",
-		"CLIQ_DB_NAME": "githubusermap"
+		"CLIQ_DB_NAME": "githubusermap",
+		"DASHBOARD_USERNAME": "admin",
+		"DASHBOARD_PASSWORD": "admin123"
 	},
 	/**
 	 * Queues
@@ -45,17 +47,34 @@
 				"queue": "code-reviewer-queue",
 				"max_batch_size": 1,
 				"max_concurrency": 2,
-				"max_retries": 1
+				"max_retries": 2
 			}
 		]
 	},
 	/**
-	 * KV Namespace for storing usage metrics
+	 * KV Namespaces — isolated by concern to prevent TTL conflicts and key collisions.
+	 * Create with:
+	 *   npx wrangler kv:namespace create USAGE_METRICS
+	 *   npx wrangler kv:namespace create AUTH_KV
+	 *   npx wrangler kv:namespace create CACHE_KV
+	 *   npx wrangler kv:namespace create DEDUP_KV
 	 */
 	"kv_namespaces": [
 		{
 			"binding": "USAGE_METRICS",
 			"id": "2825e1ef509f4069b316c5e96d1dd61b"
+		},
+		{
+			"binding": "AUTH_KV",
+			"id": "c715f1033e3c4d2d8fcc356a62657390"
+		},
+		{
+			"binding": "CACHE_KV",
+			"id": "800a1d0290dd4b8091dc919f48ebc1e5"
+		},
+		{
+			"binding": "DEDUP_KV",
+			"id": "84049d8f2396421682c8abe889dd1ffe"
 		}
 	]
 }

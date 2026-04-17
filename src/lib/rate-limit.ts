@@ -206,7 +206,7 @@ export async function checkRateLimitDistributed(
 
     try {
         // Get current bucket state from KV
-        const stored = await env.USAGE_METRICS.get(clientId);
+        const stored = await env.CACHE_KV.get(clientId);
         let bucket: RateLimitBucket;
 
         if (stored) {
@@ -235,7 +235,7 @@ export async function checkRateLimitDistributed(
         }
 
         // Store updated bucket with short TTL
-        await env.USAGE_METRICS.put(clientId, JSON.stringify(bucket), {
+        await env.CACHE_KV.put(clientId, JSON.stringify(bucket), {
             expirationTtl: Math.ceil(windowMs / 1000) + 10, // Slightly longer than window
         });
 

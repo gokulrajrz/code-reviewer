@@ -36,7 +36,7 @@ export async function isDuplicateWebhook(
     const kvKey = `${DEDUP_KEY_PREFIX}:${deliveryId}`;
 
     try {
-        const existing = await env.USAGE_METRICS.get(kvKey);
+        const existing = await env.DEDUP_KV.get(kvKey);
 
         if (existing) {
             logger.info('Duplicate webhook detected, skipping', { deliveryId });
@@ -44,7 +44,7 @@ export async function isDuplicateWebhook(
         }
 
         // Mark as processed with TTL
-        await env.USAGE_METRICS.put(kvKey, '1', {
+        await env.DEDUP_KV.put(kvKey, '1', {
             expirationTtl: DEDUP_TTL_SECONDS,
         });
 
@@ -69,7 +69,7 @@ export async function getWebhookStatus(
     const kvKey = `${DEDUP_KEY_PREFIX}:${deliveryId}`;
 
     try {
-        const result = await env.USAGE_METRICS.getWithMetadata(kvKey);
+        const result = await env.DEDUP_KV.getWithMetadata(kvKey);
         const metadata = result.metadata as { expiration?: number } | undefined;
         return {
             processed: result.value !== null,

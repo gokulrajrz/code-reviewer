@@ -3,7 +3,7 @@ import type { Env } from '../types/env';
 import type { ReviewFinding } from '../types/review';
 import { cachedGitHubFetch, CACHE_TTLS } from './cache';
 import { createProgressiveChunks } from './progressive-chunking';
-import { pluginRegistry } from './plugin-system';
+import { runStaticPlugins } from './plugins/index';
 import {
     MAX_FILE_SIZE_BYTES,
     MAX_TOTAL_FILES,
@@ -332,7 +332,10 @@ export async function fetchFileContent(rawUrl: string, token: string, env: Env):
  * This ensures every LLM call knows the full scope of the PR,
  * even if it only sees a subset of the files.
  */
-export function buildGlobalContext(classified: ClassifiedFiles): string {
+export function buildGlobalContext(
+    classified: ClassifiedFiles,
+    importGraph?: Map<string, string[]>
+): string {
     const { tier1, tier2, skipped } = classified;
     const allReviewable = [...tier1, ...tier2];
 
@@ -353,6 +356,16 @@ export function buildGlobalContext(classified: ClassifiedFiles): string {
     if (skipped.length > 0) {
         const preview = skipped.slice(0, 15).join(', ');
         ctx += `\n> _Skipped (noise):_ ${preview}${skipped.length > 15 ? ` ... +${skipped.length - 15} more` : ''}\n`;
+    }
+
+    // Import dependency graph — gives the LLM cross-file awareness
+    if (importGraph && importGraph.size > 0) {
+        ctx += `\n## Import Dependencies (files in this PR)\n\n`;
+        for (const [file, imports] of importGraph) {
+            if (imports.length > 0) {
+                ctx += `- \`${file}\` imports from: ${imports.map(i => `\`${i}\``).join(', ')}\n`;
+            }
+        }
     }
 
     ctx += `\n---\n\n`;
@@ -413,6 +426,95 @@ function splitLargeFileBlock(
 }
 
 // ---------------------------------------------------------------------------
+// Diff Parsing Utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses a unified diff patch and returns the set of line numbers (1-indexed)
+ * that correspond to ADDED or MODIFIED lines in the new file.
+ *
+ * Used by the plugin system to only flag findings on changed lines,
+ * eliminating false positives from pre-existing code.
+ *
+ * Handles standard unified diff format:
+ *   @@ -oldStart,oldCount +newStart,newCount @@
+ */
+export function parseDiffAddedLines(patch: string): Set<number> {
+    const addedLines = new Set<number>();
+    const lines = patch.split('\n');
+    let currentLine = 0;
+
+    for (const line of lines) {
+        // Parse hunk headers: @@ -oldStart,oldCount +newStart,newCount @@
+        const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (hunkMatch) {
+            currentLine = parseInt(hunkMatch[1], 10);
+            continue;
+        }
+
+        if (currentLine === 0) continue; // Before first hunk
+
+        if (line.startsWith('+') && !line.startsWith('+++')) {
+            // Added line — this is a changed line in the new file
+            addedLines.add(currentLine);
+            currentLine++;
+        } else if (line.startsWith('-') && !line.startsWith('---')) {
+            // Deleted line — doesn't advance the new file line counter
+            // (this line exists only in the old version)
+        } else {
+            // Context line (unchanged) or empty — advances counter
+            currentLine++;
+        }
+    }
+
+    return addedLines;
+}
+
+// ---------------------------------------------------------------------------
+// Semantic Diff Markers
+// ---------------------------------------------------------------------------
+
+/**
+ * Annotates full file content with `+>` markers on changed lines.
+ * This gives the LLM clear visual cues about which lines are new/modified,
+ * dramatically reducing false positives on pre-existing code.
+ */
+function annotateWithDiffMarkers(content: string, addedLines: Set<number>): string {
+    if (addedLines.size === 0) return content;
+
+    const lines = content.split('\n');
+    return lines.map((line, i) => {
+        const lineNum = i + 1;
+        return addedLines.has(lineNum) ? `+> ${line}` : `   ${line}`;
+    }).join('\n');
+}
+
+/**
+ * Compresses a sorted array of line numbers into human-readable ranges.
+ * e.g., [1, 2, 3, 5, 6, 8] → "1-3, 5-6, 8"
+ */
+function compressLineNumbers(sorted: number[]): string {
+    if (sorted.length === 0) return '';
+
+    const ranges: string[] = [];
+    let start = sorted[0];
+    let end = sorted[0];
+
+    for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i] === end + 1) {
+            end = sorted[i];
+        } else {
+            ranges.push(start === end ? `${start}` : `${start}-${end}`);
+            start = sorted[i];
+            end = sorted[i];
+        }
+    }
+    ranges.push(start === end ? `${start}` : `${start}-${end}`);
+
+    return ranges.join(', ');
+}
+
+// ---------------------------------------------------------------------------
 // Tiered Chunk Building (Fixed)
 // ---------------------------------------------------------------------------
 
@@ -431,24 +533,6 @@ async function buildTier1Block(
     const findings: ReviewFinding[] = [];
     const content = await fetchFileContent(file.raw_url, token, env);
 
-    // Run analyzer plugins on the full file content before chunking
-    if (content && !content.startsWith('[File too large')) {
-        try {
-            const pluginResult = await pluginRegistry.analyzeFile({
-                filename: file.filename,
-                content: content,
-                prTitle: prContext.title,
-                repoFullName: prContext.repoFullName,
-                prNumber: prContext.prNumber
-            });
-            findings.push(...pluginResult.findings);
-        } catch (error) {
-            logger.error('Plugin execution failed', error instanceof Error ? error : undefined, {
-                filename: file.filename
-            });
-        }
-    }
-
     // Determine how to chunk the file content
     const ext = file.filename.split('.').pop() ?? '';
     let contentChunks = [content || ''];
@@ -464,6 +548,9 @@ async function buildTier1Block(
         }
     }
 
+    // Parse changed line numbers for semantic diff markers
+    const addedLines = file.patch ? parseDiffAddedLines(file.patch) : new Set<number>();
+
     // Wrap each content chunk in markdown
     const blocks: string[] = [];
     const isMultiPart = contentChunks.length > 1;
@@ -473,6 +560,14 @@ async function buildTier1Block(
         const partLabel = isMultiPart ? ` — Part ${i + 1} of ${contentChunks.length}` : '';
         let block = `## 🔍 FILE CHANGED: \`${file.filename}\` (${file.status})${partLabel} — *Full Review*\n`;
 
+        // Inject changed-line summary for LLM focus
+        if (addedLines.size > 0) {
+            const lineNumbers = [...addedLines].sort((a, b) => a - b);
+            const ranges = compressLineNumbers(lineNumbers);
+            block += `### CHANGED LINES: ${ranges}\n`;
+            block += `> Lines marked with \`+>\` below are ADDED/MODIFIED in this PR. Focus your review on these.\n\n`;
+        }
+
         if (file.patch) {
             block += `### DIFF PATCH\n\`\`\`diff\n${file.patch}\n\`\`\`\n`;
         } else {
@@ -480,7 +575,9 @@ async function buildTier1Block(
         }
 
         if (chunkContent && !chunkContent.startsWith('[File too large')) {
-            block += `\n### FULL FILE CONTENT${partLabel}\n\`\`\`${ext}\n${chunkContent}\n\`\`\`\n`;
+            // Annotate full file content with diff markers on changed lines
+            const annotatedContent = annotateWithDiffMarkers(chunkContent, addedLines);
+            block += `\n### FULL FILE CONTENT${partLabel}\n\`\`\`${ext}\n${annotatedContent}\n\`\`\`\n`;
         } else if (chunkContent) {
             block += `\n${chunkContent}\n`;
         }
@@ -512,12 +609,106 @@ function buildTier2Block(file: GitHubPRFile): string {
 export interface ReviewChunksResult {
     /** The code chunks to send to chunk reviewers (Map phase) */
     chunks: string[];
+    /** Per-chunk file metadata: chunkFileMap[i] = filenames in chunks[i].
+     *  Replaces fragile regex extraction with structured data. */
+    chunkFileMap: string[][];
     /** The global PR context string (for use in the Reduce phase) */
     globalContext: string;
     /** All reviewable filenames (for the synthesizer payload) */
     allFiles: string[];
     /** Findings generated by local plugins */
     pluginFindings: ReviewFinding[];
+}
+
+/**
+ * Builds a lightweight import adjacency list from diff patches.
+ * Extracts ES `import ... from '...'`, CJS `require('...')`,
+ * Python `from X import Y`, and Go `import "..."`.
+ *
+ * Only includes edges between files that are BOTH in the PR,
+ * so the LLM knows about cross-file coupling.
+ *
+ * Zero extra subrequests — uses only the diff patches already fetched.
+ */
+function buildImportGraph(files: GitHubPRFile[]): Map<string, string[]> {
+    const graph = new Map<string, string[]>();
+    const fileSet = new Set(files.map(f => f.filename));
+
+    // Import/require patterns
+    const importPatterns = [
+        /from\s+['"]([^'"]+)['"]/g,            // ES: import X from 'Y'
+        /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // CJS: require('Y')
+        /from\s+(\S+)\s+import/g,                 // Python: from X import Y
+        /import\s+"([^"]+)"/g,                     // Go: import "Y"
+    ];
+
+    for (const file of files) {
+        if (!file.patch) continue;
+
+        const imports: string[] = [];
+        const patchContent = file.patch;
+
+        for (const pattern of importPatterns) {
+            pattern.lastIndex = 0;
+            let match: RegExpExecArray | null;
+            while ((match = pattern.exec(patchContent)) !== null) {
+                const importPath = match[1];
+
+                // Resolve relative imports to match filenames in the PR
+                const resolved = resolveImportPath(file.filename, importPath, fileSet);
+                if (resolved && !imports.includes(resolved)) {
+                    imports.push(resolved);
+                }
+            }
+        }
+
+        if (imports.length > 0) {
+            graph.set(file.filename, imports);
+        }
+    }
+
+    return graph;
+}
+
+/**
+ * Attempts to resolve a relative import path to a file in the PR.
+ * Returns the matched filename or undefined.
+ */
+function resolveImportPath(
+    sourceFile: string,
+    importPath: string,
+    fileSet: Set<string>
+): string | undefined {
+    // Skip external packages (no relative path prefix)
+    if (!importPath.startsWith('.') && !importPath.startsWith('/')) return undefined;
+
+    // Get directory of the source file
+    const sourceDir = sourceFile.includes('/')
+        ? sourceFile.substring(0, sourceFile.lastIndexOf('/'))
+        : '';
+
+    // Normalize the path
+    let resolved = importPath;
+    if (importPath.startsWith('./')) {
+        resolved = sourceDir ? `${sourceDir}/${importPath.slice(2)}` : importPath.slice(2);
+    } else if (importPath.startsWith('../')) {
+        const parts = sourceDir.split('/');
+        let relPath = importPath;
+        while (relPath.startsWith('../') && parts.length > 0) {
+            parts.pop();
+            relPath = relPath.slice(3);
+        }
+        resolved = parts.length > 0 ? `${parts.join('/')}/${relPath}` : relPath;
+    }
+
+    // Try exact match, then common extensions
+    if (fileSet.has(resolved)) return resolved;
+    const extensions = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '/index.ts', '/index.tsx', '/index.js'];
+    for (const ext of extensions) {
+        if (fileSet.has(resolved + ext)) return resolved + ext;
+    }
+
+    return undefined;
 }
 
 /**
@@ -538,18 +729,26 @@ export async function buildReviewChunks(
     prContext: { title: string; repoFullName: string; prNumber: number }
 ): Promise<ReviewChunksResult> {
     const { tier1, tier2, skipped } = classified;
-    const globalContext = buildGlobalContext(classified);
+
+    // Build import adjacency list from diff patches (zero subrequests)
+    const importGraph = buildImportGraph([...tier1, ...tier2]);
+    const globalContext = buildGlobalContext(classified, importGraph);
+
     const allFiles = [...tier1, ...tier2].map(f => f.filename);
-    const pluginFindings: ReviewFinding[] = [];
+    const pluginFindings: ReviewFinding[] = runStaticPlugins([...tier1, ...tier2]);
 
     const chunks: string[] = [];
+    const chunkFileMap: string[][] = []; // parallel array: chunkFileMap[i] = files in chunks[i]
     let currentChunkText = '';
+    let currentChunkFiles: string[] = []; // files in the chunk being built
 
     // Helper: flush current chunk text into the chunks array with global context
     const flushChunk = () => {
         if (currentChunkText) {
             chunks.push(globalContext + currentChunkText);
+            chunkFileMap.push([...currentChunkFiles]);
             currentChunkText = '';
+            currentChunkFiles = [];
         }
     };
 
@@ -572,18 +771,52 @@ export async function buildReviewChunks(
                 // Failsafe: if still too large, flush current and put it alone
                 flushChunk();
                 chunks.push(globalContext + fileBlock);
+                chunkFileMap.push([file.filename]);
             } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
                 // Adding this file would exceed the chunk limit — start a new chunk
                 flushChunk();
                 currentChunkText = fileBlock;
+                currentChunkFiles = [file.filename];
             } else {
                 currentChunkText += fileBlock;
+                if (!currentChunkFiles.includes(file.filename)) {
+                    currentChunkFiles.push(file.filename);
+                }
             }
         }
     }
 
-    // ── Process Tier 2 files (diff only, no subrequests) ──
+    // ── Process Tier 2 files (diff only unless small patch → deep fetch) ──
+    const TIER2_DEEP_FETCH_LINE_LIMIT = 500;
     for (const file of tier2) {
+        // Deep fetch: if the patch is small, fetch full content anyway
+        // This dramatically improves review quality on 80%+ of files
+        const patchLineCount = file.patch ? file.patch.split('\n').length : 0;
+        if (patchLineCount > 0 && patchLineCount < TIER2_DEEP_FETCH_LINE_LIMIT) {
+            // Upgrade this Tier 2 file to full-content review (costs 1 subrequest)
+            const { blocks, findings } = await buildTier1Block(file, token, env, prContext, effectiveMax);
+            pluginFindings.push(...findings);
+
+            for (const fileBlock of blocks) {
+                if (fileBlock.length > effectiveMax) {
+                    flushChunk();
+                    chunks.push(globalContext + fileBlock);
+                    chunkFileMap.push([file.filename]);
+                } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
+                    flushChunk();
+                    currentChunkText = fileBlock;
+                    currentChunkFiles = [file.filename];
+                } else {
+                    currentChunkText += fileBlock;
+                    if (!currentChunkFiles.includes(file.filename)) {
+                        currentChunkFiles.push(file.filename);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Fallback: diff-only block (no subrequest cost)
         const fileBlock = buildTier2Block(file);
 
         if (fileBlock.length > effectiveMax) {
@@ -591,12 +824,17 @@ export async function buildReviewChunks(
             const parts = splitLargeFileBlock(file.filename, fileBlock, effectiveMax);
             for (const part of parts) {
                 chunks.push(globalContext + part);
+                chunkFileMap.push([file.filename]);
             }
         } else if (currentChunkText.length + fileBlock.length > effectiveMax) {
             flushChunk();
             currentChunkText = fileBlock;
+            currentChunkFiles = [file.filename];
         } else {
             currentChunkText += fileBlock;
+            if (!currentChunkFiles.includes(file.filename)) {
+                currentChunkFiles.push(file.filename);
+            }
         }
     }
 
@@ -604,9 +842,11 @@ export async function buildReviewChunks(
     flushChunk();
 
     const finalChunks = chunks.length > 0 ? chunks : [globalContext + 'No verifiable file changes found.'];
+    const finalFileMap = chunkFileMap.length > 0 ? chunkFileMap : [allFiles];
 
     return {
         chunks: finalChunks,
+        chunkFileMap: finalFileMap,
         globalContext,
         allFiles,
         pluginFindings,
@@ -849,6 +1089,7 @@ export async function updateCheckRun(
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
+                name: 'AI Code Reviewer',
                 status: 'completed',
                 conclusion,
                 completed_at: new Date().toISOString(),
@@ -900,5 +1141,209 @@ export async function updateCheckRun(
             checkRunId,
         });
         // Non-critical: don't throw
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pull Request Reviews API (Inline Comments)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single inline review comment to post on a specific line of a file.
+ */
+export interface InlineReviewComment {
+    /** Relative path to the file */
+    path: string;
+    /** The line number in the NEW file (right side of diff) */
+    line: number;
+    /** Comment body in Markdown */
+    body: string;
+}
+
+/**
+ * Maps a file line number to the corresponding position in the diff patch.
+ *
+ * GitHub's Reviews API requires a `position` parameter which is the
+ * 1-indexed line number within the diff hunk (counting from the first @@).
+ * This is NOT the same as the file line number.
+ */
+function mapLineToDiffPosition(
+    patch: string | undefined,
+    targetLine: number
+): number | null {
+    if (!patch) return null;
+
+    const lines = patch.split('\n');
+    let diffPosition = 0;
+    let currentFileLine = 0;
+
+    for (const line of lines) {
+        const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (hunkMatch) {
+            currentFileLine = parseInt(hunkMatch[1], 10);
+            diffPosition++;
+            continue;
+        }
+
+        if (currentFileLine === 0) continue;
+
+        diffPosition++;
+
+        if (line.startsWith('-') && !line.startsWith('---')) {
+            // Deleted line — doesn't map to new file
+            continue;
+        }
+
+        if (currentFileLine === targetLine) {
+            return diffPosition;
+        }
+
+        // Both added and context lines advance the new file counter
+        currentFileLine++;
+    }
+
+    return null;
+}
+
+/**
+ * Posts a Pull Request Review with inline comments via the GitHub Reviews API.
+ *
+ * This produces native GitHub review comments that appear inline next to the
+ * code, not as a wall of text in an issue comment. The review can also set
+ * an overall approval status (APPROVE, REQUEST_CHANGES, COMMENT).
+ *
+ * GitHub limits: max 50 inline comments per review. Excess findings get
+ * included in the review body instead.
+ *
+ * @param repoFullName  e.g. "owner/repo"
+ * @param prNumber      PR number
+ * @param token         Installation access token
+ * @param event         Review event: APPROVE, REQUEST_CHANGES, or COMMENT
+ * @param body          Review summary body (Markdown)
+ * @param comments      Inline review comments mapped to specific file+line
+ * @param filePatches   Map of filename → diff patch for position mapping
+ */
+export async function postPRReview(
+    repoFullName: string,
+    prNumber: number,
+    token: string,
+    event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT',
+    body: string,
+    comments: InlineReviewComment[],
+    filePatches: Map<string, string>
+): Promise<void> {
+    // Check circuit breaker
+    if (!circuitBreakers.github.canExecute()) {
+        logger.warn('GitHub API circuit breaker is OPEN, skipping PR review');
+        throw new Error('GitHub API circuit breaker is OPEN');
+    }
+
+    // GitHub caps at 50 inline comments per review
+    const MAX_INLINE_COMMENTS = 50;
+
+    // Map line numbers to diff positions and filter out unmappable comments
+    const mappedComments: Array<{ path: string; position: number; body: string }> = [];
+    const unmapped: InlineReviewComment[] = [];
+
+    for (const comment of comments) {
+        const patch = filePatches.get(comment.path);
+        const position = mapLineToDiffPosition(patch, comment.line);
+
+        if (position !== null) {
+            mappedComments.push({
+                path: comment.path,
+                position,
+                body: comment.body,
+            });
+        } else {
+            unmapped.push(comment);
+        }
+    }
+
+    // Enforce GitHub's 50-comment limit — overflow goes into review body
+    const inlineToPost = mappedComments.slice(0, MAX_INLINE_COMMENTS);
+    const overflowMapped = mappedComments.slice(MAX_INLINE_COMMENTS);
+
+    // Build overflow section for the review body
+    let reviewBody = body;
+    const overflow = [...unmapped, ...overflowMapped.map(c => ({
+        path: c.path,
+        line: 0,
+        body: c.body,
+    }))];
+
+    if (overflow.length > 0) {
+        reviewBody += '\n\n---\n\n' +
+            `> ℹ️ **${overflow.length} additional finding(s)** could not be posted as inline comments ` +
+            `(line not in diff or GitHub's 50-comment limit exceeded):\n\n`;
+        for (const item of overflow.slice(0, 20)) { // Cap at 20 to avoid massive body
+            reviewBody += `- **\`${item.path}\`**: ${item.body.split('\n')[0]}\n`;
+        }
+        if (overflow.length > 20) {
+            reviewBody += `\n_...and ${overflow.length - 20} more._\n`;
+        }
+    }
+
+    logger.info('Posting PR review with inline comments', {
+        prNumber,
+        inlineComments: inlineToPost.length,
+        unmapped: unmapped.length,
+        overflow: overflowMapped.length,
+        event,
+    });
+
+    const executeReview = async (): Promise<void> => {
+        const url = `${GITHUB_API_BASE}/repos/${repoFullName}/pulls/${prNumber}/reviews`;
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                ...githubHeaders(token),
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                event,
+                body: truncateMarkdown(reviewBody),
+                comments: inlineToPost,
+            }),
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
+            const errorMessage = `Failed to post PR review: ${response.status} — ${errorText}`;
+            if (response.status === 429 && retryAfter) {
+                const retryAfterMs = parseInt(retryAfter, 10) * 1000;
+                if (!isNaN(retryAfterMs)) {
+                    throw new RateLimitError(errorMessage, undefined, retryAfterMs);
+                }
+            }
+            throw new Error(errorMessage);
+        }
+    };
+
+    try {
+        const { attempts } = await retryWithBackoff(
+            executeReview,
+            'GitHub post PR review',
+            {
+                maxAttempts: 3,
+                initialDelayMs: 1000,
+                backoffMultiplier: 2,
+                jitter: true,
+            }
+        );
+
+        circuitBreakers.github.recordSuccess();
+
+        if (attempts > 1) {
+            logger.info(`PR review posted after ${attempts} attempts`, {
+                prNumber,
+                attempts,
+            });
+        }
+    } catch (error) {
+        circuitBreakers.github.recordFailure();
+        throw error;
     }
 }

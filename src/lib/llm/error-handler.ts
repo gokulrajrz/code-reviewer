@@ -23,8 +23,23 @@ export async function handleLLMErrorResponse(
     // Extract retry-after header for rate limit errors
     const retryAfter = response.status === 429 ? response.headers.get('retry-after') : null;
 
+    // Try to parse the error as JSON to extract a human-readable message
+    let parsedMessage: string | null = null;
+    try {
+        const parsed = JSON.parse(errorText);
+        if (parsed?.error?.message) {
+            parsedMessage = String(parsed.error.message);
+        } else if (parsed?.message) {
+            parsedMessage = String(parsed.message);
+        }
+    } catch {
+        // Not valid JSON, fallback to raw text
+    }
+
+    const rawErrorTarget = parsedMessage || errorText;
+
     // Sanitize error message to prevent potential API key leaks
-    const sanitizedError = errorText
+    const sanitizedError = rawErrorTarget
         .replace(/key[=:]\s*['"]?[a-zA-Z0-9_-]{20,}['"]?/gi, 'key=[REDACTED]')
         .replace(/api[_-]?key['"]?\s*[=:]\s*['"]?[^'"\s]+['"]?/gi, 'api_key=[REDACTED]')
         .substring(0, 500); // Limit error text length

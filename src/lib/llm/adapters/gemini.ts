@@ -1,5 +1,4 @@
 import { LLMProviderAdapter, type LLMProviderConfig, type LLMResponse, type ChunkReviewRequest, type SynthesisRequest } from '../adapter';
-import { CHUNK_REVIEWER_PROMPT, SYNTHESIZER_PROMPT } from '../../../config/system-prompt';
 import { MODELS } from '../../../config/constants';
 import { logger } from '../../logger';
 import { handleLLMErrorResponse } from '../error-handler';
@@ -24,6 +23,15 @@ export class GeminiAdapter extends LLMProviderAdapter {
         this.temperature = config.temperature ?? 0.1;
     }
 
+    /**
+     * Dynamically scale output token budget based on chunk content size.
+     * Larger chunks may produce more findings needing more output room.
+     * Gemini 2.5 Flash supports up to 65,536 output tokens.
+     */
+    private getChunkMaxTokens(chunkContent: string): number {
+        return Math.min(8192, 2048 + Math.floor(chunkContent.length / 50));
+    }
+
     getProviderName(): string {
         return 'gemini';
     }
@@ -33,6 +41,9 @@ export class GeminiAdapter extends LLMProviderAdapter {
     }
 
     async reviewChunk(request: ChunkReviewRequest, signal?: AbortSignal): Promise<LLMResponse> {
+        if (!request.systemPrompt) {
+            throw new Error('Gemini reviewChunk requires a composed systemPrompt — use composeChunkPrompt()');
+        }
         const { chunkContent, prTitle, chunkLabel } = request;
 
         const userPrompt = `Pull Request Title: "${prTitle}"
@@ -44,30 +55,26 @@ ${chunkContent}
 
 Analyze this code chunk for issues. Return findings as JSON array.`;
 
-        // Note: Google's Gemini API requires the key in the URL query string
-        // This is intentional by their design, not a security flaw on our part.
+        // Use x-goog-api-key header instead of URL query param to avoid key in logs
         const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.config.apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`,
             {
                 method: 'POST',
                 headers: {
                     'content-type': 'application/json',
+                    'x-goog-api-key': this.config.apiKey,
                 },
                 body: JSON.stringify({
-                    // Use systemInstruction for proper system prompt handling
                     systemInstruction: {
-                        parts: [{
-                            text: request.systemPrompt
-                                ? `${CHUNK_REVIEWER_PROMPT}\n\n---\n\nADDITIONAL REVIEW CONTEXT:\n${request.systemPrompt}`
-                                : CHUNK_REVIEWER_PROMPT
-                        }],
+                        parts: [{ text: request.systemPrompt }],
                     },
                     contents: [
                         { role: 'user', parts: [{ text: userPrompt }] },
                     ],
                     generationConfig: {
-                        maxOutputTokens: this.maxTokens,
+                        maxOutputTokens: this.getChunkMaxTokens(chunkContent),
                         temperature: this.temperature,
+                        responseMimeType: 'application/json',
                     },
                 }),
                 signal,
@@ -109,6 +116,9 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
     }
 
     async synthesize(request: SynthesisRequest, signal?: AbortSignal): Promise<LLMResponse> {
+        if (!request.systemPrompt) {
+            throw new Error('Gemini synthesize requires a composed systemPrompt — use composeSynthesizerPrompt()');
+        }
         const { payload } = request;
         const outputBudget = request.maxTokens ?? this.maxTokens;
 
@@ -116,21 +126,17 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
 
 ${payload}`;
 
-        // Note: Google's Gemini API requires the key in the URL query string
         const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.config.apiKey}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`,
             {
                 method: 'POST',
                 headers: {
                     'content-type': 'application/json',
+                    'x-goog-api-key': this.config.apiKey,
                 },
                 body: JSON.stringify({
                     systemInstruction: {
-                        parts: [{
-                            text: request.systemPrompt
-                                ? `${SYNTHESIZER_PROMPT}\n\n---\n\nADDITIONAL REVIEW CONTEXT:\n${request.systemPrompt}`
-                                : SYNTHESIZER_PROMPT
-                        }],
+                        parts: [{ text: request.systemPrompt }],
                     },
                     contents: [
                         { role: 'user', parts: [{ text: userPrompt }] },

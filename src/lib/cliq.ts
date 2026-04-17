@@ -89,7 +89,7 @@ async function resolveCliqUser(
 ): Promise<string | null> {
     const zohoApiBase = 'https://cliq.zoho.in/api/v2';
     const encDb = encodeURIComponent(dbName);
-    const criteria = encodeURIComponent(`githubusername==${githubUsername}`);
+    const criteria = encodeURIComponent(`github_username==${githubUsername}`);
     const endpoint = `${zohoApiBase}/storages/${encDb}/records?criteria=${criteria}&limit=1`;
 
     const controller = new AbortController();
@@ -122,7 +122,7 @@ async function resolveCliqUser(
             return null;
         }
 
-        const cliqZuid = result.list[0].cliqzuid;
+        const cliqZuid = result.list[0].cliq_zuid;
         if (!cliqZuid) {
             logger.warn('Cliq DB record missing cliqzuid field', { githubUsername, dbName });
             return null;
@@ -170,7 +170,8 @@ export async function postToCliq(
     prAuthor: string,
     conclusion: string,
     severityCounts: Record<FindingSeverity, number>,
-    dbName?: string
+    dbName?: string,
+    pipelineErrors?: string[]
 ): Promise<void> {
     if (!clientId || !clientSecret || !refreshToken || !botName || !targetId) {
         logger.warn('Skipping Cliq notification: Client ID, Secret, Refresh Token, Bot Name, or Target ID is missing');
@@ -212,11 +213,17 @@ export async function postToCliq(
         }
     }
 
+    // Determine if we need to show failure warnings
+    let titlePrefix = '';
+    if (pipelineErrors && pipelineErrors.length > 0) {
+        titlePrefix = '⚠️ DEGRADED: ';
+    }
+
     // Strictly typed payload (API Contract)
     const payload: CliqBotPayload = {
         text: `${mentionTag} — AI Code Review completed for **${repoFullName}#${prNumber}**`,
         card: {
-            title: `PR #${prNumber}: ${prTitle}`,
+            title: `${titlePrefix}PR #${prNumber}: ${prTitle}`,
             theme: 'modern-inline',
         },
         slides: [
@@ -250,6 +257,21 @@ export async function postToCliq(
             },
         ],
     };
+
+    // Inject Pipeline Errors Slide if any exist
+    if (pipelineErrors && pipelineErrors.length > 0) {
+        // Limit to 3 errors to prevent blowing up the Cliq message card size
+        const errorsToDisplay = pipelineErrors.slice(0, 3);
+        const errorText = errorsToDisplay.map(e => `• ${e}`).join('\n');
+        const appendTrailing = pipelineErrors.length > 3 ? `\n...and ${pipelineErrors.length - 3} more errors` : '';
+        
+        payload.slides.push({
+            type: 'label',
+            data: [
+                { 'Pipeline Errors': errorText + appendTrailing }
+            ]
+        });
+    }
 
     // ── Dynamic API Routing (Enforcing Bot Identity & Target Classification) ──
     const zohoApiBase = 'https://cliq.zoho.in/api/v2';

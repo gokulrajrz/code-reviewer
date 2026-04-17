@@ -21,6 +21,7 @@ export interface GitHubPullRequest {
     html_url: string;
     diff_url: string;
     patch_url: string;
+    draft: boolean;
     commits: number;
     additions: number;
     deletions: number;
@@ -37,7 +38,7 @@ export interface GitHubPullRequest {
 }
 
 export interface PullRequestWebhookPayload {
-    action: 'opened' | 'closed' | 'synchronize' | 'reopened' | 'edited' | string;
+    action: 'opened' | 'closed' | 'synchronize' | 'reopened' | 'edited' | 'ready_for_review' | string;
     number: number;
     pull_request: GitHubPullRequest;
     repository: GitHubRepository;

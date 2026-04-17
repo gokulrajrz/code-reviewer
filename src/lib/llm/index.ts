@@ -4,6 +4,7 @@ import type { TokenUsage } from '../../types/usage';
 import { DEFAULT_AI_PROVIDER, MODELS } from '../../config/constants';
 import { parseFindings } from './parse-findings';
 import { retryWithBackoff, circuitBreakers } from '../retry';
+import { RateLimitError } from '../errors';
 import { logger } from '../logger';
 
 // Import adapters (registers them with the factory)
@@ -64,7 +65,8 @@ export async function callChunkReview(
     chunkLabel: string,
     env: Env,
     signal?: AbortSignal,
-    systemPrompt?: string
+    systemPrompt?: string,
+    changedFiles?: string[]
 ): Promise<ChunkReviewResult> {
     const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
@@ -84,7 +86,7 @@ export async function callChunkReview(
             { chunkContent, prTitle, chunkLabel, systemPrompt },
             signal
         );
-        const findings = parseFindings(result.content);
+        const findings = parseFindings(result.content, changedFiles);
         return { findings, usage: result.usage };
     };
 
@@ -113,7 +115,12 @@ export async function callChunkReview(
 
         return result;
     } catch (error) {
-        breaker.recordFailure();
+        // Only count genuine failures towards the Circuit Breaker, not capacity limitations.
+        if (!(error instanceof RateLimitError) && !String(error).includes('429')) {
+            breaker.recordFailure();
+        } else {
+            logger.warn(`Rate limit exhausted, preserving circuit breaker state`, { provider, chunkLabel });
+        }
         throw error;
     }
 }

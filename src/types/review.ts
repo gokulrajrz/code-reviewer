@@ -11,21 +11,44 @@
 export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low';
 
 /**
+ * Universal categories — always valid regardless of detected tech stack.
+ * These represent fundamental code quality dimensions.
+ */
+export type UniversalCategory =
+    | 'bug'              // Logic errors, race conditions, off-by-one
+    | 'security'         // XSS, injection, secrets, auth
+    | 'performance'      // N+1, memory leaks, unnecessary computation
+    | 'error-handling'   // Missing try/catch, unhandled promises
+    | 'type-safety'      // `any` usage, type assertions, loose types
+    | 'dead-code'        // Unused variables, unreachable branches
+    | 'naming'           // Poor names, inconsistent conventions
+    | 'accessibility'    // Missing ARIA, semantic HTML
+    | 'architecture'     // Layer violations, circular deps
+    | 'clean-code'       // General code quality
+    | 'testing'          // Missing tests, brittle tests
+    | 'documentation';   // Missing JSDoc, unclear comments
+
+/**
+ * Stack-specific categories — emitted when the corresponding
+ * technology is detected in the repo. Kept for backward compatibility
+ * with existing findings and prompt modules.
+ */
+export type StackCategory =
+    | 'react'           // Hooks violations, component patterns
+    | 'fsd'             // FSD layer boundary violations
+    | 'zustand'         // State management anti-patterns
+    | 'tanstack-query'  // Query key issues, staleTime
+    | 'tailwind'        // Utility-first violations
+    | 'forms'           // Form library anti-patterns
+    | 'typescript';     // TS-specific (strict mode, generics)
+
+/**
  * Categories for classifying the domain of each finding.
+ * Two-tier system: universal categories are always valid,
+ * stack-specific categories activate when detected.
  * Used by the synthesizer to group and deduplicate findings.
  */
-export type FindingCategory =
-    | 'fsd'
-    | 'react'
-    | 'typescript'
-    | 'security'
-    | 'performance'
-    | 'accessibility'
-    | 'zustand'
-    | 'tanstack-query'
-    | 'tailwind'
-    | 'forms'
-    | 'clean-code';
+export type FindingCategory = UniversalCategory | StackCategory;
 
 /**
  * A single structured finding produced by a chunk reviewer (Map phase).
@@ -87,4 +110,10 @@ export interface SynthesizerInput {
     droppedFindingsCount: number;
     /** Files that were in failed chunks (no coverage) */
     failedChunkFiles: string[];
+    /** Pre-computed verdict — the LLM MUST use this, not derive its own */
+    verdict: 'approve' | 'request_changes' | 'needs_discussion';
+    /** Pre-computed severity counts for the summary table */
+    severityCounts: { critical: number; high: number; medium: number; low: number };
+    /** GitHub Check Run conclusion mapped from verdict */
+    conclusion: 'success' | 'failure' | 'neutral';
 }

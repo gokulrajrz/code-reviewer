@@ -1,8 +1,8 @@
-# Production-Grade Implementation - Token Usage Tracking
+# Production-Grade Implementation — AI Code Reviewer
 
 ## Executive Summary
 
-This implementation has been rebuilt to **industrial-grade standards** with enterprise-level error handling, validation, observability, and security.
+This implementation has been rebuilt to **industrial-grade standards** with enterprise-level error handling, validation, observability, security, and a **polyglot tech-stack-aware prompt system**.
 
 ## What Makes This Production-Ready
 
@@ -343,6 +343,30 @@ npm test
 4. `src/config/usage-constants.ts` - Configuration (50 lines)
 5. `test/validation.spec.ts` - Validation tests (200 lines)
 6. `test/errors.spec.ts` - Error tests (150 lines)
+
+### New Modular Prompt System Files
+1. `src/types/stack.ts` - TechStackProfile type definitions
+2. `src/lib/stack-detector.ts` - 6-tier static tech stack detection engine
+3. `src/lib/repo-config.ts` - `.codereview.yml` fetch, parse, and overrides
+4. `src/config/prompts/base.ts` - Universal review rules
+5. `src/config/prompts/output-format.ts` - JSON output schema
+6. `src/config/prompts/composer.ts` - Dynamic prompt composition engine
+7. `src/config/prompts/languages/typescript.ts` - TypeScript rules
+8. `src/config/prompts/languages/python.ts` - Python rules
+9. `src/config/prompts/languages/go.ts` - Go rules
+10. `src/config/prompts/frameworks/react.ts` - React rules
+11. `src/config/prompts/frameworks/nextjs.ts` - Next.js rules
+12. `src/config/prompts/frameworks/express.ts` - Express rules
+13. `src/config/prompts/ecosystem/zustand.ts` - Zustand rules
+14. `src/config/prompts/ecosystem/tanstack-query.ts` - TanStack Query rules
+15. `src/config/prompts/ecosystem/tailwind.ts` - Tailwind CSS rules
+16. `src/config/prompts/ecosystem/react-hook-form.ts` - React Hook Form rules
+17. `src/config/prompts/architecture/fsd.ts` - Feature-Sliced Design rules
+
+### Deleted Legacy Files
+1. `src/config/system-prompt.ts` - Replaced by modular prompt system
+2. `src/lib/review-rules.ts` - Replaced by modular prompt system
+3. `src/config/_legacy-chunk-prompt.ts` - Dead code
 
 ### Enhanced Files
 1. `src/lib/usage-tracker.ts` - Added validation, retry logic, error handling
