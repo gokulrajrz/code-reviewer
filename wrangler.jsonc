@@ -66,15 +66,15 @@
 		},
 		{
 			"binding": "AUTH_KV",
-			"id": "REPLACE_WITH_AUTH_KV_ID"
+			"id": "c715f1033e3c4d2d8fcc356a62657390"
 		},
 		{
 			"binding": "CACHE_KV",
-			"id": "REPLACE_WITH_CACHE_KV_ID"
+			"id": "800a1d0290dd4b8091dc919f48ebc1e5"
 		},
 		{
 			"binding": "DEDUP_KV",
-			"id": "REPLACE_WITH_DEDUP_KV_ID"
+			"id": "84049d8f2396421682c8abe889dd1ffe"
 		}
 	]
 }
