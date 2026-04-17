@@ -19,6 +19,8 @@ export interface Env {
   GITHUB_APP_INSTALLATION_ID: string;
   /** GitHub Webhook Secret (configured in the GitHub App webhook settings) */
   GITHUB_WEBHOOK_SECRET: string;
+  /** Secret used to sign Dashboard session cookies (must be 32+ chars) */
+  DASHBOARD_SESSION_SECRET: string;
 
   // --- Vars (non-secret, safe to set in wrangler.jsonc) ---
   /** Which LLM provider to use. Defaults to "claude". */
@@ -27,9 +29,9 @@ export interface Env {
   ALLOWED_TARGET_BRANCHES?: string;
   /** Optional API key for usage endpoints. If set, requires Bearer token authentication. */
   USAGE_API_KEY?: string;
-  /** Dashboard username (set via wrangler secret). Defaults to 'admin' if not set. */
+  /** Dashboard username (plain-text var in wrangler.jsonc). Required for CLI/UI. */
   DASHBOARD_USERNAME?: string;
-  /** Dashboard password (set via wrangler secret). Required for dashboard login. */
+  /** Dashboard password (plain-text var in wrangler.jsonc). Required for CLI/UI. */
   DASHBOARD_PASSWORD?: string;
   /** Zoho OAuth Client ID */
   CLIQ_CLIENT_ID?: string;
@@ -48,9 +50,15 @@ export interface Env {
   /** The Queue responsible for processing reviews in the background */
   REVIEW_QUEUE: Queue<ReviewMessage>;
 
-  // --- KV Namespaces ---
-  /** KV namespace for storing usage metrics and cost tracking */
+  // --- KV Namespaces (isolated by concern) ---
+  /** KV for usage metrics and cost tracking (TTL: 30 days) */
   USAGE_METRICS: KVNamespace;
+  /** KV for GitHub auth tokens (TTL: 30 min) */
+  AUTH_KV: KVNamespace;
+  /** KV for file content and repo config caching (TTL: 5 min) */
+  CACHE_KV: KVNamespace;
+  /** KV for webhook deduplication IDs (TTL: 1 hour) */
+  DEDUP_KV: KVNamespace;
 }
 
 /**

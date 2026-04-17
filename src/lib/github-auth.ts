@@ -145,7 +145,7 @@ export async function getInstallationToken(env: Env): Promise<string> {
 
     // Check KV cache first
     try {
-        const cached = await env.USAGE_METRICS.get(INSTALL_TOKEN_KV_KEY);
+        const cached = await env.AUTH_KV.get(INSTALL_TOKEN_KV_KEY);
         if (cached) {
             logger.debug('Using cached installation token');
             return cached;
@@ -160,7 +160,7 @@ export async function getInstallationToken(env: Env): Promise<string> {
 
     // Cache it with TTL
     try {
-        await env.USAGE_METRICS.put(INSTALL_TOKEN_KV_KEY, token, {
+        await env.AUTH_KV.put(INSTALL_TOKEN_KV_KEY, token, {
             expirationTtl: INSTALL_TOKEN_TTL_SECONDS,
         });
     } catch {
@@ -177,7 +177,7 @@ export async function getInstallationToken(env: Env): Promise<string> {
  */
 export async function invalidateInstallationToken(env: Env): Promise<void> {
     try {
-        await env.USAGE_METRICS.delete(INSTALL_TOKEN_KV_KEY);
+        await env.AUTH_KV.delete(INSTALL_TOKEN_KV_KEY);
     } catch {
         // Best-effort deletion
     }

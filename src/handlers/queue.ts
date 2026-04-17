@@ -2,6 +2,7 @@ import type { Env, ReviewMessage } from '../types/env';
 import type { ReviewFinding, SynthesizerInput, AnnotatedFinding } from '../types/review';
 import type { LLMCallUsage } from '../types/usage';
 import { MAX_CHUNK_CHARS, MAX_LLM_CHUNKS, MAX_SYNTHESIZER_INPUT_CHARS, DEFAULT_AI_PROVIDER } from '../config/constants';
+import { SubrequestBudget } from '../lib/subrequest-budget';
 import {
     fetchChangedFiles,
     classifyFiles,
@@ -22,7 +23,7 @@ import type { FindingCluster } from '../lib/finding-clusters';
 import { deriveVerdict, verdictToConclusion, countBySeverity } from '../lib/verdict';
 import { formatFindingsAsMarkdown } from '../lib/review-formatter';
 import { detectTechStack } from '../lib/stack-detector';
-import { composeChunkPrompt, composeSynthesizerPrompt, extractFileNamesFromChunk } from '../config/prompts/composer';
+import { composeChunkPrompt, composeSynthesizerPrompt } from '../config/prompts/composer';
 import { fetchRepoConfig, applyConfigOverrides, buildCustomRulesPrompt, shouldIgnore } from '../lib/repo-config';
 import type { TechStackProfile } from '../types/stack';
 
@@ -235,7 +236,7 @@ export async function queueHandler(
 
     // Process each message with its own request context for distributed tracing
     const processingPromises = batch.messages.map(async (message) => {
-        const { prNumber, title, repoFullName, headSha, requestId } = message.body;
+        const { prNumber, title, repoFullName, headSha, requestId, checkRunId } = message.body;
 
         // Create request context for this message
         const context = {
@@ -245,7 +246,50 @@ export async function queueHandler(
             repoFullName,
         };
 
-        return runWithContextAsync(context, async () => processMessage(message, env));
+        // ── Timeout Safety Net ──
+        // If the main pipeline crashes (CPU/memory exceeded, unexpected deploy),
+        // this background timer ensures the Check Run doesn't stay 'in_progress' forever.
+        // It fires after 10 minutes and marks the Check Run as 'timed_out'.
+        let timerId: ReturnType<typeof setTimeout> | undefined;
+        let timeoutResolver: (() => void) | undefined;
+        
+        const safetyNet = new Promise<void>((resolve) => {
+            timeoutResolver = resolve;
+        });
+
+        if (checkRunId) {
+            const SAFETY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+            timerId = setTimeout(async () => {
+                try {
+                    const token = await getInstallationToken(env);
+                    await updateCheckRun(
+                        repoFullName,
+                        checkRunId,
+                        token,
+                        'timed_out',
+                        '⏰ The code review pipeline did not complete within 10 minutes. This is likely due to a transient infrastructure issue. Please re-push or re-open the PR to retry.'
+                    );
+                    logger.warn('Safety net timeout fired — marked Check Run as timed out', { prNumber, checkRunId });
+                } catch {
+                    // Best-effort — if this fails, the Check Run stays in_progress which is still visible
+                } finally {
+                    if (timeoutResolver) timeoutResolver();
+                }
+            }, SAFETY_TIMEOUT_MS);
+            
+            _ctx.waitUntil(safetyNet);
+        }
+
+        return runWithContextAsync(context, async () => {
+            try {
+                await processMessage(message, env);
+            } finally {
+                // Clear the timeout if the pipeline finishes successfully before 10 minutes
+                if (timerId) clearTimeout(timerId);
+                // Resolve the waitUntil promise so the worker doesn't stay alive unnecessarily
+                if (timeoutResolver) timeoutResolver();
+            }
+        });
     });
 
     await Promise.all(processingPromises);
@@ -368,7 +412,7 @@ async function processMessage(
             fileContents: patchContents.length > 0 ? patchContents : undefined,
             repoFullName,
             token,
-            kvNamespace: env.USAGE_METRICS,
+            kvNamespace: env.CACHE_KV,
         });
         logger.info('Tech stack detected', {
             prNumber,
@@ -382,7 +426,7 @@ async function processMessage(
         // ── Step 3.6: Fetch repo config (.codereview.yml) ──
         let activeProfile = stackProfile;
         let customRulesPrompt: string | undefined;
-        const repoConfig = await fetchRepoConfig(repoFullName, token, env.USAGE_METRICS);
+        const repoConfig = await fetchRepoConfig(repoFullName, token, env.CACHE_KV);
         if (repoConfig) {
             activeProfile = applyConfigOverrides(stackProfile, repoConfig);
             customRulesPrompt = buildCustomRulesPrompt(repoConfig);
@@ -419,7 +463,7 @@ async function processMessage(
             prNumber,
             maxChunkChars: MAX_CHUNK_CHARS,
         });
-        const { chunks: rawChunks, globalContext, allFiles: reviewableFiles, pluginFindings } =
+        const { chunks: rawChunks, chunkFileMap, globalContext, allFiles: reviewableFiles, pluginFindings } =
             await buildReviewChunks(classified, token, MAX_CHUNK_CHARS, env, {
                 title,
                 repoFullName,
@@ -433,15 +477,25 @@ async function processMessage(
             globalContextLength: globalContext.length,
         });
 
-        // Apply Hard Cap to prevent 50-subrequest limit exhaustion
-        // Budget: chunks × 1 (Map) + 1-2 (Reduce with fallback) + file fetches + auth ≤ 50
-        if (chunks.length > MAX_LLM_CHUNKS) {
-            logger.warn('Truncating chunks to prevent subrequest limit', {
+        // ── Subrequest Budget: dynamically cap chunks based on remaining budget ──
+        // Instead of blindly capping at MAX_LLM_CHUNKS, calculate how many
+        // subrequests we can still afford for chunk reviews.
+        const budget = new SubrequestBudget();
+        // Account for what buildReviewChunks already consumed (Tier 1 file fetches)
+        budget.use(classified.tier1.length); // 1 subrequest per Tier 1 file
+        budget.use(2); // auth JWT + install token
+        budget.use(2); // post review + update check run (reserved for end)
+        budget.use(2); // Reduce LLM call with fallback
+
+        const maxChunksFromBudget = Math.min(MAX_LLM_CHUNKS, budget.remaining());
+        if (chunks.length > maxChunksFromBudget) {
+            logger.warn('Truncating chunks based on subrequest budget', {
                 prNumber,
                 original: chunks.length,
-                max: MAX_LLM_CHUNKS,
+                max: maxChunksFromBudget,
+                budgetState: budget.getState(),
             });
-            chunks = chunks.slice(0, MAX_LLM_CHUNKS);
+            chunks = chunks.slice(0, maxChunksFromBudget);
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -456,10 +510,11 @@ async function processMessage(
         let failedChunks = 0;
         const failedChunkFiles: string[] = []; // Track which files lacked coverage
 
-        // Process chunks strictly sequentially (concurrency=1) to prevent popping
-        // the 30k tokens/minute rate limit of Anthropic Tier 1/2 boundaries.
-        // It trades a bit of speed for total execution safety on huge PRs.
-        const CHUNK_CONCURRENCY = 1;
+        // Dynamic concurrency: Gemini has 2x higher RPM limits than Claude.
+        // Claude Tier 1/2: 15 RPM → sequential only.
+        // Gemini: 30 RPM → safe to run 3 concurrent.
+        const provider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as import('../types/env').AIProvider;
+        const CHUNK_CONCURRENCY = provider === 'gemini' ? 3 : 1;
 
         /**
          * Simple semaphore for bounded concurrency.
@@ -496,7 +551,7 @@ async function processMessage(
                 const chunkLabel = `${i + 1}/${chunks.length}`;
 
                 // Per-chunk prompt composition: only include rules relevant to THIS chunk's files
-                const chunkFiles = extractFileNamesFromChunk(chunkContent);
+                const chunkFiles = chunkFileMap[i] || [];
                 const chunkSystemPrompt = composeChunkPrompt(activeProfile, chunkFiles, customRulesPrompt);
 
                 // Prepend PR description for intent context (if available)
@@ -511,22 +566,65 @@ async function processMessage(
                     chunkFiles: chunkFiles.slice(0, 5),
                 });
 
-                const result = await withTimeout(
-                    (signal) => callChunkReview(
-                        prContext + chunkContent, title, chunkLabel, env, signal, chunkSystemPrompt
-                    ),
-                    LLM_TIMEOUT_MS,
-                    `Chunk ${chunkLabel}`
-                );
+                // Track subrequest consumption per Map call
+                budget.use(1);
 
-                logger.info('Chunk processed', {
-                    prNumber,
-                    chunk: chunkLabel,
-                    findings: result.findings.length,
-                    tokens: result.usage.totalTokens,
-                });
+                try {
+                    const result = await withTimeout(
+                        (signal) => callChunkReview(
+                            prContext + chunkContent, title, chunkLabel, env, signal, chunkSystemPrompt, reviewableFiles
+                        ),
+                        LLM_TIMEOUT_MS,
+                        `Chunk ${chunkLabel}`
+                    );
 
-                return { result, chunkLabel, chunkContent };
+                    logger.info('Chunk processed', {
+                        prNumber,
+                        chunk: chunkLabel,
+                        findings: result.findings.length,
+                        tokens: result.usage.totalTokens,
+                    });
+
+                    return { result, chunkLabel, chunkContent };
+                } catch (primaryError) {
+                    // Mid-pipeline fallback: if primary provider's circuit breaker
+                    // opened, try the alternate provider instead of failing the chunk.
+                    const errMsg = primaryError instanceof Error ? primaryError.message : String(primaryError);
+                    if (errMsg.includes('circuit breaker') && errMsg.includes('OPEN')) {
+                        const altProvider = provider === 'claude' ? 'gemini' : 'claude';
+                        const altKey = altProvider === 'gemini' ? env.GEMINI_API_KEY : env.ANTHROPIC_API_KEY;
+
+                        if (altKey) {
+                            logger.warn(`Primary provider circuit breaker open, falling back to ${altProvider} for chunk ${chunkLabel}`, {
+                                prNumber,
+                                chunk: chunkLabel,
+                            });
+
+                            // Create a temporary env override for the alternate provider
+                            const fallbackEnv = { ...env, AI_PROVIDER: altProvider } as Env;
+                            budget.use(1); // fallback costs a subrequest too
+
+                            const result = await withTimeout(
+                                (signal) => callChunkReview(
+                                    prContext + chunkContent, title, chunkLabel, fallbackEnv, signal, chunkSystemPrompt, reviewableFiles
+                                ),
+                                LLM_TIMEOUT_MS,
+                                `Chunk ${chunkLabel} (fallback:${altProvider})`
+                            );
+
+                            logger.info('Chunk processed via fallback provider', {
+                                prNumber,
+                                chunk: chunkLabel,
+                                provider: altProvider,
+                                findings: result.findings.length,
+                            });
+
+                            return { result, chunkLabel, chunkContent };
+                        }
+                    }
+                    // No fallback available — rethrow for normal error handling
+                    throw primaryError;
+                }
             }
         );
 
@@ -549,7 +647,7 @@ async function processMessage(
                     chunkErrors.push(errorReason);
                 }
 
-                const filePaths = extractFileNamesFromChunk(chunks[i]);
+                const filePaths = chunkFileMap[i] || [];
                 for (const filePath of filePaths) {
                     if (!failedChunkFiles.includes(filePath)) {
                         failedChunkFiles.push(filePath);

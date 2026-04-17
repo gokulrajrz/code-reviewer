@@ -405,7 +405,7 @@ RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 - DO NOT output empty severity sections. Skip sections with 0 findings.
-- The payload has N findings. Your output MUST have EXACTLY N items. Count them.
+- The payload has N findings. Your output MUST NOT EXCEED N items. You MAY dismiss findings that are false positives or duplicates — add a brief "(Dismissed: reason)" note inline.
 - NEVER write "same issue as above" or "see above" — each finding must be self-contained.
 - DO NOT INCLUDE CODE BLOCKS FOR MEDIUM AND LOW ISSUES.
 - Severity sections must be in order: 🔴 Critical → 🟠 High → 🟡 Medium → 🟢 Low.
@@ -457,32 +457,3 @@ function buildStackSummaryLine(profile: TechStackProfile): string {
     return parts.join(' • ');
 }
 
-/**
- * Extract filenames from a chunk content string.
- *
- * The chunk format uses patterns like:
- *   `--- File: path/to/file.tsx ---`
- *   `File: \`path/to/file.tsx\``
- *
- * This function extracts those filenames for per-chunk prompt composition.
- */
-export function extractFileNamesFromChunk(chunkContent: string): string[] {
-    const filenames: string[] = [];
-    const patterns = [
-        /---\s*FILE:\s*([^\s\-]+)/gi,
-        /FILE:\s*`([^`]+)`/gi,
-        /FILE:\s*([^\s\n]+\.\w+)/gi,
-    ];
-
-    for (const pattern of patterns) {
-        let match: RegExpExecArray | null;
-        while ((match = pattern.exec(chunkContent)) !== null) {
-            const filename = match[1].trim();
-            if (filename && !filenames.includes(filename)) {
-                filenames.push(filename);
-            }
-        }
-    }
-
-    return filenames;
-}

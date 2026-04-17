@@ -65,7 +65,8 @@ export async function callChunkReview(
     chunkLabel: string,
     env: Env,
     signal?: AbortSignal,
-    systemPrompt?: string
+    systemPrompt?: string,
+    changedFiles?: string[]
 ): Promise<ChunkReviewResult> {
     const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
@@ -85,7 +86,7 @@ export async function callChunkReview(
             { chunkContent, prTitle, chunkLabel, systemPrompt },
             signal
         );
-        const findings = parseFindings(result.content);
+        const findings = parseFindings(result.content, changedFiles);
         return { findings, usage: result.usage };
     };
 

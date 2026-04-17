@@ -13,7 +13,12 @@ import { logger } from '../logger';
  *
  * A 30-year rule: never trust external input. The LLM is external input.
  */
-export function parseFindings(rawOutput: string): ReviewFinding[] {
+/**
+ * @param rawOutput  — raw LLM text (may contain code fences, prose, etc.)
+ * @param changedFiles — optional list of filenames in the PR. If provided,
+ *   findings referencing files NOT in this list are dropped as hallucinations.
+ */
+export function parseFindings(rawOutput: string, changedFiles?: string[]): ReviewFinding[] {
     const cleaned = extractJSON(rawOutput);
 
     let parsed: unknown;
@@ -52,19 +57,36 @@ export function parseFindings(rawOutput: string): ReviewFinding[] {
         return [];
     }
 
+    // Build a set of changed filenames for O(1) lookup (hallucination filter)
+    const changedFileSet = changedFiles ? new Set(changedFiles) : null;
+
     // Validate and sanitize each finding
     const validated: ReviewFinding[] = [];
+    let hallucinated = 0;
     for (const item of rawFindings) {
         const finding = validateFinding(item);
-        if (finding) {
-            validated.push(finding);
+        if (!finding) continue;
+
+        // Hallucination filter: drop findings that reference files not in the PR
+        if (changedFileSet && !changedFileSet.has(finding.file)) {
+            hallucinated++;
+            continue;
         }
+
+        validated.push(finding);
         if (validated.length >= MAX_FINDINGS_PER_CHUNK) {
             logger.warn('Hit MAX_FINDINGS_PER_CHUNK, truncating', {
                 max: MAX_FINDINGS_PER_CHUNK,
             });
             break;
         }
+    }
+
+    if (hallucinated > 0) {
+        logger.warn('Dropped hallucinated findings referencing files not in PR', {
+            hallucinated,
+            validatedCount: validated.length,
+        });
     }
 
     return validated;

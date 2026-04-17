@@ -33,9 +33,12 @@ const DASHBOARD_SESSION_COOKIE = 'dashboard_session';
  * In production, DASHBOARD_USERNAME and DASHBOARD_PASSWORD MUST be set via `wrangler secret put`.
  */
 function getDashboardCredentials(env: Env): { username: string; password: string } {
+    if (!env.DASHBOARD_USERNAME || !env.DASHBOARD_PASSWORD) {
+        throw new Error('500: Dashboard credentials are not configured. Set DASHBOARD_USERNAME and DASHBOARD_PASSWORD in wrangler.jsonc or via secrets.');
+    }
     return {
-        username: env.DASHBOARD_USERNAME || 'admin',
-        password: env.DASHBOARD_PASSWORD || 'admin123',
+        username: env.DASHBOARD_USERNAME,
+        password: env.DASHBOARD_PASSWORD,
     };
 }
 
@@ -47,7 +50,7 @@ async function generateSessionToken(env: Env): Promise<string> {
     const timestamp = Date.now().toString(36);
     const random = Math.random().toString(36).substring(2, 15);
     const payload = `${timestamp}.${random}`;
-    const signature = await hmacSign(payload, env.GITHUB_WEBHOOK_SECRET);
+    const signature = await hmacSign(payload, env.DASHBOARD_SESSION_SECRET || env.GITHUB_WEBHOOK_SECRET);
     return `${payload}.${signature}`;
 }
 
@@ -84,7 +87,7 @@ async function isAuthenticated(request: Request, env: Env): Promise<boolean> {
     const payload = `${timestamp}.${random}`;
 
     // Verify HMAC signature
-    const expectedSig = await hmacSign(payload, env.GITHUB_WEBHOOK_SECRET);
+    const expectedSig = await hmacSign(payload, env.DASHBOARD_SESSION_SECRET || env.GITHUB_WEBHOOK_SECRET);
     if (signature !== expectedSig) return false;
 
     // Check token age (max 8 hours)
@@ -336,25 +339,38 @@ export default {
             // — Dashboard UI with Environment-Based Login —
             else if (pathname === '/dashboard' || pathname.startsWith('/dashboard/')) {
                 if (method === 'POST' && pathname === '/dashboard/login') {
-                    const formData = await request.formData();
-                    const username = formData.get('username')?.toString() || '';
-                    const password = formData.get('password')?.toString() || '';
-                    const creds = getDashboardCredentials(env);
+                    try {
+                        const formData = await request.formData();
+                        const username = formData.get('username')?.toString() || '';
+                        const password = formData.get('password')?.toString() || '';
+                        const creds = getDashboardCredentials(env);
 
-                    if (username === creds.username && password === creds.password) {
-                        response = new Response(dashboardHtml, {
-                            status: 200,
-                            headers: {
-                                'Content-Type': 'text/html',
-                                'Set-Cookie': await createSessionCookie(env),
-                                ...getSecurityHeaders({
-                                    contentSecurityPolicy: "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'"
-                                }),
-                            },
-                        });
-                    } else {
-                        response = new Response(loginHtml('Invalid username or password'), {
-                            status: 401,
+                        if (username === creds.username && password === creds.password) {
+                            response = new Response(dashboardHtml, {
+                                status: 200,
+                                headers: {
+                                    'Content-Type': 'text/html',
+                                    'Set-Cookie': await createSessionCookie(env),
+                                    ...getSecurityHeaders({
+                                        contentSecurityPolicy: "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+                                    }),
+                                },
+                            });
+                        } else {
+                            response = new Response(loginHtml('Invalid username or password'), {
+                                status: 401,
+                                headers: {
+                                    'Content-Type': 'text/html',
+                                    ...getSecurityHeaders({
+                                        contentSecurityPolicy: "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+                                    }),
+                                },
+                            });
+                        }
+                    } catch (error) {
+                        const errMsg = error instanceof Error ? error.message : String(error);
+                        response = new Response(loginHtml(errMsg.startsWith('500') ? errMsg : 'Configuration Error. Please check server logs.'), {
+                            status: 500,
                             headers: {
                                 'Content-Type': 'text/html',
                                 ...getSecurityHeaders({

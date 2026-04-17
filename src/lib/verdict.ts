@@ -67,6 +67,13 @@ export function deriveVerdict(
         return 'request_changes';
     }
 
+    // Medium-severity threshold: ≥3 medium findings warrant discussion,
+    // not an outright block. This prevents false merge-blocks from
+    // speculative or style-based medium findings.
+    if (counts.medium >= 3) {
+        return 'needs_discussion';
+    }
+
     return 'approve';
 }
 
