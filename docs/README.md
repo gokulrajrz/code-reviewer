@@ -1,46 +1,56 @@
-# Code Reviewer Agent — Documentation
+# Operations Runbook
 
-Complete documentation for the AI Code Reviewer agent.
+This manual covers the active day-to-day operations, telemetry querying, and observability tuning for the AI Code Reviewer platform running on Cloudflare.
 
-## Quick Start
+## Dashboard & Metrics Interfaces
 
-**New users:** [QUICKSTART.md](./QUICKSTART.md) - Get started in 5 minutes
+The agent automatically logs granular token budgets, estimated LLM costs, and telemetry on every chunk execution through Cloudflare KV (`USAGE_METRICS`).
 
-## Documentation
+### 1. The Visual Dashboard
+Located internally at `scripts/usage-dashboard.html`. Open this locally in your browser and bind it to your worker's live HTTP URL. It will automatically generate graphical layouts representing your AI token budget burn rates.
 
-### User Guides
-- **[QUICKSTART.md](./QUICKSTART.md)** - Quick start guide (5 min)
-- **[USER_GUIDE.md](./USER_GUIDE.md)** - Complete user guide with API reference
+### 2. Checking Current PR Usage
+Target a specific Pull Request to diagnose token explosions or Map-Reduce chunking counts:
+```bash
+curl https://code-reviewer.<YOUR-WORKER>.workers.dev/usage/owner/repo/pr/123
+```
 
-### Developer Guides  
-- **[ARCHITECTURE.md](./ARCHITECTURE.md)** - System architecture and technical details
-- **[DEPLOYMENT.md](./DEPLOYMENT.md)** - Deployment guide and checklist
-- **[RUNBOOK.md](./RUNBOOK.md)** - Operational runbook (health checks, troubleshooting)
+### 3. Check Repository Burn-Rates
+Aggregates total metrics to see if developers in a specific repo are expending too much AI budget:
+```bash
+curl https://code-reviewer.<YOUR-WORKER>.workers.dev/usage/owner/repo/stats
+```
 
-### Reference
-- **[MIGRATION.md](./MIGRATION.md)** - Migration guide for existing deployments
-- **[IMPLEMENTATION.md](./IMPLEMENTATION.md)** - Implementation details and quality metrics
+## Telemetry Payload Structures
 
-## Key Concepts
+Each Pull Request review stores a 90-day ephemeral JSON document that outlines:
+- **`Duration`**: Compute time within the `ReviewContainer` limits (Usually 0-30s).
+- **`Chunks Processed`**: How many LLM requests the AST Map-Reduce algorithm dispatched.
+- **`Provider`**: Indicates if the pipeline leveraged `claude` (Sonnet) or `gemini` (Flash).
+- **`Cost`**: Calculated automatically off hardcoded pricing parameters in `src/types/usage.ts`.
 
-### Tech-Stack-Aware Reviews
-The agent automatically detects your project's tech stack by analyzing file extensions, directory structures, manifest files, and import statements. Reviews are tailored with language-specific, framework-specific, and ecosystem-specific rules — all composed dynamically per code chunk.
+## Adjusting Operational Constraints
 
-See `src/lib/stack-detector.ts` and `src/config/prompts/composer.ts` for implementation details.
+If the AI budget is burning too violently or you hit Cloudflare limits, adjust the following limits inside `src/config/constants.ts`:
 
-### Per-Repo Configuration
-Teams can override detected stacks, add custom rules, or ignore files by placing a `.codereview.yml` in the repository root. See `src/lib/repo-config.ts` and the main [README](../README.md) for syntax.
+1. **`MAX_LLM_CHUNKS`**
+   - *Default*: 50 limits per PR. 
+   - *Tuning*: Decrease to 20 if subrequests are consistently blowing up your architecture budget.
+2. **`TIER1_MAX_FILES`**
+   - *Default*: 100 fully scanned files per PR.
+   - *Tuning*: Decrease to prevent gigantic OS Memory dumps during OS Clone stages.
+3. **`NOISE_EXTENSIONS`**
+   - *Tuning*: Add internally generated vendor formats (`*.swagger.json`, `pnpm-lock.yaml`) to the array so they never get charged to the LLM agent.
 
-### Map-Reduce Pipeline
-Reviews use a Map-Reduce pipeline:
-1. **MAP**: Each code chunk is reviewed independently with a per-chunk composed prompt
-2. **REDUCE**: All findings are deduplicated, clustered, and synthesized into a final markdown report
+## Emergency Kill-Switches & Outages
 
-See `src/handlers/queue.ts` for the full pipeline implementation.
+### Container Memory Leaks (Error 1102)
+If Cloudflare reports `1102` (Exceeded Memory Limit) while executing `Oxlint` or `Git`, your worker container has reached its 128MB isolated memory capacity.
 
-## Tools
+**Remediation:**
+1. Drop the `TIER1_MAX_FILES` constraint to prevent massive PR clones.
+2. Temporarily switch `AI_PROVIDER=gemini` inside `.dev.vars` / Cloudflare Dashboard vars to force smaller execution frames.
+3. If necessary, delete the container `Dockerfile` bindings in `wrangler.jsonc` to force the entire system to run within the internal lightweight string-matching Fallback Architecture.
 
-Located in `../scripts/`:
-- `check-usage.sh` - Bash CLI tool
-- `usage-client.ts` - TypeScript client  
-- `usage-dashboard.html` - Visual dashboard
+### Cloudflare Key-Value Failure
+If the `USAGE_METRICS` namespace enters degraded states, you will see `StorageError` exceptions. The Edge Worker is constructed securely with **Exponential Backoff Retries** under `src/lib/retry.ts`, so no reviews will crash. However, local observability metrics may fail to sync. Verify `npx wrangler tail` to observe dropped metrics.

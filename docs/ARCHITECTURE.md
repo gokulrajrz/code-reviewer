@@ -1,357 +1,75 @@
-# Usage Tracking Architecture
+# System Architecture
 
-Visual guide to how token usage tracking works in the code reviewer agent.
+The AI Code Reviewer represents an enterprise-grade agentic pipeline, running exclusively on Cloudflare's edge network. The architecture utilizes a **Dual-Compute Edge Model** to guarantee sub-second webhook ingestion while safely offloading extremely massive LLM review loads (heavy I/O + long cold starts) securely out-of-band.
 
-## System Overview
+## The Dual-Compute Pipeline
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         GitHub PR Event                          │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Webhook Handler                             │
-│  • Verify signature                                              │
-│  • Create Check Run (in_progress)                                │
-│  • Push to Queue                                                 │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Queue Consumer                              │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 1. Fetch & Classify Files                                │   │
-│  │    • Tier 1: Full content (top 15 files)                 │   │
-│  │    • Tier 2: Diff only (remaining files)                 │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                             │                                     │
-│                             ▼                                     │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 2. MAP PHASE: Review Chunks                              │   │
-│  │    ┌──────────────────────────────────────────────┐     │   │
-│  │    │ For each chunk (max 10):                     │     │   │
-│  │    │   • Call LLM (Claude/Gemini)                 │     │   │
-│  │    │   • Get findings + token usage ◄─────────────┼─┐   │   │
-│  │    │   • Store usage in memory                    │ │   │   │
-│  │    └──────────────────────────────────────────────┘ │   │   │
-│  └────────────────────────────────────────────────────┼──┘   │
-│                             │                          │       │
-│                             ▼                          │       │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 3. Aggregate & Deduplicate Findings                     │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                             │                          │       │
-│                             ▼                          │       │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 4. REDUCE PHASE: Synthesize Review                      │   │
-│  │    • Call LLM with all findings                         │   │
-│  │    • Get final review + token usage ◄───────────────────┼─┐ │
-│  │    • Store usage in memory                              │ │ │
-│  └─────────────────────────────────────────────────────────┘ │ │
-│                             │                          │     │ │
-│                             ▼                          │     │ │
-│  ┌─────────────────────────────────────────────────────────┐ │ │
-│  │ 5. Post Review & Update Check Run                       │ │ │
-│  └─────────────────────────────────────────────────────────┘ │ │
-│                             │                          │     │ │
-│                             ▼                          │     │ │
-│  ┌─────────────────────────────────────────────────────────┐ │ │
-│  │ 6. BUILD & STORE USAGE METRICS ◄───────────────────────┼─┘ │
-│  │    • Aggregate all LLM call usage                       │   │
-│  │    • Calculate total cost                               │   │
-│  │    • Build PRUsageMetrics object                        │   │
-│  │    • Store in Cloudflare KV                             │   │
-│  └────────────────────────┬────────────────────────────────┘   │
-└───────────────────────────┼────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Cloudflare KV Storage                         │
-│                                                                   │
-│  Keys:                                                            │
-│  • usage:{repo}:{pr}:{sha}     → Full metrics                    │
-│  • usage:{repo}:{pr}:latest    → Latest review (convenience)     │
-│                                                                   │
-│  Retention: 90 days (automatic expiration)                       │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             │ Query via REST API
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Usage Query Endpoints                       │
-│                                                                   │
-│  GET /usage/{owner}/{repo}/pr/{prNumber}                         │
-│  GET /usage/{owner}/{repo}/pr/{prNumber}?sha={sha}              │
-│  GET /usage/{owner}/{repo}?limit=N                               │
-│  GET /usage/{owner}/{repo}/stats                                 │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Query Tools                                 │
-│                                                                   │
-│  • Bash Script (check-usage.sh)                                  │
-│  • TypeScript Client (usage-client.ts)                           │
-│  • Visual Dashboard (usage-dashboard.html)                       │
-│  • Direct curl/API calls                                         │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    classDef worker fill:#f9a826,stroke:#fff,color:#fff;
+    classDef container fill:#2b8bd6,stroke:#fff,color:#fff;
+    classDef llm fill:#000,stroke:#fff,color:#fff;
+    classDef gh fill:#333,stroke:#fff,color:#fff;
+
+    A[GitHub Pull Request]:::gh --> B
+    
+    subgraph Edge Worker Isolate
+        B[Webhook Handler]:::worker -->|HTTP 202| C(Queue: code-reviewer-queue):::worker
+        C --> D[Queue Consumer]:::worker
+        D -.-> |Fallback / Orchestration| R[Legacy Reducer Pipeline]:::worker
+    end
+
+    subgraph Ephemeral Container Sandbox
+        D -->|Dispatch / Fetch| E[ReviewContainer Durable Object]:::container
+        E --> F[Hono Server]:::container
+        
+        F --> G[Git Clone Sandbox]:::container
+        G --> H[Tree-sitter AST Builder]:::container
+        H --> I[SAST/Linter Engines]:::container
+        I --> J[Chunking & Clustering]:::container
+        
+        J --> K[Primary Review LLM]:::llm
+        K --> L[Verification LLM]:::llm
+    end
+
+    L --> M[GitHub Check Run PATCH]:::gh
+    M -.-> |Returns Findings| D
+    
+    R --> N[GitHub PR Comment]:::gh
+    D --> N
 ```
 
-## Data Flow Detail
+### 1. The Edge Worker Isolate (The Entrypoint)
+The frontend of the application is a V8 Isolate running on Cloudflare Workers. It exposes a single `fetch` listener that hooks securely into GitHub Webhooks.
+* **Responsibilities:**
+  * Cryptographic HMAC-SHA256 signature verification.
+  * JWT application token swapping.
+  * Filtering irrelevant Git branches.
+  * Synchronous instantiation of an "In Progress" GitHub Check Run.
+  * Immediately pushing the payload to the Cloudflare Queue (Returning HTTP `202`).
 
-### 1. LLM Call Tracking
+### 2. The Cloudflare Container Sandbox (The Engine)
+Because Cloudflare Workers crash on heavy OS-level binary operations, we utilize **Cloudflare Containers** via the `ReviewContainer` Durable Object. This boots up an ephemeral Sandbox capable of executing heavy binaries over a 15-minute timeframe.
+* **Responsibilities:**
+  * **OS Sandbox**: Clones the repository locally using actual `git`.
+  * **Abstract Syntax Tree (AST)**: Recompiles code into Node structures using `tree-sitter`. Maps massive "blast radiuses" linking definitions and call expressions across the codebase.
+  * **Static Security Tooling**: Executes `oxlint`, `biome`, and `semgrep` to intercept syntax faults with 100% mathematical consistency without expending LLM tokens.
+  * **Multi-Agent Generation**: Maps chunks across Anthropic/OpenAI APIs, feeding them context heavily supplemented by AST definitions.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    callChunkReview()                          │
-│                                                                │
-│  Input: Code chunk                                             │
-│     ↓                                                          │
-│  Call LLM API (Claude/Gemini)                                  │
-│     ↓                                                          │
-│  Response:                                                     │
-│  {                                                             │
-│    content: "JSON findings",                                   │
-│    usage: {                                                    │
-│      inputTokens: 12500,                                       │
-│      outputTokens: 850,                                        │
-│      totalTokens: 13350                                        │
-│    }                                                           │
-│  }                                                             │
-│     ↓                                                          │
-│  Store in llmCalls array:                                      │
-│  {                                                             │
-│    phase: "map",                                               │
-│    chunkLabel: "1/3",                                          │
-│    model: "claude-sonnet-4-20250514",                          │
-│    usage: { ... },                                             │
-│    timestamp: "2026-03-26T10:30:45.000Z"                       │
-│  }                                                             │
-└──────────────────────────────────────────────────────────────┘
-```
+## Fault Tolerance & The Map-Reduce Fallback
 
-### 2. Metrics Aggregation
+To ensure the review pipeline achieves a 99.9% uptime SLA, the Edge Worker Consumer utilizes an intensive **Fallback Net**.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              buildPRUsageMetrics()                            │
-│                                                                │
-│  Input: llmCalls[] array                                       │
-│     ↓                                                          │
-│  Aggregate:                                                    │
-│  • totalInputTokens = sum(call.usage.inputTokens)             │
-│  • totalOutputTokens = sum(call.usage.outputTokens)           │
-│  • totalTokens = totalInput + totalOutput                     │
-│     ↓                                                          │
-│  Calculate Cost:                                               │
-│  • inputCost = (totalInput / 1M) × $3.00                      │
-│  • outputCost = (totalOutput / 1M) × $15.00                   │
-│  • estimatedCost = inputCost + outputCost                     │
-│     ↓                                                          │
-│  Build PRUsageMetrics:                                         │
-│  {                                                             │
-│    prNumber, repoFullName, headSha,                            │
-│    provider, startTime, endTime, durationMs,                   │
-│    calls: [...],                                               │
-│    totalInputTokens, totalOutputTokens, totalTokens,           │
-│    estimatedCost,                                              │
-│    filesReviewed, chunksProcessed, findingsCount,              │
-│    status                                                      │
-│  }                                                             │
-└──────────────────────────────────────────────────────────────┘
-```
+If the `ReviewContainer` sandbox crashes (e.g., Node.js OOM fatal errors, Cloudflare network partitions, or GitHub API clone failures):
+1. The Container throws an HTTP `500` upwards asynchronously to the Queue Consumer.
+2. The Queue Consumer instantly falls back to a simplistic **In-Worker Map-Reduce** pipeline.
+3. The Fallback fetches raw diff patches from GitHub APIs instead of using Git, strips Out-of-Bounds Context, and performs a raw syntax string-matching review mapped against the LLMs.
+4. No data drops occur.
 
-### 3. KV Storage
+## The Verification Agent (Hallucination Defense)
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│              storePRUsageMetrics()                            │
-│                                                                │
-│  Input: PRUsageMetrics object                                  │
-│     ↓                                                          │
-│  Store with dual keys:                                         │
-│                                                                │
-│  Key 1: usage:myorg/myrepo:123:abc123...                      │
-│  Value: { ...metrics... }                                      │
-│  TTL: 7776000 seconds (90 days)                                │
-│                                                                │
-│  Key 2: usage:myorg/myrepo:123:latest                         │
-│  Value: { ...metrics... }                                      │
-│  TTL: 7776000 seconds (90 days)                                │
-│                                                                │
-│  ✓ Stored successfully                                         │
-└──────────────────────────────────────────────────────────────┘
-```
-
-## Token Usage Example
-
-### Scenario: PR with 3 chunks
-
-```
-Review Timeline:
-─────────────────────────────────────────────────────────────
-
-10:30:00  Start review
-          ↓
-10:30:45  MAP: Chunk 1/3
-          Input:  12,500 tokens
-          Output:    850 tokens
-          Cost:   $0.0503
-          ↓
-10:31:20  MAP: Chunk 2/3
-          Input:  15,200 tokens
-          Output:  1,100 tokens
-          Cost:   $0.0621
-          ↓
-10:31:55  MAP: Chunk 3/3
-          Input:  11,800 tokens
-          Output:    920 tokens
-          Cost:   $0.0492
-          ↓
-10:32:10  REDUCE: Synthesize
-          Input:   3,200 tokens
-          Output:  1,200 tokens
-          Cost:   $0.0276
-          ↓
-10:32:15  Store metrics
-          ─────────────────────────
-          Total Input:   42,700 tokens
-          Total Output:   4,070 tokens
-          Total Tokens:  46,770 tokens
-          Total Cost:    $0.1892
-          ─────────────────────────
-          Files:         12
-          Chunks:         3
-          Findings:       8
-          Duration:     135s
-          Status:       success
-```
-
-## Cost Calculation
-
-### Claude Sonnet 4 Pricing
-
-```
-Input:  $3.00 per 1M tokens
-Output: $15.00 per 1M tokens
-
-Example PR:
-  Input:  42,700 tokens → (42,700 / 1,000,000) × $3.00  = $0.1281
-  Output:  4,070 tokens → (4,070 / 1,000,000) × $15.00 = $0.0611
-  ────────────────────────────────────────────────────────────
-  Total:                                                  $0.1892
-```
-
-### Gemini 3.1 Pro Pricing
-
-```
-Input:  $1.25 per 1M tokens
-Output: $5.00 per 1M tokens
-
-Same PR with Gemini:
-  Input:  42,700 tokens → (42,700 / 1,000,000) × $1.25 = $0.0534
-  Output:  4,070 tokens → (4,070 / 1,000,000) × $5.00  = $0.0204
-  ────────────────────────────────────────────────────────────
-  Total:                                                  $0.0738
-  
-Savings: $0.1154 (61% cheaper)
-```
-
-## Query Patterns
-
-### Pattern 1: Get Latest PR Usage
-
-```
-Request:
-  GET /usage/myorg/myrepo/pr/123
-
-Flow:
-  1. Extract: owner=myorg, repo=myrepo, prNumber=123
-  2. Build key: usage:myorg/myrepo:123:latest
-  3. KV.get(key)
-  4. Parse JSON
-  5. Return PRUsageMetrics
-```
-
-### Pattern 2: Get Repository Stats
-
-```
-Request:
-  GET /usage/myorg/myrepo/stats
-
-Flow:
-  1. KV.list({ prefix: "usage:myorg/myrepo:" })
-  2. Filter out ":latest" keys
-  3. Fetch all metrics
-  4. Aggregate:
-     • totalReviews = count
-     • totalTokens = sum(metrics.totalTokens)
-     • totalCost = sum(metrics.estimatedCost)
-     • avgTokensPerReview = totalTokens / totalReviews
-     • avgCostPerReview = totalCost / totalReviews
-     • byProvider = group by provider
-  5. Return stats object
-```
-
-## Performance Characteristics
-
-### Storage
-- **Size per review**: ~1KB (JSON)
-- **Retention**: 90 days
-- **Example**: 100 reviews/month = ~9MB total
-
-### Latency
-- **Tracking overhead**: 1-2ms per review
-- **KV write**: ~10-50ms (async, non-blocking)
-- **KV read**: ~10-50ms per query
-- **List operation**: ~100-200ms (depends on count)
-
-### Limits
-- **KV free tier**: 100,000 reads/day, 1,000 writes/day
-- **Typical usage**: <100 writes/day, <1,000 reads/day
-- **Cost**: $0.00 (well within free tier)
-
-## Error Handling
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Error Scenarios                            │
-│                                                                │
-│  1. LLM API Failure                                            │
-│     • Chunk review fails                                       │
-│     • Continue with remaining chunks (graceful degradation)    │
-│     • Mark status as "partial"                                 │
-│                                                                │
-│  2. KV Storage Failure                                         │
-│     • Log error                                                │
-│     • Review still completes successfully                      │
-│     • Non-fatal: usage tracking is optional                    │
-│                                                                │
-│  3. Query Endpoint Failure                                     │
-│     • Return 404 if no data found                              │
-│     • Return 500 if KV error                                   │
-│     • Does not affect review pipeline                          │
-└──────────────────────────────────────────────────────────────┘
-```
-
-## Security Considerations
-
-- **No authentication**: Endpoints are public by default
-- **No PII**: Only metadata and token counts stored
-- **No code content**: Review findings not stored, only counts
-- **Automatic expiration**: 90-day TTL prevents indefinite storage
-
-To add authentication, modify `src/index.ts`:
-
-```typescript
-// Add auth middleware
-if (pathname.startsWith('/usage/')) {
-  const authHeader = request.headers.get('Authorization');
-  if (authHeader !== `Bearer ${env.USAGE_API_KEY}`) {
-    return new Response('Unauthorized', { status: 401 });
-  }
-}
-```
+Instead of trusting the Primary Review LLM blindly, the Ephemeral Sandbox employs an internal **Adversarial Architecture**:
+1. The `Review Agent` produces a set of code critiques.
+2. The critiques are grouped alongside the localized diff patch and handed to the `Verification Agent`.
+3. The Verification Agent's *sole purpose* is to act as a defense attorney. It mathematically proves whether the primary agent is hallucinating APIs, nitpicking useless syntax, or hallucinating data structures.
+4. If a finding is deemed unhelpful or false, the Verification Agent silently assassinates the finding before it is pushed to the GitHub repository.

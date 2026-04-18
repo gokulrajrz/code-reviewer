@@ -620,96 +620,8 @@ export interface ReviewChunksResult {
     pluginFindings: ReviewFinding[];
 }
 
-/**
- * Builds a lightweight import adjacency list from diff patches.
- * Extracts ES `import ... from '...'`, CJS `require('...')`,
- * Python `from X import Y`, and Go `import "..."`.
- *
- * Only includes edges between files that are BOTH in the PR,
- * so the LLM knows about cross-file coupling.
- *
- * Zero extra subrequests — uses only the diff patches already fetched.
- */
-function buildImportGraph(files: GitHubPRFile[]): Map<string, string[]> {
-    const graph = new Map<string, string[]>();
-    const fileSet = new Set(files.map(f => f.filename));
-
-    // Import/require patterns
-    const importPatterns = [
-        /from\s+['"]([^'"]+)['"]/g,            // ES: import X from 'Y'
-        /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g, // CJS: require('Y')
-        /from\s+(\S+)\s+import/g,                 // Python: from X import Y
-        /import\s+"([^"]+)"/g,                     // Go: import "Y"
-    ];
-
-    for (const file of files) {
-        if (!file.patch) continue;
-
-        const imports: string[] = [];
-        const patchContent = file.patch;
-
-        for (const pattern of importPatterns) {
-            pattern.lastIndex = 0;
-            let match: RegExpExecArray | null;
-            while ((match = pattern.exec(patchContent)) !== null) {
-                const importPath = match[1];
-
-                // Resolve relative imports to match filenames in the PR
-                const resolved = resolveImportPath(file.filename, importPath, fileSet);
-                if (resolved && !imports.includes(resolved)) {
-                    imports.push(resolved);
-                }
-            }
-        }
-
-        if (imports.length > 0) {
-            graph.set(file.filename, imports);
-        }
-    }
-
-    return graph;
-}
-
-/**
- * Attempts to resolve a relative import path to a file in the PR.
- * Returns the matched filename or undefined.
- */
-function resolveImportPath(
-    sourceFile: string,
-    importPath: string,
-    fileSet: Set<string>
-): string | undefined {
-    // Skip external packages (no relative path prefix)
-    if (!importPath.startsWith('.') && !importPath.startsWith('/')) return undefined;
-
-    // Get directory of the source file
-    const sourceDir = sourceFile.includes('/')
-        ? sourceFile.substring(0, sourceFile.lastIndexOf('/'))
-        : '';
-
-    // Normalize the path
-    let resolved = importPath;
-    if (importPath.startsWith('./')) {
-        resolved = sourceDir ? `${sourceDir}/${importPath.slice(2)}` : importPath.slice(2);
-    } else if (importPath.startsWith('../')) {
-        const parts = sourceDir.split('/');
-        let relPath = importPath;
-        while (relPath.startsWith('../') && parts.length > 0) {
-            parts.pop();
-            relPath = relPath.slice(3);
-        }
-        resolved = parts.length > 0 ? `${parts.join('/')}/${relPath}` : relPath;
-    }
-
-    // Try exact match, then common extensions
-    if (fileSet.has(resolved)) return resolved;
-    const extensions = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '/index.ts', '/index.tsx', '/index.js'];
-    for (const ext of extensions) {
-        if (fileSet.has(resolved + ext)) return resolved + ext;
-    }
-
-    return undefined;
-}
+// Removed obsolete regex-based buildImportGraph and resolveImportPath functions.
+// Context extraction is now handled by the Cloudflare Container utilizing tree-sitter.
 
 /**
  * Builds review chunks using the tiered classification system.
@@ -730,8 +642,8 @@ export async function buildReviewChunks(
 ): Promise<ReviewChunksResult> {
     const { tier1, tier2, skipped } = classified;
 
-    // Build import adjacency list from diff patches (zero subrequests)
-    const importGraph = buildImportGraph([...tier1, ...tier2]);
+    // Provide empty map for fallback pipeline (AST context mapping runs in container now)
+    const importGraph = new Map<string, string[]>();
     const globalContext = buildGlobalContext(classified, importGraph);
 
     const allFiles = [...tier1, ...tier2].map(f => f.filename);

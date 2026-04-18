@@ -12,9 +12,10 @@ export const MAX_CHUNK_CHARS = 100_000;
 
 /**
  * Hard limit on how many LLM chunks to process to prevent hitting 
- * the Cloudflare Worker 50 subrequests limit. (32 chunks = 32 requests = crash)
+ * the Cloudflare Worker subrequests limit. 
+ * Increased from 10 to 50 on Paid Plan (1000 subrequests ceiling).
  */
-export const MAX_LLM_CHUNKS = 10;
+export const MAX_LLM_CHUNKS = 50;
 
 /**
  * Maximum number of findings a single chunk reviewer can report.
@@ -37,9 +38,9 @@ export const GLOBAL_CONTEXT_BUDGET_CHARS = 8_000;
 
 /**
  * Tier 1: Maximum files that get FULL content fetched (patch + raw file).
- * Each file costs 1 subrequest, so this is bounded by Cloudflare's limit.
+ * Increased from 15 to 100 on Cloudflare Workers Paid Plan (1000 subrequests ceiling).
  */
-export const TIER1_MAX_FILES = 15;
+export const TIER1_MAX_FILES = 100;
 
 /**
  * Maximum total files we consider from the PR at all.

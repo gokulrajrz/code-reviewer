@@ -1,0 +1,28 @@
+{
+  "name": "code-reviewer-container",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ephemeral container for AI code review: git clone, AST parsing, static analysis, multi-agent LLM review",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@google/generative-ai": "^0.24.0",
+    "@hono/node-server": "^1.19.14",
+    "execa": "^9.5.0",
+    "hono": "^4.7.0",
+    "tree-sitter": "^0.22.0",
+    "tree-sitter-typescript": "^0.23.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,3 +1,7 @@
+// Re-export the ReviewContainer class so Cloudflare binds it as a Durable Object.
+// The class itself lives in container-class.ts and configures the Docker container lifecycle.
+export { ReviewContainer } from './container-class';
+
 import type { Env, ReviewMessage } from './types/env';
 import { WORKER_VERSION } from './config/constants';
 import { handlePRWebhook } from './handlers/webhook';

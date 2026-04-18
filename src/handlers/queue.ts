@@ -1,5 +1,6 @@
 import type { Env, ReviewMessage } from '../types/env';
 import type { ReviewFinding, SynthesizerInput, AnnotatedFinding } from '../types/review';
+import { getContainer } from '@cloudflare/containers';
 import type { LLMCallUsage } from '../types/usage';
 import { MAX_CHUNK_CHARS, MAX_LLM_CHUNKS, MAX_SYNTHESIZER_INPUT_CHARS, DEFAULT_AI_PROVIDER } from '../config/constants';
 import { SubrequestBudget } from '../lib/subrequest-budget';
@@ -30,6 +31,102 @@ import type { TechStackProfile } from '../types/stack';
 /** Maximum time (ms) to wait for a single LLM call before aborting.
  * Increased to 5 minutes to accommodate rate limit (HTTP 429) retry-after sleep intervals. */
 const LLM_TIMEOUT_MS = 300_000;
+
+/** Maximum time (ms) to wait for the container review before falling back. */
+const CONTAINER_TIMEOUT_MS = 600_000; // 10 minutes
+
+/**
+ * Container review response (mirrors the container app's ReviewResponse).
+ */
+interface ContainerReviewResult {
+    findings: ReviewFinding[];
+    staticFindings: Array<{ tool: string; rule: string; message: string; file: string; line: number; severity: string }>;
+    blastRadius: { changedFiles: string[]; impactedFiles: string[]; changedSymbols: any[]; impactedSymbols: any[] };
+    metrics: {
+        cloneTimeMs: number; parseTimeMs: number; staticAnalysisTimeMs: number;
+        reviewAgentTimeMs: number; verificationAgentTimeMs: number; totalTimeMs: number;
+        filesAnalyzed: number; symbolsTracked: number; llmInputTokens: number; llmOutputTokens: number;
+    };
+    verdict: 'approve' | 'request_changes' | 'needs_discussion';
+    verified: boolean;
+}
+
+/**
+ * Attempt to dispatch the review to a Cloudflare Container.
+ * Returns the container result on success, or null if the container is unavailable.
+ */
+async function tryContainerReview(
+    env: Env,
+    repoFullName: string,
+    prNumber: number,
+    headSha: string,
+    title: string,
+    prAuthor: string,
+    prDescription: string | undefined,
+    installationToken: string,
+    requestId: string,
+    checkRunId?: number
+): Promise<ContainerReviewResult | null> {
+    if (!env.REVIEW_CONTAINER) {
+        logger.info('REVIEW_CONTAINER binding not available, skipping container dispatch', { prNumber });
+        return null;
+    }
+
+    try {
+        const container = getContainer(env.REVIEW_CONTAINER, `pr-${repoFullName}-${prNumber}`);
+
+        const response = await withTimeout(
+            async () => {
+                return container.fetch(
+                    new Request('http://container/review', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            repoFullName,
+                            prNumber,
+                            headSha,
+                            title,
+                            prAuthor,
+                            prDescription,
+                            installationToken,
+                            aiProvider: env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER,
+                            anthropicApiKey: env.ANTHROPIC_API_KEY,
+                            geminiApiKey: env.GEMINI_API_KEY,
+                            requestId,
+                            checkRunId,
+                        }),
+                    })
+                );
+            },
+            CONTAINER_TIMEOUT_MS,
+            'ContainerReview'
+        );
+
+        if (!response.ok) {
+            const errorBody = await response.text().catch(() => 'unknown');
+            logger.warn('Container returned non-OK status', {
+                prNumber, status: response.status, body: errorBody.slice(0, 500),
+            });
+            return null;
+        }
+
+        const result: ContainerReviewResult = await response.json();
+        logger.info('Container review completed', {
+            prNumber,
+            findings: result.findings.length,
+            staticFindings: result.staticFindings.length,
+            verified: result.verified,
+            totalTimeMs: result.metrics.totalTimeMs,
+        });
+        return result;
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        logger.warn('Container dispatch failed, falling back to in-Worker pipeline', {
+            prNumber, error: errMsg,
+        });
+        return null;
+    }
+}
 
 /**
  * Wraps an async function with a timeout guard.
@@ -335,6 +432,100 @@ async function processMessage(
     }
 
     try {
+        // ══════════════════════════════════════════════════════════════
+        // CONTAINER PATH: Try the Cloudflare Container first.
+        // If it succeeds, skip the entire in-Worker Map-Reduce pipeline.
+        // If it fails, fall through to the legacy pipeline with a notification.
+        // ══════════════════════════════════════════════════════════════
+        const containerResult = await tryContainerReview(
+            env, repoFullName, prNumber, headSha, title, prAuthor, prDescription, token,
+            `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+            checkRunId ?? undefined
+        );
+
+        if (containerResult) {
+            // Container succeeded — format and post results directly
+            logger.info('Using container review results', { prNumber });
+
+            const deduplicated = deduplicateFindings(containerResult.findings);
+            const clusters = clusterFindings(deduplicated);
+            const verdict = containerResult.verdict;
+            const conclusion = verdictToConclusion(verdict);
+            const severityCounts = countBySeverity(deduplicated);
+
+            // Build the review markdown
+            const allReviewableFiles = [...containerResult.blastRadius.changedFiles];
+            let finalReview: string;
+
+            if (deduplicated.length === 0) {
+                finalReview = formatFindingsAsMarkdown(clusters, {
+                    allFiles: allReviewableFiles,
+                    prTitle: title,
+                    totalChunks: 1,
+                    failedChunks: 0,
+                    droppedFindingsCount: 0,
+                    failedChunkFiles: [],
+                    isFallback: false,
+                });
+            } else {
+                finalReview = formatFindingsAsMarkdown(clusters, {
+                    allFiles: allReviewableFiles,
+                    prTitle: title,
+                    totalChunks: 1,
+                    failedChunks: 0,
+                    droppedFindingsCount: 0,
+                    failedChunkFiles: [],
+                    isFallback: false,
+                });
+            }
+
+            // Add container metadata banner
+            const verifiedBadge = containerResult.verified ? '✅ Verified' : '⚠️ Unverified';
+            const containerBanner =
+                `> 🐳 **Container Review** (${verifiedBadge}) — ` +
+                `${containerResult.metrics.filesAnalyzed} files analyzed, ` +
+                `${containerResult.staticFindings.length} static findings, ` +
+                `${containerResult.metrics.symbolsTracked} symbols tracked, ` +
+                `${(containerResult.metrics.totalTimeMs / 1000).toFixed(1)}s total\n\n`;
+            finalReview = containerBanner + finalReview;
+
+            // Post the review
+            const reviewEvent = verdict === 'approve'
+                ? 'APPROVE' as const
+                : verdict === 'request_changes'
+                    ? 'REQUEST_CHANGES' as const
+                    : 'COMMENT' as const;
+
+            try {
+                await postPRReview(repoFullName, prNumber, token, reviewEvent, finalReview, [], new Map());
+            } catch {
+                await postPRComment(repoFullName, prNumber, finalReview, token).catch(() => {});
+            }
+
+            // Update Check Run
+            if (checkRunId) {
+                await updateCheckRun(repoFullName, checkRunId, token, conclusion, finalReview).catch((err) =>
+                    logger.error('Failed to update Check Run', err instanceof Error ? err : undefined, { prNumber })
+                );
+            }
+
+            // Cliq notification
+            if (env.CLIQ_CLIENT_ID && env.CLIQ_CLIENT_SECRET && env.CLIQ_REFRESH_TOKEN && env.CLIQ_BOT_NAME && env.CLIQ_CHANNEL_ID) {
+                await postToCliq(
+                    env.CLIQ_CLIENT_ID, env.CLIQ_CLIENT_SECRET, env.CLIQ_REFRESH_TOKEN,
+                    env.CLIQ_BOT_NAME, env.CLIQ_CHANNEL_ID,
+                    repoFullName, prNumber, title, prAuthor ?? 'unknown',
+                    conclusion, severityCounts, env.CLIQ_DB_NAME, []
+                );
+            }
+
+            message.ack();
+            return;
+        }
+
+        // Container unavailable — fall through to legacy pipeline with notification
+        logger.info('Container unavailable, using legacy in-Worker pipeline', { prNumber });
+
         // ── Step 2: Fetch ALL changed files (paginated) ──
         logger.info('Fetching changed files', { prNumber });
         let allFiles;

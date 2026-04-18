@@ -156,7 +156,7 @@ export async function handlePRWebhook(
     try {
         checkRunId = await createCheckRun(repository.full_name, headSha, token, {
             status: 'in_progress',
-            summary: 'AI Code Review is in progress. The LLM is analyzing your changes...',
+            summary: 'Spinning up Cloudflare Container sandbox...',
         });
     } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);

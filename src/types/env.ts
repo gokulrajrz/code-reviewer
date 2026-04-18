@@ -50,6 +50,10 @@ export interface Env {
   /** The Queue responsible for processing reviews in the background */
   REVIEW_QUEUE: Queue<ReviewMessage>;
 
+  // --- Containers (Durable Object binding) ---
+  /** The ReviewContainer DO namespace for dispatching reviews to ephemeral containers */
+  REVIEW_CONTAINER: DurableObjectNamespace<import('../container-class').ReviewContainer>;
+
   // --- KV Namespaces (isolated by concern) ---
   /** KV for usage metrics and cost tracking (TTL: 30 days) */
   USAGE_METRICS: KVNamespace;
