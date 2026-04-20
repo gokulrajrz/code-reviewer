@@ -3,8 +3,8 @@ import type { AIProvider } from '../types/env';
 export const DEFAULT_AI_PROVIDER: AIProvider = 'claude';
 
 export const MODELS = {
-    claude: 'claude-sonnet-4-6',
-    gemini: 'gemini-2.5-flash-preview-04-17',
+    claude: 'claude-haiku-4-5',
+    gemini: 'gemini-2.5-flash',
 } as const satisfies Record<AIProvider, string>;
 
 /** Maximum characters per LLM chunk. Guards against massive PR context windows. */

@@ -33,22 +33,19 @@ import type { TechStackProfile } from '../types/stack';
 const LLM_TIMEOUT_MS = 300_000;
 
 /** Maximum time (ms) to wait for the container review before falling back. */
-const CONTAINER_TIMEOUT_MS = 600_000; // 10 minutes
+const CONTAINER_TIMEOUT_MS = 240_000; // 4 minutes
 
 /**
  * Container review response (mirrors the container app's ReviewResponse).
  */
 interface ContainerReviewResult {
-    findings: ReviewFinding[];
     staticFindings: Array<{ tool: string; rule: string; message: string; file: string; line: number; severity: string }>;
     blastRadius: { changedFiles: string[]; impactedFiles: string[]; changedSymbols: any[]; impactedSymbols: any[] };
     metrics: {
         cloneTimeMs: number; parseTimeMs: number; staticAnalysisTimeMs: number;
-        reviewAgentTimeMs: number; verificationAgentTimeMs: number; totalTimeMs: number;
-        filesAnalyzed: number; symbolsTracked: number; llmInputTokens: number; llmOutputTokens: number;
+        totalTimeMs: number;
+        filesAnalyzed: number; symbolsTracked: number;
     };
-    verdict: 'approve' | 'request_changes' | 'needs_discussion';
-    verified: boolean;
 }
 
 /**
@@ -65,6 +62,7 @@ async function tryContainerReview(
     prDescription: string | undefined,
     installationToken: string,
     requestId: string,
+    allowedFiles: string[],
     checkRunId?: number
 ): Promise<ContainerReviewResult | null> {
     if (!env.REVIEW_CONTAINER) {
@@ -89,9 +87,7 @@ async function tryContainerReview(
                             prAuthor,
                             prDescription,
                             installationToken,
-                            aiProvider: env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER,
-                            anthropicApiKey: env.ANTHROPIC_API_KEY,
-                            geminiApiKey: env.GEMINI_API_KEY,
+                            allowedFiles,
                             requestId,
                             checkRunId,
                         }),
@@ -113,9 +109,7 @@ async function tryContainerReview(
         const result: ContainerReviewResult = await response.json();
         logger.info('Container review completed', {
             prNumber,
-            findings: result.findings.length,
             staticFindings: result.staticFindings.length,
-            verified: result.verified,
             totalTimeMs: result.metrics.totalTimeMs,
         });
         return result;
@@ -355,7 +349,7 @@ export async function queueHandler(
         });
 
         if (checkRunId) {
-            const SAFETY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+            const SAFETY_TIMEOUT_MS = 14 * 60 * 1000; // 14 minutes
             timerId = setTimeout(async () => {
                 try {
                     const token = await getInstallationToken(env);
@@ -364,7 +358,7 @@ export async function queueHandler(
                         checkRunId,
                         token,
                         'timed_out',
-                        '⏰ The code review pipeline did not complete within 10 minutes. This is likely due to a transient infrastructure issue. Please re-push or re-open the PR to retry.'
+                        '⏰ The code review pipeline did not complete within 14 minutes. This is likely due to a transient infrastructure issue. Please re-push or re-open the PR to retry.'
                     );
                     logger.warn('Safety net timeout fired — marked Check Run as timed out', { prNumber, checkRunId });
                 } catch {
@@ -432,222 +426,106 @@ async function processMessage(
     }
 
     try {
-        // ══════════════════════════════════════════════════════════════
-        // CONTAINER PATH: Try the Cloudflare Container first.
-        // If it succeeds, skip the entire in-Worker Map-Reduce pipeline.
-        // If it fails, fall through to the legacy pipeline with a notification.
-        // ══════════════════════════════════════════════════════════════
+        // ── Step 2 (Pre-compute): Fetch and Filter Changed Files ──
+    logger.info('Fetching changed files', { prNumber });
+    let allFiles;
+    try {
+        allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+    } catch (fetchError) {
+        const errMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
+        if (errMsg.includes('401')) {
+            logger.warn('GitHub API returned 401, retrying token', { prNumber });
+            await invalidateInstallationToken(env);
+            token = await getInstallationToken(env);
+            allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+        } else {
+            throw fetchError;
+        }
+    }
+    logger.info('Fetched changed files', { prNumber, count: allFiles.length });
+
+    if (allFiles.length === 0) {
+        if (checkRunId) await updateCheckRun(repoFullName, checkRunId, token, 'neutral', '## No Files to Review\n\nThis PR has no reviewable file changes.');
+        message.ack();
+        return;
+    }
+
+    const classified = classifyFiles(allFiles);
+    if (classified.tier1.length === 0 && classified.tier2.length === 0) {
+        if (checkRunId) await updateCheckRun(repoFullName, checkRunId, token, 'neutral', `## No Reviewable Files\n\nAll ${allFiles.length} files are skipped as noise.`);
+        message.ack();
+        return;
+    }
+
+    // ── Detect tech stack and parse config ──
+    const patchContents = allFiles
+        .filter(f => f.patch && (f.status === 'added' || f.status === 'modified'))
+        .slice(0, 20)
+        .map(f => ({
+            filename: f.filename,
+            content: f.patch!.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1)).join('\n'),
+        }))
+        .filter(f => f.content.length > 0);
+
+    const stackProfile: TechStackProfile = await detectTechStack({
+        changedFiles: allFiles.map(f => f.filename), fileContents: patchContents.length > 0 ? patchContents : undefined, repoFullName, token, kvNamespace: env.CACHE_KV,
+    });
+
+    let activeProfile = stackProfile;
+    let customRulesPrompt: string | undefined;
+    let severityOverrides: Record<string, string> | undefined;
+    const repoConfig = await fetchRepoConfig(repoFullName, token, env.CACHE_KV);
+    
+    if (repoConfig) {
+        activeProfile = applyConfigOverrides(stackProfile, repoConfig);
+        customRulesPrompt = buildCustomRulesPrompt(repoConfig);
+        severityOverrides = repoConfig.severity;
+        
+        if (repoConfig.ignore?.length) {
+            classified.tier1 = classified.tier1.filter(f => !shouldIgnore(f.filename, repoConfig.ignore!));
+            classified.tier2 = classified.tier2.filter(f => !shouldIgnore(f.filename, repoConfig.ignore!));
+        }
+    }
+
+    if (classified.tier1.length === 0 && classified.tier2.length === 0) {
+        if (checkRunId) await updateCheckRun(repoFullName, checkRunId, token, 'neutral', `## All Files Ignored\n\nAll ${allFiles.length} files are ignored by \`.codereview.yml\`.`);
+        message.ack();
+        return;
+    }
+
+    // ── Container Pre-processing (AST/SAST) ──
+    let containerStaticFindings: import('../types/review').ReviewFinding[] = [];
+    let containerBlastRadiusText = '';
+
+    try {
+        const allowedFiles = [...classified.tier1.map(f => f.filename), ...classified.tier2.map(f => f.filename)];
         const containerResult = await tryContainerReview(
             env, repoFullName, prNumber, headSha, title, prAuthor, prDescription, token,
             `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+            allowedFiles,
             checkRunId ?? undefined
         );
 
         if (containerResult) {
-            // Container succeeded — format and post results directly
-            logger.info('Using container review results', { prNumber });
+            containerStaticFindings = containerResult.staticFindings.map(f => ({
+                issue: f.message,
+                title: `[${f.tool}] ${f.rule}`,
+                description: f.message,
+                severity: (f.severity === 'error' ? 'high' : 'medium') as 'critical'|'high'|'medium'|'low',
+                file: f.file,
+                line: f.line,
+                category: 'clean-code',
+            }));
 
-            const deduplicated = deduplicateFindings(containerResult.findings);
-            const clusters = clusterFindings(deduplicated);
-            const verdict = containerResult.verdict;
-            const conclusion = verdictToConclusion(verdict);
-            const severityCounts = countBySeverity(deduplicated);
-
-            // Build the review markdown
-            const allReviewableFiles = [...containerResult.blastRadius.changedFiles];
-            let finalReview: string;
-
-            if (deduplicated.length === 0) {
-                finalReview = formatFindingsAsMarkdown(clusters, {
-                    allFiles: allReviewableFiles,
-                    prTitle: title,
-                    totalChunks: 1,
-                    failedChunks: 0,
-                    droppedFindingsCount: 0,
-                    failedChunkFiles: [],
-                    isFallback: false,
-                });
-            } else {
-                finalReview = formatFindingsAsMarkdown(clusters, {
-                    allFiles: allReviewableFiles,
-                    prTitle: title,
-                    totalChunks: 1,
-                    failedChunks: 0,
-                    droppedFindingsCount: 0,
-                    failedChunkFiles: [],
-                    isFallback: false,
-                });
-            }
-
-            // Add container metadata banner
-            const verifiedBadge = containerResult.verified ? '✅ Verified' : '⚠️ Unverified';
-            const containerBanner =
-                `> 🐳 **Container Review** (${verifiedBadge}) — ` +
-                `${containerResult.metrics.filesAnalyzed} files analyzed, ` +
-                `${containerResult.staticFindings.length} static findings, ` +
-                `${containerResult.metrics.symbolsTracked} symbols tracked, ` +
-                `${(containerResult.metrics.totalTimeMs / 1000).toFixed(1)}s total\n\n`;
-            finalReview = containerBanner + finalReview;
-
-            // Post the review
-            const reviewEvent = verdict === 'approve'
-                ? 'APPROVE' as const
-                : verdict === 'request_changes'
-                    ? 'REQUEST_CHANGES' as const
-                    : 'COMMENT' as const;
-
-            try {
-                await postPRReview(repoFullName, prNumber, token, reviewEvent, finalReview, [], new Map());
-            } catch {
-                await postPRComment(repoFullName, prNumber, finalReview, token).catch(() => {});
-            }
-
-            // Update Check Run
-            if (checkRunId) {
-                await updateCheckRun(repoFullName, checkRunId, token, conclusion, finalReview).catch((err) =>
-                    logger.error('Failed to update Check Run', err instanceof Error ? err : undefined, { prNumber })
-                );
-            }
-
-            // Cliq notification
-            if (env.CLIQ_CLIENT_ID && env.CLIQ_CLIENT_SECRET && env.CLIQ_REFRESH_TOKEN && env.CLIQ_BOT_NAME && env.CLIQ_CHANNEL_ID) {
-                await postToCliq(
-                    env.CLIQ_CLIENT_ID, env.CLIQ_CLIENT_SECRET, env.CLIQ_REFRESH_TOKEN,
-                    env.CLIQ_BOT_NAME, env.CLIQ_CHANNEL_ID,
-                    repoFullName, prNumber, title, prAuthor ?? 'unknown',
-                    conclusion, severityCounts, env.CLIQ_DB_NAME, []
-                );
-            }
-
-            message.ack();
-            return;
+            const br = containerResult.blastRadius;
+            containerBlastRadiusText = `\n\n## Container Blast Radius Analysis\nChanged files: ${br.changedFiles.length}\nImpacted files: ${br.impactedFiles.length}\nChanged symbols: ${br.changedSymbols.map((s) => `${s.kind} ${s.name}`).join(', ')}`;
+            logger.info('Container analysis completed, fusing results', { prNumber });
+        } else {
+            logger.info('Container unavailable, using in-worker only', { prNumber });
         }
-
-        // Container unavailable — fall through to legacy pipeline with notification
-        logger.info('Container unavailable, using legacy in-Worker pipeline', { prNumber });
-
-        // ── Step 2: Fetch ALL changed files (paginated) ──
-        logger.info('Fetching changed files', { prNumber });
-        let allFiles;
-        try {
-            allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
-        } catch (fetchError) {
-            // If the cached token is expired/invalid, GitHub returns 401.
-            // Invalidate the cache, get a fresh token, and retry once.
-            const errMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
-            if (errMsg.includes('401')) {
-                logger.warn('GitHub API returned 401, invalidating cached token and retrying', { prNumber });
-                await invalidateInstallationToken(env);
-                token = await getInstallationToken(env);
-                allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
-            } else {
-                throw fetchError;
-            }
-        }
-        logger.info('Fetched changed files', { prNumber, count: allFiles.length });
-
-        if (allFiles.length === 0) {
-            logger.warn('No changed files found, skipping review', { prNumber });
-            if (checkRunId) {
-                await updateCheckRun(repoFullName, checkRunId, token, 'neutral',
-                    '## No Files to Review\n\nThis PR has no reviewable file changes.');
-            }
-            message.ack();
-            return;
-        }
-
-        // ── Step 3: Classify files into tiers ──
-        const classified = classifyFiles(allFiles);
-        logger.info('Classified files', {
-            prNumber,
-            tier1: classified.tier1.length,
-            tier2: classified.tier2.length,
-            skipped: classified.skipped.length,
-        });
-
-        if (classified.tier1.length === 0 && classified.tier2.length === 0) {
-            logger.warn('All files classified as noise, skipping review', {
-                prNumber,
-                totalFiles: allFiles.length,
-            });
-            if (checkRunId) {
-                await updateCheckRun(repoFullName, checkRunId, token, 'neutral',
-                    `## No Reviewable Files\n\nAll ${allFiles.length} files in this PR are auto-generated, vendor, or noise files.\n\n` +
-                    `Skipped: ${classified.skipped.slice(0, 20).join(', ')}${classified.skipped.length > 20 ? '...' : ''}`);
-            }
-            message.ack();
-            return;
-        }
-
-        // ── Step 3.5: Detect tech stack ──
-        logger.info('Detecting tech stack', { repoFullName });
-
-        // Extract content snippets from diff patches (already fetched, zero cost)
-        // to feed the stack detector's Tier 6 import scanner.
-        const patchContents = allFiles
-            .filter(f => f.patch && (f.status === 'added' || f.status === 'modified'))
-            .slice(0, 20) // Cap to avoid excessive processing
-            .map(f => ({
-                filename: f.filename,
-                // Extract added lines from the patch (lines starting with '+')
-                content: f.patch!
-                    .split('\n')
-                    .filter(line => line.startsWith('+') && !line.startsWith('+++'))
-                    .map(line => line.slice(1)) // Remove the '+' prefix
-                    .join('\n'),
-            }))
-            .filter(f => f.content.length > 0);
-
-        const stackProfile: TechStackProfile = await detectTechStack({
-            changedFiles: allFiles.map(f => f.filename),
-            fileContents: patchContents.length > 0 ? patchContents : undefined,
-            repoFullName,
-            token,
-            kvNamespace: env.CACHE_KV,
-        });
-        logger.info('Tech stack detected', {
-            prNumber,
-            languages: stackProfile.languages,
-            frameworks: stackProfile.frameworks,
-            architecture: stackProfile.architecture,
-            confidence: stackProfile.confidence,
-            source: stackProfile.source,
-        });
-
-        // ── Step 3.6: Fetch repo config (.codereview.yml) ──
-        let activeProfile = stackProfile;
-        let customRulesPrompt: string | undefined;
-        const repoConfig = await fetchRepoConfig(repoFullName, token, env.CACHE_KV);
-        if (repoConfig) {
-            activeProfile = applyConfigOverrides(stackProfile, repoConfig);
-            customRulesPrompt = buildCustomRulesPrompt(repoConfig);
-            logger.info('Applied repo config overrides', {
-                prNumber,
-                hasStack: !!repoConfig.stack,
-                rulesCount: repoConfig.rules?.length ?? 0,
-                ignoreCount: repoConfig.ignore?.length ?? 0,
-            });
-
-            // Apply repo-specific ignores
-            if (repoConfig.ignore && repoConfig.ignore.length > 0) {
-                const preTier1 = classified.tier1.length;
-                const preTier2 = classified.tier2.length;
-                
-                classified.tier1 = classified.tier1.filter(f => !shouldIgnore(f.filename, repoConfig.ignore));
-                classified.tier2 = classified.tier2.filter(f => !shouldIgnore(f.filename, repoConfig.ignore));
-                
-                const ignored1 = preTier1 - classified.tier1.length;
-                const ignored2 = preTier2 - classified.tier2.length;
-                
-                if (ignored1 > 0 || ignored2 > 0) {
-                    logger.info('Applied repo-specific ignores', {
-                        prNumber,
-                        ignoredTier1: ignored1,
-                        ignoredTier2: ignored2,
-                    });
-                }
-            }
-        }
+    } catch (e) {
+        logger.warn('Container error', { prNumber, error: e });
+    }
 
         // ── Step 4: Build size-limited chunks with global context ──
         logger.info('Building review chunks', {
@@ -659,7 +537,10 @@ async function processMessage(
                 title,
                 repoFullName,
                 prNumber
-            });
+            }, containerBlastRadiusText);
+
+        // Fuse Container Context
+        if (containerStaticFindings.length > 0) pluginFindings.push(...containerStaticFindings);
 
         let chunks = rawChunks;
         logger.info('Generated chunks', {

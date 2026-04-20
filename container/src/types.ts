@@ -10,25 +10,11 @@ export interface ReviewRequest {
 	prAuthor: string;
 	prDescription?: string;
 	installationToken: string;
-	aiProvider: 'claude' | 'gemini';
-	anthropicApiKey: string;
-	geminiApiKey: string;
+	/** Files allowed to be processed (pre-filtered by Worker .codereview.yml ignores) */
+	allowedFiles: string[];
 	/** Worker-generated request ID for distributed tracing */
 	requestId?: string;
 	checkRunId?: number;
-}
-
-/**
- * A single code review finding produced by the Review Agent.
- */
-export interface ReviewFinding {
-	title: string;
-	description: string;
-	severity: 'critical' | 'high' | 'medium' | 'low';
-	file: string;
-	line?: number;
-	category: string;
-	suggestion?: string;
 }
 
 /**
@@ -70,24 +56,17 @@ export interface SymbolInfo {
  * Response payload returned by the container to the Worker.
  */
 export interface ReviewResponse {
-	findings: ReviewFinding[];
 	staticFindings: StaticFinding[];
 	blastRadius: BlastRadius;
 	metrics: ReviewMetrics;
-	verdict: 'approve' | 'request_changes' | 'needs_discussion';
-	/** True if the Verification Agent ran successfully */
-	verified: boolean;
 }
 
 export interface ReviewMetrics {
 	cloneTimeMs: number;
 	parseTimeMs: number;
 	staticAnalysisTimeMs: number;
-	reviewAgentTimeMs: number;
-	verificationAgentTimeMs: number;
 	totalTimeMs: number;
 	filesAnalyzed: number;
 	symbolsTracked: number;
-	llmInputTokens: number;
-	llmOutputTokens: number;
 }
+

@@ -34,10 +34,7 @@ app.post('/review', async (c) => {
 		const response: ReviewResponse = await runReviewPipeline(request, requestId);
 
 		console.log(`[${requestId}] Review completed in ${Date.now() - startTime}ms`, {
-			findings: response.findings.length,
 			staticFindings: response.staticFindings.length,
-			verdict: response.verdict,
-			verified: response.verified,
 		});
 
 		return c.json(response);

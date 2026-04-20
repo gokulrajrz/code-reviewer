@@ -638,13 +638,17 @@ export async function buildReviewChunks(
     token: string,
     maxChunkChars: number,
     env: Env,
-    prContext: { title: string; repoFullName: string; prNumber: number }
+    prContext: { title: string; repoFullName: string; prNumber: number },
+    containerBlastRadiusText?: string
 ): Promise<ReviewChunksResult> {
     const { tier1, tier2, skipped } = classified;
 
     // Provide empty map for fallback pipeline (AST context mapping runs in container now)
     const importGraph = new Map<string, string[]>();
-    const globalContext = buildGlobalContext(classified, importGraph);
+    let globalContext = buildGlobalContext(classified, importGraph);
+    if (containerBlastRadiusText) {
+        globalContext += containerBlastRadiusText;
+    }
 
     const allFiles = [...tier1, ...tier2].map(f => f.filename);
     const pluginFindings: ReviewFinding[] = runStaticPlugins([...tier1, ...tier2]);

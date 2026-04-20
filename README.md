@@ -13,26 +13,26 @@ This project operates on a heavily parallelized Dual-Compute pipeline:
 1. **The Edge Worker (Isolate):** A heavily secured, incredibly fast routing tier handling Webhook ingestion (HMAC-SHA256 verified), PR queuing, JWT App Authentication, usage metrics tracking, and rate-limiting.
 2. **The Review Sandbox (Docker Container):** Ephemeral Node.js containers orchestrated dynamically by Cloudflare. Handles heavy OS-level dependencies required for massive AST analysis: `git clone`, `tree-sitter`, `Biome`, `Oxlint`, and `Semgrep`.
 
-```
+```text
 GitHub PR Event → Webhook POST → Worker Isolate Tier
                                    ├── Verify Signature
                                    ├── Push to Queue (code-reviewer-queue)
                                    └── Return 202 Accepted
                                         ↓
                          Worker Queue Consumer (Up to 15 min runtime)
+                                   ├── Execute `.codereview.yml` filtering rules
                                    └── Dispatch `ReviewContainer` Durable Object
                                         ↓
                            Container Sandbox (Hono/Docker)
                                    ├── 📦 Git Clone (Shallow depth)
                                    ├── 🌳 Tree-Sitter AST Blast Radius computation
-                                   ├── 🛡️ Execute SAST (Semgrep, Oxlint, Biome)
-                                   ├── 🧠 MAP Primary LLM Review Pass
-                                   ├── 🕵️ MAP Verification LLM Agent (Kill false positives)
-                                   └── Live Patch GitHub Check Runs Progress
+                                   └── 🛡️ Execute SAST (Semgrep, Oxlint, Biome)
                                         ↓
-                         Worker Reducer Fallback
-                                   ├── Deduplicate & Synthesize Findings
-                                   └── Post PR Comment via GitHub API
+                         Worker Orchestrator (Map-Reduce)
+                                   ├── Split files into scaling Cloudflare limits chunks
+                                   ├── Map: Synthesize Chunks across LLMs using Blast Radius Context
+                                   ├── Reduce: Deduplicate LLM Findings with SAST Errors
+                                   └── Post PR Inline Comment via GitHub API
 ```
 
 ---
@@ -42,7 +42,6 @@ GitHub PR Event → Webhook POST → Worker Isolate Tier
 - **🧠 Ephemeral Container Checkouts**: Pulls your raw repository into an isolated sandbox to run native CLI operations.
 - **🌳 AST Dependency Trees**: Generates a Tree-sitter powered codebase "blast radius" context so the LLM perfectly understands function relationships across unaffected files.
 - **🛡️ SAST & Linter Guards**: Natively executes `oxlint`, `biome`, and `semgrep` alongside the AI agents to guarantee mathematically correct syntax validations.
-- **🕵️ Multi-Agent Verification**: Every LLM critique is violently challenged by a secondary **Verification Agent** to aggressively eliminate LLM hallucinated false positives.
 - **⚙️ `.codereview.yml` Overrides**: Fully bypass zero-LLM tech stack inferences by throwing a `.codereview.yml` into your repo to enforce your team's custom codebase architecture standards.
 - **📊 Metric Observability**: Complete JSON logging, REST APIs, and automated token counting budget thresholds.
 - **💼 Zoho Cliq**: Pushes custom Rich-Card payloads to Cliq groups to announce merge-blocking check run outcomes. 
