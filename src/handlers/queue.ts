@@ -1,8 +1,12 @@
 import type { Env, ReviewMessage } from '../types/env';
 import type { ReviewFinding, SynthesizerInput, AnnotatedFinding } from '../types/review';
+import { getContainer } from '@cloudflare/containers';
 import type { LLMCallUsage } from '../types/usage';
 import { MAX_CHUNK_CHARS, MAX_LLM_CHUNKS, MAX_SYNTHESIZER_INPUT_CHARS, DEFAULT_AI_PROVIDER } from '../config/constants';
 import { SubrequestBudget } from '../lib/subrequest-budget';
+import { adaptiveConcurrency } from '../lib/adaptive-concurrency';
+import { getServiceLevelConfig, applyServiceLevel, getServiceLevelMessage, ServiceLevel } from '../lib/service-levels';
+import type { SystemHealth } from '../lib/service-levels';
 import {
     fetchChangedFiles,
     classifyFiles,
@@ -30,6 +34,96 @@ import type { TechStackProfile } from '../types/stack';
 /** Maximum time (ms) to wait for a single LLM call before aborting.
  * Increased to 5 minutes to accommodate rate limit (HTTP 429) retry-after sleep intervals. */
 const LLM_TIMEOUT_MS = 300_000;
+
+/** Maximum time (ms) to wait for the container review before falling back. */
+const CONTAINER_TIMEOUT_MS = 240_000; // 4 minutes
+
+/**
+ * Container review response (mirrors the container app's ReviewResponse).
+ */
+interface ContainerReviewResult {
+    staticFindings: Array<{ tool: string; rule: string; message: string; file: string; line: number; severity: string }>;
+    blastRadius: { changedFiles: string[]; impactedFiles: string[]; changedSymbols: any[]; impactedSymbols: any[] };
+    metrics: {
+        cloneTimeMs: number; parseTimeMs: number; staticAnalysisTimeMs: number;
+        totalTimeMs: number;
+        filesAnalyzed: number; symbolsTracked: number;
+    };
+}
+
+/**
+ * Attempt to dispatch the review to a Cloudflare Container.
+ * Returns the container result on success, or null if the container is unavailable.
+ */
+async function tryContainerReview(
+    env: Env,
+    repoFullName: string,
+    prNumber: number,
+    headSha: string,
+    title: string,
+    prAuthor: string,
+    prDescription: string | undefined,
+    installationToken: string,
+    requestId: string,
+    allowedFiles: string[],
+    checkRunId?: number
+): Promise<ContainerReviewResult | null> {
+    if (!env.REVIEW_CONTAINER) {
+        logger.info('REVIEW_CONTAINER binding not available, skipping container dispatch', { prNumber });
+        return null;
+    }
+
+    try {
+        const container = getContainer(env.REVIEW_CONTAINER, `pr-${repoFullName}-${prNumber}`);
+
+        const response = await withTimeout(
+            async () => {
+                return container.fetch(
+                    new Request('http://container/review', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            repoFullName,
+                            prNumber,
+                            headSha,
+                            title,
+                            prAuthor,
+                            prDescription,
+                            installationToken,
+                            allowedFiles,
+                            requestId,
+                            checkRunId,
+                        }),
+                    })
+                );
+            },
+            CONTAINER_TIMEOUT_MS,
+            'ContainerReview'
+        );
+
+        if (!response.ok) {
+            const errorBody = await response.text().catch(() => 'unknown');
+            logger.warn('Container returned non-OK status', {
+                prNumber, status: response.status, body: errorBody.slice(0, 500),
+            });
+            return null;
+        }
+
+        const result: ContainerReviewResult = await response.json();
+        logger.info('Container review completed', {
+            prNumber,
+            staticFindings: result.staticFindings.length,
+            totalTimeMs: result.metrics.totalTimeMs,
+        });
+        return result;
+    } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        logger.warn('Container dispatch failed, falling back to in-Worker pipeline', {
+            prNumber, error: errMsg,
+        });
+        return null;
+    }
+}
 
 /**
  * Wraps an async function with a timeout guard.
@@ -258,7 +352,7 @@ export async function queueHandler(
         });
 
         if (checkRunId) {
-            const SAFETY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+            const SAFETY_TIMEOUT_MS = 14 * 60 * 1000; // 14 minutes
             timerId = setTimeout(async () => {
                 try {
                     const token = await getInstallationToken(env);
@@ -267,7 +361,7 @@ export async function queueHandler(
                         checkRunId,
                         token,
                         'timed_out',
-                        '⏰ The code review pipeline did not complete within 10 minutes. This is likely due to a transient infrastructure issue. Please re-push or re-open the PR to retry.'
+                        '⏰ The code review pipeline did not complete within 14 minutes. This is likely due to a transient infrastructure issue. Please re-push or re-open the PR to retry.'
                     );
                     logger.warn('Safety net timeout fired — marked Check Run as timed out', { prNumber, checkRunId });
                 } catch {
@@ -318,6 +412,41 @@ async function processMessage(
     const provider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER);
     const modelName = getModelName(provider);
 
+    // ── Step 0: Check Service Level (graceful degradation) ──
+    // Calculate system health metrics for service level determination
+    const systemHealth: SystemHealth = {
+        errorRate: 0, // Will be calculated from recent metrics
+        rateLimitUtilization: 0, // Will be fetched from rate limiter
+        costBudgetUtilization: 0, // Will be fetched from cost breaker
+        containerSuccessRate: 1.0, // Assume healthy initially
+    };
+
+    const serviceLevelConfig = await getServiceLevelConfig(env, repoFullName, systemHealth);
+    
+    if (serviceLevelConfig.level === ServiceLevel.DISABLED) {
+        logger.error('[ServiceLevel] Service disabled, skipping review', undefined, {
+            prNumber,
+            reason: serviceLevelConfig.reason,
+        });
+
+        const disabledMessage = getServiceLevelMessage(serviceLevelConfig);
+        
+        if (checkRunId) {
+            const token = await getInstallationToken(env);
+            await updateCheckRun(repoFullName, checkRunId, token, 'neutral', disabledMessage);
+        }
+        
+        message.ack();
+        return;
+    }
+
+    if (serviceLevelConfig.level === ServiceLevel.DEGRADED) {
+        logger.warn('[ServiceLevel] Running in degraded mode', {
+            prNumber,
+            reason: serviceLevelConfig.reason,
+        });
+    }
+
     // ── Step 1: Get a fresh installation token ──
     let token: string;
     try {
@@ -335,128 +464,106 @@ async function processMessage(
     }
 
     try {
-        // ── Step 2: Fetch ALL changed files (paginated) ──
-        logger.info('Fetching changed files', { prNumber });
-        let allFiles;
-        try {
+        // ── Step 2 (Pre-compute): Fetch and Filter Changed Files ──
+    logger.info('Fetching changed files', { prNumber });
+    let allFiles;
+    try {
+        allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+    } catch (fetchError) {
+        const errMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
+        if (errMsg.includes('401')) {
+            logger.warn('GitHub API returned 401, retrying token', { prNumber });
+            await invalidateInstallationToken(env);
+            token = await getInstallationToken(env);
             allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
-        } catch (fetchError) {
-            // If the cached token is expired/invalid, GitHub returns 401.
-            // Invalidate the cache, get a fresh token, and retry once.
-            const errMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
-            if (errMsg.includes('401')) {
-                logger.warn('GitHub API returned 401, invalidating cached token and retrying', { prNumber });
-                await invalidateInstallationToken(env);
-                token = await getInstallationToken(env);
-                allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
-            } else {
-                throw fetchError;
-            }
+        } else {
+            throw fetchError;
         }
-        logger.info('Fetched changed files', { prNumber, count: allFiles.length });
+    }
+    logger.info('Fetched changed files', { prNumber, count: allFiles.length });
 
-        if (allFiles.length === 0) {
-            logger.warn('No changed files found, skipping review', { prNumber });
-            if (checkRunId) {
-                await updateCheckRun(repoFullName, checkRunId, token, 'neutral',
-                    '## No Files to Review\n\nThis PR has no reviewable file changes.');
-            }
-            message.ack();
-            return;
+    if (allFiles.length === 0) {
+        if (checkRunId) await updateCheckRun(repoFullName, checkRunId, token, 'neutral', '## No Files to Review\n\nThis PR has no reviewable file changes.');
+        message.ack();
+        return;
+    }
+
+    const classified = classifyFiles(allFiles);
+    if (classified.tier1.length === 0 && classified.tier2.length === 0) {
+        if (checkRunId) await updateCheckRun(repoFullName, checkRunId, token, 'neutral', `## No Reviewable Files\n\nAll ${allFiles.length} files are skipped as noise.`);
+        message.ack();
+        return;
+    }
+
+    // ── Detect tech stack and parse config ──
+    const patchContents = allFiles
+        .filter(f => f.patch && (f.status === 'added' || f.status === 'modified'))
+        .slice(0, 20)
+        .map(f => ({
+            filename: f.filename,
+            content: f.patch!.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1)).join('\n'),
+        }))
+        .filter(f => f.content.length > 0);
+
+    const stackProfile: TechStackProfile = await detectTechStack({
+        changedFiles: allFiles.map(f => f.filename), fileContents: patchContents.length > 0 ? patchContents : undefined, repoFullName, token, kvNamespace: env.CACHE_KV,
+    });
+
+    let activeProfile = stackProfile;
+    let customRulesPrompt: string | undefined;
+    let severityOverrides: Record<string, string> | undefined;
+    const repoConfig = await fetchRepoConfig(repoFullName, token, env.CACHE_KV);
+    
+    if (repoConfig) {
+        activeProfile = applyConfigOverrides(stackProfile, repoConfig);
+        customRulesPrompt = buildCustomRulesPrompt(repoConfig);
+        severityOverrides = repoConfig.severity;
+        
+        if (repoConfig.ignore?.length) {
+            classified.tier1 = classified.tier1.filter(f => !shouldIgnore(f.filename, repoConfig.ignore!));
+            classified.tier2 = classified.tier2.filter(f => !shouldIgnore(f.filename, repoConfig.ignore!));
         }
+    }
 
-        // ── Step 3: Classify files into tiers ──
-        const classified = classifyFiles(allFiles);
-        logger.info('Classified files', {
-            prNumber,
-            tier1: classified.tier1.length,
-            tier2: classified.tier2.length,
-            skipped: classified.skipped.length,
-        });
+    if (classified.tier1.length === 0 && classified.tier2.length === 0) {
+        if (checkRunId) await updateCheckRun(repoFullName, checkRunId, token, 'neutral', `## All Files Ignored\n\nAll ${allFiles.length} files are ignored by \`.codereview.yml\`.`);
+        message.ack();
+        return;
+    }
 
-        if (classified.tier1.length === 0 && classified.tier2.length === 0) {
-            logger.warn('All files classified as noise, skipping review', {
-                prNumber,
-                totalFiles: allFiles.length,
-            });
-            if (checkRunId) {
-                await updateCheckRun(repoFullName, checkRunId, token, 'neutral',
-                    `## No Reviewable Files\n\nAll ${allFiles.length} files in this PR are auto-generated, vendor, or noise files.\n\n` +
-                    `Skipped: ${classified.skipped.slice(0, 20).join(', ')}${classified.skipped.length > 20 ? '...' : ''}`);
-            }
-            message.ack();
-            return;
+    // ── Container Pre-processing (AST/SAST) ──
+    let containerStaticFindings: import('../types/review').ReviewFinding[] = [];
+    let containerBlastRadiusText = '';
+
+    try {
+        const allowedFiles = [...classified.tier1.map(f => f.filename), ...classified.tier2.map(f => f.filename)];
+        const containerResult = await tryContainerReview(
+            env, repoFullName, prNumber, headSha, title, prAuthor, prDescription, token,
+            `${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+            allowedFiles,
+            checkRunId ?? undefined
+        );
+
+        if (containerResult) {
+            containerStaticFindings = containerResult.staticFindings.map(f => ({
+                issue: f.message,
+                title: `[${f.tool}] ${f.rule}`,
+                description: f.message,
+                severity: (f.severity === 'error' ? 'high' : 'medium') as 'critical'|'high'|'medium'|'low',
+                file: f.file,
+                line: f.line,
+                category: 'clean-code',
+            }));
+
+            const br = containerResult.blastRadius;
+            containerBlastRadiusText = `\n\n## Container Blast Radius Analysis\nChanged files: ${br.changedFiles.length}\nImpacted files: ${br.impactedFiles.length}\nChanged symbols: ${br.changedSymbols.map((s) => `${s.kind} ${s.name}`).join(', ')}`;
+            logger.info('Container analysis completed, fusing results', { prNumber });
+        } else {
+            logger.info('Container unavailable, using in-worker only', { prNumber });
         }
-
-        // ── Step 3.5: Detect tech stack ──
-        logger.info('Detecting tech stack', { repoFullName });
-
-        // Extract content snippets from diff patches (already fetched, zero cost)
-        // to feed the stack detector's Tier 6 import scanner.
-        const patchContents = allFiles
-            .filter(f => f.patch && (f.status === 'added' || f.status === 'modified'))
-            .slice(0, 20) // Cap to avoid excessive processing
-            .map(f => ({
-                filename: f.filename,
-                // Extract added lines from the patch (lines starting with '+')
-                content: f.patch!
-                    .split('\n')
-                    .filter(line => line.startsWith('+') && !line.startsWith('+++'))
-                    .map(line => line.slice(1)) // Remove the '+' prefix
-                    .join('\n'),
-            }))
-            .filter(f => f.content.length > 0);
-
-        const stackProfile: TechStackProfile = await detectTechStack({
-            changedFiles: allFiles.map(f => f.filename),
-            fileContents: patchContents.length > 0 ? patchContents : undefined,
-            repoFullName,
-            token,
-            kvNamespace: env.CACHE_KV,
-        });
-        logger.info('Tech stack detected', {
-            prNumber,
-            languages: stackProfile.languages,
-            frameworks: stackProfile.frameworks,
-            architecture: stackProfile.architecture,
-            confidence: stackProfile.confidence,
-            source: stackProfile.source,
-        });
-
-        // ── Step 3.6: Fetch repo config (.codereview.yml) ──
-        let activeProfile = stackProfile;
-        let customRulesPrompt: string | undefined;
-        const repoConfig = await fetchRepoConfig(repoFullName, token, env.CACHE_KV);
-        if (repoConfig) {
-            activeProfile = applyConfigOverrides(stackProfile, repoConfig);
-            customRulesPrompt = buildCustomRulesPrompt(repoConfig);
-            logger.info('Applied repo config overrides', {
-                prNumber,
-                hasStack: !!repoConfig.stack,
-                rulesCount: repoConfig.rules?.length ?? 0,
-                ignoreCount: repoConfig.ignore?.length ?? 0,
-            });
-
-            // Apply repo-specific ignores
-            if (repoConfig.ignore && repoConfig.ignore.length > 0) {
-                const preTier1 = classified.tier1.length;
-                const preTier2 = classified.tier2.length;
-                
-                classified.tier1 = classified.tier1.filter(f => !shouldIgnore(f.filename, repoConfig.ignore));
-                classified.tier2 = classified.tier2.filter(f => !shouldIgnore(f.filename, repoConfig.ignore));
-                
-                const ignored1 = preTier1 - classified.tier1.length;
-                const ignored2 = preTier2 - classified.tier2.length;
-                
-                if (ignored1 > 0 || ignored2 > 0) {
-                    logger.info('Applied repo-specific ignores', {
-                        prNumber,
-                        ignoredTier1: ignored1,
-                        ignoredTier2: ignored2,
-                    });
-                }
-            }
-        }
+    } catch (e) {
+        logger.warn('Container error', { prNumber, error: e });
+    }
 
         // ── Step 4: Build size-limited chunks with global context ──
         logger.info('Building review chunks', {
@@ -468,13 +575,23 @@ async function processMessage(
                 title,
                 repoFullName,
                 prNumber
-            });
+            }, containerBlastRadiusText);
+
+        // Fuse Container Context
+        if (containerStaticFindings.length > 0) pluginFindings.push(...containerStaticFindings);
 
         let chunks = rawChunks;
         logger.info('Generated chunks', {
             prNumber,
             chunkCount: chunks.length,
             globalContextLength: globalContext.length,
+        });
+
+        // ── Apply Service Level to chunk configuration ──
+        const chunkConfig = applyServiceLevel(serviceLevelConfig.level, {
+            maxChunks: MAX_LLM_CHUNKS,
+            skipSynthesis: false,
+            skipInlineComments: false,
         });
 
         // ── Subrequest Budget: dynamically cap chunks based on remaining budget ──
@@ -487,12 +604,13 @@ async function processMessage(
         budget.use(2); // post review + update check run (reserved for end)
         budget.use(2); // Reduce LLM call with fallback
 
-        const maxChunksFromBudget = Math.min(MAX_LLM_CHUNKS, budget.remaining());
+        const maxChunksFromBudget = Math.min(chunkConfig.maxChunks, budget.remaining());
         if (chunks.length > maxChunksFromBudget) {
-            logger.warn('Truncating chunks based on subrequest budget', {
+            logger.warn('Truncating chunks based on subrequest budget and service level', {
                 prNumber,
                 original: chunks.length,
                 max: maxChunksFromBudget,
+                serviceLevel: serviceLevelConfig.level,
                 budgetState: budget.getState(),
             });
             chunks = chunks.slice(0, maxChunksFromBudget);
@@ -510,11 +628,16 @@ async function processMessage(
         let failedChunks = 0;
         const failedChunkFiles: string[] = []; // Track which files lacked coverage
 
-        // Dynamic concurrency: Gemini has 2x higher RPM limits than Claude.
-        // Claude Tier 1/2: 15 RPM → sequential only.
-        // Gemini: 30 RPM → safe to run 3 concurrent.
+        // Dynamic concurrency: Use adaptive concurrency controller instead of fixed values.
+        // The controller automatically adjusts based on success/error rates.
         const provider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as import('../types/env').AIProvider;
-        const CHUNK_CONCURRENCY = provider === 'gemini' ? 3 : 1;
+        const CHUNK_CONCURRENCY = adaptiveConcurrency.chunkReview.getConcurrency();
+
+        logger.info('Using adaptive concurrency', {
+            prNumber,
+            concurrency: CHUNK_CONCURRENCY,
+            provider,
+        });
 
         /**
          * Simple semaphore for bounded concurrency.
@@ -585,6 +708,9 @@ async function processMessage(
                         tokens: result.usage.totalTokens,
                     });
 
+                    // Record success for adaptive concurrency
+                    adaptiveConcurrency.chunkReview.recordSuccess();
+
                     return { result, chunkLabel, chunkContent };
                 } catch (primaryError) {
                     // Mid-pipeline fallback: if primary provider's circuit breaker
@@ -604,22 +730,46 @@ async function processMessage(
                             const fallbackEnv = { ...env, AI_PROVIDER: altProvider } as Env;
                             budget.use(1); // fallback costs a subrequest too
 
-                            const result = await withTimeout(
-                                (signal) => callChunkReview(
-                                    prContext + chunkContent, title, chunkLabel, fallbackEnv, signal, chunkSystemPrompt, reviewableFiles
-                                ),
-                                LLM_TIMEOUT_MS,
-                                `Chunk ${chunkLabel} (fallback:${altProvider})`
-                            );
+                            try {
+                                const result = await withTimeout(
+                                    (signal) => callChunkReview(
+                                        prContext + chunkContent, title, chunkLabel, fallbackEnv, signal, chunkSystemPrompt, reviewableFiles
+                                    ),
+                                    LLM_TIMEOUT_MS,
+                                    `Chunk ${chunkLabel} (fallback:${altProvider})`
+                                );
 
-                            logger.info('Chunk processed via fallback provider', {
-                                prNumber,
-                                chunk: chunkLabel,
-                                provider: altProvider,
-                                findings: result.findings.length,
-                            });
+                                logger.info('Chunk processed via fallback provider', {
+                                    prNumber,
+                                    chunk: chunkLabel,
+                                    provider: altProvider,
+                                    findings: result.findings.length,
+                                });
 
-                            return { result, chunkLabel, chunkContent };
+                                // Record success for adaptive concurrency
+                                adaptiveConcurrency.chunkReview.recordSuccess();
+
+                                return { result, chunkLabel, chunkContent };
+                            } catch (fallbackError) {
+                                // Both primary and fallback failed - return error marker
+                                logger.error('[Queue] Chunk failed on both providers', 
+                                    fallbackError instanceof Error ? fallbackError : undefined, {
+                                    prNumber,
+                                    chunk: chunkLabel,
+                                    primaryError: errMsg,
+                                    fallbackError: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+                                });
+
+                                // Record error for adaptive concurrency
+                                adaptiveConcurrency.chunkReview.recordError('both_providers_failed');
+
+                                // Return error marker instead of throwing
+                                return {
+                                    error: true,
+                                    chunkLabel,
+                                    errorMessage: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+                                };
+                            }
                         }
                     }
                     // No fallback available — rethrow for normal error handling
@@ -632,17 +782,29 @@ async function processMessage(
         const chunkErrors: string[] = []; // Track unique error reasons
         for (let i = 0; i < chunkResults.length; i++) {
             const outcome = chunkResults[i];
-            if (outcome instanceof Error) {
+            
+            // Handle both Error objects and error markers
+            if (outcome instanceof Error || (outcome as any).error) {
                 failedChunks++;
                 const chunkLabel = `${i + 1}/${chunks.length}`;
+                const errorMsg = outcome instanceof Error ? outcome.message : (outcome as any).errorMessage;
+                
+                // Record error type for adaptive concurrency
+                if (errorMsg?.includes('timeout') || errorMsg?.includes('timed out')) {
+                    adaptiveConcurrency.chunkReview.recordTimeout();
+                } else if (!(outcome as any).error) {
+                    // Only record if not already recorded in fallback handler
+                    adaptiveConcurrency.chunkReview.recordError('chunk_processing_error');
+                }
+                
                 logger.warn('Chunk failed, continuing with remaining', {
                     prNumber,
                     chunk: chunkLabel,
-                    error: outcome.message,
+                    error: errorMsg,
                 });
 
                 // Collect unique error reasons for surfacing in PR comment
-                const errorReason = outcome.message || 'Unknown error';
+                const errorReason = errorMsg || 'Unknown error';
                 if (!chunkErrors.includes(errorReason)) {
                     chunkErrors.push(errorReason);
                 }
@@ -654,14 +816,17 @@ async function processMessage(
                     }
                 }
             } else {
-                allFindings.push(...outcome.result.findings);
-                llmCalls.push({
-                    phase: 'map',
-                    chunkLabel: outcome.chunkLabel,
-                    model: modelName,
-                    usage: outcome.result.usage,
-                    timestamp: new Date().toISOString(),
-                });
+                // Success case - outcome has result property
+                if (outcome.result) {
+                    allFindings.push(...outcome.result.findings);
+                    llmCalls.push({
+                        phase: 'map',
+                        chunkLabel: outcome.chunkLabel,
+                        model: modelName,
+                        usage: outcome.result.usage,
+                        timestamp: new Date().toISOString(),
+                    });
+                }
             }
         }
 
@@ -758,6 +923,39 @@ async function processMessage(
                 failedChunkFiles,
                 isFallback: false,
             });
+        } else if (chunkConfig.skipSynthesis) {
+            // Service level degradation: skip synthesis, use formatter
+            logger.warn('Service level degradation: skipping synthesis', {
+                prNumber,
+                serviceLevel: serviceLevelConfig.level,
+            });
+            
+            const { droppedFindingsCount } = buildSynthesizerPayload(
+                title,
+                reviewableFiles,
+                classified.skipped.length,
+                clusters,
+                chunks.length,
+                failedChunks,
+                failedChunkFiles,
+                verdict,
+                severityCounts,
+                conclusion
+            );
+            
+            isFallback = true;
+            finalReview = formatFindingsAsMarkdown(clusters, {
+                allFiles: reviewableFiles,
+                prTitle: title,
+                totalChunks: chunks.length,
+                failedChunks,
+                droppedFindingsCount,
+                failedChunkFiles,
+                isFallback: true,
+            });
+
+            const degradationBanner = getServiceLevelMessage(serviceLevelConfig) + '\n\n';
+            finalReview = degradationBanner + finalReview;
         } else {
             // Scale output budget based on finding count.
             // Claude Sonnet 4 supports up to 16384 output tokens.
@@ -795,6 +993,9 @@ async function processMessage(
                     tokens: result.usage.totalTokens,
                 });
 
+                // Record success for adaptive concurrency
+                adaptiveConcurrency.synthesis.recordSuccess();
+
                 // Track usage
                 llmCalls.push({
                     phase: 'reduce',
@@ -807,6 +1008,13 @@ async function processMessage(
                 const errMsg = error instanceof Error ? error.message : String(error);
                 logger.error('All synthesizer providers failed, using fallback formatter',
                     error instanceof Error ? error : undefined, { prNumber });
+
+                // Record error for adaptive concurrency
+                if (errMsg?.includes('timeout') || errMsg?.includes('timed out')) {
+                    adaptiveConcurrency.synthesis.recordTimeout();
+                } else {
+                    adaptiveConcurrency.synthesis.recordError('synthesis_failed');
+                }
 
                 isFallback = true;
                 finalReview = formatFindingsAsMarkdown(clusters, {

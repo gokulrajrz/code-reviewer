@@ -8,6 +8,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "code-reviewer",
+	"account_id": "ad91abcd16cd9e9c569d83d9ef46e398",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-03-10",
 	"compatibility_flags": [
@@ -75,6 +76,49 @@
 		{
 			"binding": "DEDUP_KV",
 			"id": "84049d8f2396421682c8abe889dd1ffe"
+		}
+	],
+	/**
+	 * Containers — Ephemeral Docker containers for heavy review compute.
+	 * The ReviewContainer class (src/container-class.ts) manages lifecycle.
+	 * The Docker image (container/Dockerfile) runs the actual review pipeline.
+	 */
+	"containers": [
+		{
+			"class_name": "ReviewContainer",
+			"image": "./container/Dockerfile",
+			"instance_type": "standard-1",
+			"max_instances": 10
+		}
+	],
+	/**
+	 * Durable Object binding for the ReviewContainer.
+	 * The Worker uses this to dispatch review jobs to container instances.
+	 */
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "REVIEW_CONTAINER",
+				"class_name": "ReviewContainer"
+			},
+			{
+				"name": "RATE_LIMITER",
+				"class_name": "RateLimiterDO"
+			}
+		]
+	},
+	/**
+	 * DO migration — required for first deploy.
+	 * Uses SQLite-backed DOs as required by Cloudflare Containers.
+	 */
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["ReviewContainer"]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["RateLimiterDO"]
 		}
 	]
 }
