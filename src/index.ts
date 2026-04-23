@@ -2,6 +2,10 @@
 // The class itself lives in container-class.ts and configures the Docker container lifecycle.
 export { ReviewContainer } from './container-class';
 
+// Re-export the RateLimiterDO class so Cloudflare binds it as a Durable Object.
+// The class itself lives in lib/llm/distributed-rate-limiter.ts and provides distributed rate limiting.
+export { RateLimiterDO } from './lib/llm/distributed-rate-limiter';
+
 import type { Env, ReviewMessage } from './types/env';
 import { WORKER_VERSION } from './config/constants';
 import { handlePRWebhook } from './handlers/webhook';
@@ -22,6 +26,8 @@ import { extractOrGenerateRequestId, runWithContextAsync, getRequestId } from '.
 import { setRequestContextGetter } from './lib/logger';
 import { performHealthCheck, getHealthStatusCode } from './lib/health-check';
 import { getOperationalMetrics, getPrometheusMetrics, recordRequestMetrics } from './lib/metrics';
+import { getAllRetryMetrics } from './lib/retry-with-backoff';
+import { getAllConcurrencyMetrics } from './lib/adaptive-concurrency';
 import { loginHtml, dashboardHtml } from './handlers/dashboard-html';
 
 // Wire up logger → request context (fix #9: was never connected)
@@ -195,6 +201,69 @@ export default {
                     });
                 } else {
                     response = createSecureJsonResponse(metrics, 200);
+                }
+            }
+
+            // — Admin Endpoints for Industrial-Grade Systems —
+            // GET /admin/retry-metrics - Retry controller metrics
+            else if (method === 'GET' && pathname === '/admin/retry-metrics') {
+                try {
+                    authenticateUsageRequest(request, env);
+                    const metrics = getAllRetryMetrics();
+                    response = createSecureJsonResponse(metrics, 200);
+                } catch (error) {
+                    const normalizedError = normalizeError(error);
+                    response = createSecureJsonResponse(
+                        { error: normalizedError.message, code: normalizedError.code },
+                        normalizedError.statusCode
+                    );
+                }
+            }
+
+            // GET /admin/concurrency-metrics - Adaptive concurrency metrics
+            else if (method === 'GET' && pathname === '/admin/concurrency-metrics') {
+                try {
+                    authenticateUsageRequest(request, env);
+                    const metrics = getAllConcurrencyMetrics();
+                    response = createSecureJsonResponse(metrics, 200);
+                } catch (error) {
+                    const normalizedError = normalizeError(error);
+                    response = createSecureJsonResponse(
+                        { error: normalizedError.message, code: normalizedError.code },
+                        normalizedError.statusCode
+                    );
+                }
+            }
+
+            // GET /admin/rate-limiter-metrics/{provider} - Rate limiter metrics
+            else if (method === 'GET' && pathname.startsWith('/admin/rate-limiter-metrics/')) {
+                try {
+                    authenticateUsageRequest(request, env);
+                    const provider = pathname.split('/').pop();
+                    
+                    if (!provider || !['claude', 'gemini'].includes(provider)) {
+                        response = createSecureJsonResponse(
+                            { error: 'Invalid provider. Use: claude or gemini' },
+                            400
+                        );
+                    } else if (!env.RATE_LIMITER) {
+                        response = createSecureJsonResponse(
+                            { error: 'Rate limiter not configured' },
+                            503
+                        );
+                    } else {
+                        const id = env.RATE_LIMITER.idFromName(provider);
+                        const stub = env.RATE_LIMITER.get(id);
+                        const metricsResponse = await stub.fetch('https://rate-limiter/metrics');
+                        const metrics = await metricsResponse.json();
+                        response = createSecureJsonResponse(metrics, 200);
+                    }
+                } catch (error) {
+                    const normalizedError = normalizeError(error);
+                    response = createSecureJsonResponse(
+                        { error: normalizedError.message, code: normalizedError.code },
+                        normalizedError.statusCode
+                    );
                 }
             }
 

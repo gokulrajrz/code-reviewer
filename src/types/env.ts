@@ -46,6 +46,14 @@ export interface Env {
   /** Zoho Cliq Database name for GitHub↔Cliq user mapping (default: 'githubusermap') */
   CLIQ_DB_NAME?: string;
 
+  // --- Industrial-Grade Systems (New) ---
+  /** Webhook URL for budget alerts (Slack, PagerDuty, etc.) */
+  BUDGET_ALERT_WEBHOOK?: string;
+  /** Honeycomb API key for OpenTelemetry traces */
+  HONEYCOMB_API_KEY?: string;
+  /** OpenTelemetry exporter URL (alternative to Honeycomb) */
+  OTEL_EXPORTER_URL?: string;
+
   // --- Queues ---
   /** The Queue responsible for processing reviews in the background */
   REVIEW_QUEUE: Queue<ReviewMessage>;
@@ -53,6 +61,8 @@ export interface Env {
   // --- Containers (Durable Object binding) ---
   /** The ReviewContainer DO namespace for dispatching reviews to ephemeral containers */
   REVIEW_CONTAINER: DurableObjectNamespace<import('../container-class').ReviewContainer>;
+  /** The RateLimiter DO namespace for distributed rate limiting */
+  RATE_LIMITER: DurableObjectNamespace;
 
   // --- KV Namespaces (isolated by concern) ---
   /** KV for usage metrics and cost tracking (TTL: 30 days) */

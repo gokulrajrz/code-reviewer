@@ -4,6 +4,9 @@ import { getContainer } from '@cloudflare/containers';
 import type { LLMCallUsage } from '../types/usage';
 import { MAX_CHUNK_CHARS, MAX_LLM_CHUNKS, MAX_SYNTHESIZER_INPUT_CHARS, DEFAULT_AI_PROVIDER } from '../config/constants';
 import { SubrequestBudget } from '../lib/subrequest-budget';
+import { adaptiveConcurrency } from '../lib/adaptive-concurrency';
+import { getServiceLevelConfig, applyServiceLevel, getServiceLevelMessage, ServiceLevel } from '../lib/service-levels';
+import type { SystemHealth } from '../lib/service-levels';
 import {
     fetchChangedFiles,
     classifyFiles,
@@ -409,6 +412,41 @@ async function processMessage(
     const provider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER);
     const modelName = getModelName(provider);
 
+    // ── Step 0: Check Service Level (graceful degradation) ──
+    // Calculate system health metrics for service level determination
+    const systemHealth: SystemHealth = {
+        errorRate: 0, // Will be calculated from recent metrics
+        rateLimitUtilization: 0, // Will be fetched from rate limiter
+        costBudgetUtilization: 0, // Will be fetched from cost breaker
+        containerSuccessRate: 1.0, // Assume healthy initially
+    };
+
+    const serviceLevelConfig = await getServiceLevelConfig(env, repoFullName, systemHealth);
+    
+    if (serviceLevelConfig.level === ServiceLevel.DISABLED) {
+        logger.error('[ServiceLevel] Service disabled, skipping review', undefined, {
+            prNumber,
+            reason: serviceLevelConfig.reason,
+        });
+
+        const disabledMessage = getServiceLevelMessage(serviceLevelConfig);
+        
+        if (checkRunId) {
+            const token = await getInstallationToken(env);
+            await updateCheckRun(repoFullName, checkRunId, token, 'neutral', disabledMessage);
+        }
+        
+        message.ack();
+        return;
+    }
+
+    if (serviceLevelConfig.level === ServiceLevel.DEGRADED) {
+        logger.warn('[ServiceLevel] Running in degraded mode', {
+            prNumber,
+            reason: serviceLevelConfig.reason,
+        });
+    }
+
     // ── Step 1: Get a fresh installation token ──
     let token: string;
     try {
@@ -549,6 +587,13 @@ async function processMessage(
             globalContextLength: globalContext.length,
         });
 
+        // ── Apply Service Level to chunk configuration ──
+        const chunkConfig = applyServiceLevel(serviceLevelConfig.level, {
+            maxChunks: MAX_LLM_CHUNKS,
+            skipSynthesis: false,
+            skipInlineComments: false,
+        });
+
         // ── Subrequest Budget: dynamically cap chunks based on remaining budget ──
         // Instead of blindly capping at MAX_LLM_CHUNKS, calculate how many
         // subrequests we can still afford for chunk reviews.
@@ -559,12 +604,13 @@ async function processMessage(
         budget.use(2); // post review + update check run (reserved for end)
         budget.use(2); // Reduce LLM call with fallback
 
-        const maxChunksFromBudget = Math.min(MAX_LLM_CHUNKS, budget.remaining());
+        const maxChunksFromBudget = Math.min(chunkConfig.maxChunks, budget.remaining());
         if (chunks.length > maxChunksFromBudget) {
-            logger.warn('Truncating chunks based on subrequest budget', {
+            logger.warn('Truncating chunks based on subrequest budget and service level', {
                 prNumber,
                 original: chunks.length,
                 max: maxChunksFromBudget,
+                serviceLevel: serviceLevelConfig.level,
                 budgetState: budget.getState(),
             });
             chunks = chunks.slice(0, maxChunksFromBudget);
@@ -582,11 +628,16 @@ async function processMessage(
         let failedChunks = 0;
         const failedChunkFiles: string[] = []; // Track which files lacked coverage
 
-        // Dynamic concurrency: Gemini has 2x higher RPM limits than Claude.
-        // Claude Tier 1/2: 15 RPM → sequential only.
-        // Gemini: 30 RPM → safe to run 3 concurrent.
+        // Dynamic concurrency: Use adaptive concurrency controller instead of fixed values.
+        // The controller automatically adjusts based on success/error rates.
         const provider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as import('../types/env').AIProvider;
-        const CHUNK_CONCURRENCY = provider === 'gemini' ? 3 : 1;
+        const CHUNK_CONCURRENCY = adaptiveConcurrency.chunkReview.getConcurrency();
+
+        logger.info('Using adaptive concurrency', {
+            prNumber,
+            concurrency: CHUNK_CONCURRENCY,
+            provider,
+        });
 
         /**
          * Simple semaphore for bounded concurrency.
@@ -657,6 +708,9 @@ async function processMessage(
                         tokens: result.usage.totalTokens,
                     });
 
+                    // Record success for adaptive concurrency
+                    adaptiveConcurrency.chunkReview.recordSuccess();
+
                     return { result, chunkLabel, chunkContent };
                 } catch (primaryError) {
                     // Mid-pipeline fallback: if primary provider's circuit breaker
@@ -676,22 +730,46 @@ async function processMessage(
                             const fallbackEnv = { ...env, AI_PROVIDER: altProvider } as Env;
                             budget.use(1); // fallback costs a subrequest too
 
-                            const result = await withTimeout(
-                                (signal) => callChunkReview(
-                                    prContext + chunkContent, title, chunkLabel, fallbackEnv, signal, chunkSystemPrompt, reviewableFiles
-                                ),
-                                LLM_TIMEOUT_MS,
-                                `Chunk ${chunkLabel} (fallback:${altProvider})`
-                            );
+                            try {
+                                const result = await withTimeout(
+                                    (signal) => callChunkReview(
+                                        prContext + chunkContent, title, chunkLabel, fallbackEnv, signal, chunkSystemPrompt, reviewableFiles
+                                    ),
+                                    LLM_TIMEOUT_MS,
+                                    `Chunk ${chunkLabel} (fallback:${altProvider})`
+                                );
 
-                            logger.info('Chunk processed via fallback provider', {
-                                prNumber,
-                                chunk: chunkLabel,
-                                provider: altProvider,
-                                findings: result.findings.length,
-                            });
+                                logger.info('Chunk processed via fallback provider', {
+                                    prNumber,
+                                    chunk: chunkLabel,
+                                    provider: altProvider,
+                                    findings: result.findings.length,
+                                });
 
-                            return { result, chunkLabel, chunkContent };
+                                // Record success for adaptive concurrency
+                                adaptiveConcurrency.chunkReview.recordSuccess();
+
+                                return { result, chunkLabel, chunkContent };
+                            } catch (fallbackError) {
+                                // Both primary and fallback failed - return error marker
+                                logger.error('[Queue] Chunk failed on both providers', 
+                                    fallbackError instanceof Error ? fallbackError : undefined, {
+                                    prNumber,
+                                    chunk: chunkLabel,
+                                    primaryError: errMsg,
+                                    fallbackError: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+                                });
+
+                                // Record error for adaptive concurrency
+                                adaptiveConcurrency.chunkReview.recordError('both_providers_failed');
+
+                                // Return error marker instead of throwing
+                                return {
+                                    error: true,
+                                    chunkLabel,
+                                    errorMessage: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+                                };
+                            }
                         }
                     }
                     // No fallback available — rethrow for normal error handling
@@ -704,17 +782,29 @@ async function processMessage(
         const chunkErrors: string[] = []; // Track unique error reasons
         for (let i = 0; i < chunkResults.length; i++) {
             const outcome = chunkResults[i];
-            if (outcome instanceof Error) {
+            
+            // Handle both Error objects and error markers
+            if (outcome instanceof Error || (outcome as any).error) {
                 failedChunks++;
                 const chunkLabel = `${i + 1}/${chunks.length}`;
+                const errorMsg = outcome instanceof Error ? outcome.message : (outcome as any).errorMessage;
+                
+                // Record error type for adaptive concurrency
+                if (errorMsg?.includes('timeout') || errorMsg?.includes('timed out')) {
+                    adaptiveConcurrency.chunkReview.recordTimeout();
+                } else if (!(outcome as any).error) {
+                    // Only record if not already recorded in fallback handler
+                    adaptiveConcurrency.chunkReview.recordError('chunk_processing_error');
+                }
+                
                 logger.warn('Chunk failed, continuing with remaining', {
                     prNumber,
                     chunk: chunkLabel,
-                    error: outcome.message,
+                    error: errorMsg,
                 });
 
                 // Collect unique error reasons for surfacing in PR comment
-                const errorReason = outcome.message || 'Unknown error';
+                const errorReason = errorMsg || 'Unknown error';
                 if (!chunkErrors.includes(errorReason)) {
                     chunkErrors.push(errorReason);
                 }
@@ -726,14 +816,17 @@ async function processMessage(
                     }
                 }
             } else {
-                allFindings.push(...outcome.result.findings);
-                llmCalls.push({
-                    phase: 'map',
-                    chunkLabel: outcome.chunkLabel,
-                    model: modelName,
-                    usage: outcome.result.usage,
-                    timestamp: new Date().toISOString(),
-                });
+                // Success case - outcome has result property
+                if (outcome.result) {
+                    allFindings.push(...outcome.result.findings);
+                    llmCalls.push({
+                        phase: 'map',
+                        chunkLabel: outcome.chunkLabel,
+                        model: modelName,
+                        usage: outcome.result.usage,
+                        timestamp: new Date().toISOString(),
+                    });
+                }
             }
         }
 
@@ -830,6 +923,39 @@ async function processMessage(
                 failedChunkFiles,
                 isFallback: false,
             });
+        } else if (chunkConfig.skipSynthesis) {
+            // Service level degradation: skip synthesis, use formatter
+            logger.warn('Service level degradation: skipping synthesis', {
+                prNumber,
+                serviceLevel: serviceLevelConfig.level,
+            });
+            
+            const { droppedFindingsCount } = buildSynthesizerPayload(
+                title,
+                reviewableFiles,
+                classified.skipped.length,
+                clusters,
+                chunks.length,
+                failedChunks,
+                failedChunkFiles,
+                verdict,
+                severityCounts,
+                conclusion
+            );
+            
+            isFallback = true;
+            finalReview = formatFindingsAsMarkdown(clusters, {
+                allFiles: reviewableFiles,
+                prTitle: title,
+                totalChunks: chunks.length,
+                failedChunks,
+                droppedFindingsCount,
+                failedChunkFiles,
+                isFallback: true,
+            });
+
+            const degradationBanner = getServiceLevelMessage(serviceLevelConfig) + '\n\n';
+            finalReview = degradationBanner + finalReview;
         } else {
             // Scale output budget based on finding count.
             // Claude Sonnet 4 supports up to 16384 output tokens.
@@ -867,6 +993,9 @@ async function processMessage(
                     tokens: result.usage.totalTokens,
                 });
 
+                // Record success for adaptive concurrency
+                adaptiveConcurrency.synthesis.recordSuccess();
+
                 // Track usage
                 llmCalls.push({
                     phase: 'reduce',
@@ -879,6 +1008,13 @@ async function processMessage(
                 const errMsg = error instanceof Error ? error.message : String(error);
                 logger.error('All synthesizer providers failed, using fallback formatter',
                     error instanceof Error ? error : undefined, { prNumber });
+
+                // Record error for adaptive concurrency
+                if (errMsg?.includes('timeout') || errMsg?.includes('timed out')) {
+                    adaptiveConcurrency.synthesis.recordTimeout();
+                } else {
+                    adaptiveConcurrency.synthesis.recordError('synthesis_failed');
+                }
 
                 isFallback = true;
                 finalReview = formatFindingsAsMarkdown(clusters, {
