@@ -13,7 +13,36 @@ import {
     type ClaudeContentBlock,
     CLAUDE_WEB_SEARCH_TOOL_VERSION,
     CLAUDE_WEB_SEARCH_MAX_USES,
+    CLAUDE_WEB_SEARCH_ALLOWED_DOMAINS,
+    SEARCH_TOKEN_BUDGET_MULTIPLIER,
+    CLAUDE_MAX_SEARCH_CONTINUATIONS,
 } from '../../web-search';
+
+/** Shape of Claude API response body. */
+interface ClaudeAPIResponse {
+    content: ClaudeContentBlock[];
+    usage: { input_tokens: number; output_tokens: number; server_tool_use?: { web_search_requests?: number } };
+    stop_reason?: string;
+}
+
+/** Parameters for the shared pause_turn handler. */
+interface PauseTurnParams {
+    data: ClaudeAPIResponse;
+    userPrompt: string;
+    systemPrompt: string;
+    maxTokens: number;
+    tools?: unknown[];
+    signal?: AbortSignal;
+    label: string;
+}
+
+/** Result from pause_turn handling. */
+interface PauseTurnResult {
+    allContentBlocks: ClaudeContentBlock[];
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    continuationsUsed: number;
+}
 
 /**
  * Anthropic Claude LLM Provider Adapter
@@ -115,10 +144,14 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         }
 
         // Check cost budget if available
+        // When web search is active, inflate estimates to account for search result tokens
         if (this.costBreaker) {
+            const adjustedInputTokens = this.webSearchEnabled
+                ? Math.ceil(estimatedInputTokens * SEARCH_TOKEN_BUDGET_MULTIPLIER)
+                : estimatedInputTokens;
             const estimatedCost = (this.costBreaker.constructor as any).estimateCost(
                 'claude',
-                estimatedInputTokens,
+                adjustedInputTokens,
                 estimatedOutputTokens
             );
 
@@ -129,8 +162,14 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         }
 
         // Build tools array — conditionally include web_search server tool
+        // allowed_domains focuses searches on official docs, security advisories, and registries
         const tools: unknown[] | undefined = this.webSearchEnabled
-            ? [{ type: CLAUDE_WEB_SEARCH_TOOL_VERSION, name: 'web_search', max_uses: CLAUDE_WEB_SEARCH_MAX_USES }]
+            ? [{
+                type: CLAUDE_WEB_SEARCH_TOOL_VERSION,
+                name: 'web_search',
+                max_uses: CLAUDE_WEB_SEARCH_MAX_USES,
+                allowed_domains: CLAUDE_WEB_SEARCH_ALLOWED_DOMAINS,
+            }]
             : undefined;
 
         if (this.webSearchEnabled) {
@@ -163,19 +202,27 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             await handleLLMErrorResponse(response, 'Claude');
         }
 
-        const data = await response.json() as {
-            content: ClaudeContentBlock[];
-            usage: { input_tokens: number; output_tokens: number; server_tool_use?: { web_search_requests?: number } };
-            stop_reason?: string;
-        };
+        let data = await response.json() as ClaudeAPIResponse;
+
+        // Handle pause_turn continuations for web search (shared helper)
+        const { allContentBlocks, totalInputTokens, totalOutputTokens, continuationsUsed } =
+            await this.handlePauseTurn({
+                data,
+                userPrompt,
+                systemPrompt: request.systemPrompt!,
+                maxTokens: estimatedOutputTokens,
+                tools,
+                signal,
+                label: chunkLabel ?? 'chunk',
+            });
 
         // When web search is active, response contains multiple content blocks
         // (text, server_tool_use, web_search_tool_result). Extract text content.
         let content: string;
         if (this.webSearchEnabled) {
-            content = extractClaudeTextContent(data.content);
+            content = extractClaudeTextContent(allContentBlocks);
         } else {
-            content = data.content.find(c => c.type === 'text')?.text ?? '';
+            content = allContentBlocks.find(c => c.type === 'text')?.text ?? '';
         }
 
         if (data.stop_reason === 'max_tokens') {
@@ -183,9 +230,9 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         }
 
         const usage: TokenUsage = {
-            inputTokens: data.usage.input_tokens,
-            outputTokens: data.usage.output_tokens,
-            totalTokens: data.usage.input_tokens + data.usage.output_tokens,
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+            totalTokens: totalInputTokens + totalOutputTokens,
         };
 
         // Release unused tokens to rate limiter
@@ -196,7 +243,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             });
         }
 
-        // Record actual cost
+        // Record actual cost (covers initial + all continuations)
         if (this.costBreaker) {
             const actualCost = (this.costBreaker.constructor as any).estimateCost(
                 'claude',
@@ -206,9 +253,9 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             await this.costBreaker.recordCost(actualCost);
         }
 
-        // Extract web search metadata if active
+        // Extract web search metadata from ALL content blocks (including continuations)
         const webSearchMetadata = this.webSearchEnabled
-            ? extractClaudeSearchMetadata(data.content)
+            ? extractClaudeSearchMetadata(allContentBlocks)
             : undefined;
 
         if (webSearchMetadata && webSearchMetadata.searchRequestCount > 0) {
@@ -216,6 +263,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                 chunkLabel,
                 searchQueries: webSearchMetadata.searchQueries,
                 sourcesCount: webSearchMetadata.sources.length,
+                continuationsUsed,
             });
         }
 
@@ -225,10 +273,127 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             outputTokens: usage.outputTokens,
             chunkLabel,
             webSearchUsed: data.usage.server_tool_use?.web_search_requests ?? 0,
+            continuationsUsed,
         });
 
         return { content, usage, webSearchMetadata };
     }
+
+    // ---------------------------------------------------------------------------
+    // Shared pause_turn continuation handler (P0-2, P0-5)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Handle Claude's pause_turn stop reason during web search.
+     *
+     * When Claude returns pause_turn, it needs more turns to complete its search.
+     * This method sends the assistant's response back and asks it to continue,
+     * up to CLAUDE_MAX_SEARCH_CONTINUATIONS times.
+     *
+     * Safety guarantees:
+     * - Each continuation checks costBreaker before proceeding (P0-5)
+     * - Tracks total subrequests consumed for budget accounting (P0-2)
+     * - Breaks on HTTP errors without failing the entire review
+     */
+    private async handlePauseTurn(params: PauseTurnParams): Promise<PauseTurnResult> {
+        const { data, userPrompt, systemPrompt, maxTokens, tools, signal, label } = params;
+
+        const allContentBlocks = [...data.content];
+        let totalInputTokens = data.usage.input_tokens;
+        let totalOutputTokens = data.usage.output_tokens;
+        let continuationsUsed = 0;
+
+        if (!this.webSearchEnabled || data.stop_reason !== 'pause_turn') {
+            return { allContentBlocks, totalInputTokens, totalOutputTokens, continuationsUsed };
+        }
+
+        let currentData = data;
+        const conversationMessages: unknown[] = [
+            { role: 'user', content: userPrompt },
+            { role: 'assistant', content: data.content },
+        ];
+
+        while (currentData.stop_reason === 'pause_turn' && continuationsUsed < CLAUDE_MAX_SEARCH_CONTINUATIONS) {
+            continuationsUsed++;
+
+            // P0-5: Check cost breaker before each continuation to prevent cost overruns
+            if (this.costBreaker) {
+                const continuationEstimate = (this.costBreaker.constructor as any).estimateCost(
+                    'claude',
+                    totalInputTokens, // Growing with conversation history
+                    maxTokens
+                );
+                const budgetCheck = await this.costBreaker.checkBudget(continuationEstimate);
+                if (!budgetCheck.allowed) {
+                    logger.warn('Cost budget exceeded during pause_turn continuation, stopping', {
+                        label,
+                        continuation: continuationsUsed,
+                        reason: budgetCheck.reason,
+                    });
+                    break;
+                }
+            }
+
+            logger.debug('Claude pause_turn detected, continuing search', {
+                label,
+                continuation: continuationsUsed,
+                maxContinuations: CLAUDE_MAX_SEARCH_CONTINUATIONS,
+            });
+
+            // Add a user turn to prompt continuation
+            conversationMessages.push({ role: 'user', content: 'Continue your analysis.' });
+
+            const contResponse = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                    'x-api-key': this.config.apiKey,
+                    'anthropic-version': '2023-06-01',
+                    'content-type': 'application/json',
+                },
+                body: JSON.stringify({
+                    model: this.model,
+                    max_tokens: maxTokens,
+                    temperature: this.temperature,
+                    system: systemPrompt,
+                    messages: conversationMessages,
+                    ...(tools ? { tools } : {}),
+                }),
+                signal,
+            });
+
+            if (!contResponse.ok) {
+                logger.warn('Claude pause_turn continuation HTTP error, stopping', {
+                    label,
+                    status: contResponse.status,
+                    continuation: continuationsUsed,
+                });
+                break; // Don't fail the whole review on continuation errors
+            }
+
+            currentData = await contResponse.json() as ClaudeAPIResponse;
+            allContentBlocks.push(...currentData.content);
+            totalInputTokens += currentData.usage.input_tokens;
+            totalOutputTokens += currentData.usage.output_tokens;
+
+            // Add the assistant's response for the next turn
+            conversationMessages.push({ role: 'assistant', content: currentData.content });
+        }
+
+        if (continuationsUsed > 0) {
+            logger.info('Claude pause_turn continuations completed', {
+                label,
+                continuationsUsed,
+                finalStopReason: currentData.stop_reason,
+                totalContentBlocks: allContentBlocks.length,
+            });
+        }
+
+        return { allContentBlocks, totalInputTokens, totalOutputTokens, continuationsUsed };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 2: Synthesis
+    // ---------------------------------------------------------------------------
 
     async synthesize(request: SynthesisRequest, signal?: AbortSignal): Promise<LLMResponse> {
         if (!request.systemPrompt) {
@@ -264,10 +429,14 @@ ${payload}`;
         }
 
         // Check cost budget if available
+        // P1-3: Apply search token budget multiplier when web search is active
         if (this.costBreaker) {
+            const adjustedInputTokens = this.webSearchEnabled
+                ? Math.ceil(estimatedInputTokens * SEARCH_TOKEN_BUDGET_MULTIPLIER)
+                : estimatedInputTokens;
             const estimatedCost = (this.costBreaker.constructor as any).estimateCost(
                 'claude',
-                estimatedInputTokens,
+                adjustedInputTokens,
                 estimatedOutputTokens
             );
 
@@ -279,7 +448,12 @@ ${payload}`;
 
         // Build tools array — conditionally include web_search server tool
         const synthTools: unknown[] | undefined = this.webSearchEnabled
-            ? [{ type: CLAUDE_WEB_SEARCH_TOOL_VERSION, name: 'web_search', max_uses: CLAUDE_WEB_SEARCH_MAX_USES }]
+            ? [{
+                type: CLAUDE_WEB_SEARCH_TOOL_VERSION,
+                name: 'web_search',
+                max_uses: CLAUDE_WEB_SEARCH_MAX_USES,
+                allowed_domains: CLAUDE_WEB_SEARCH_ALLOWED_DOMAINS,
+            }]
             : undefined;
 
         if (this.webSearchEnabled) {
@@ -312,18 +486,26 @@ ${payload}`;
             await handleLLMErrorResponse(response, 'Claude');
         }
 
-        const data = await response.json() as {
-            content: ClaudeContentBlock[];
-            usage: { input_tokens: number; output_tokens: number; server_tool_use?: { web_search_requests?: number } };
-            stop_reason?: string;
-        };
+        let data = await response.json() as ClaudeAPIResponse;
+
+        // P1-4: Handle pause_turn for synthesis (same as reviewChunk)
+        const { allContentBlocks, totalInputTokens, totalOutputTokens, continuationsUsed } =
+            await this.handlePauseTurn({
+                data,
+                userPrompt,
+                systemPrompt: request.systemPrompt!,
+                maxTokens: outputBudget,
+                tools: synthTools,
+                signal,
+                label: 'synthesis',
+            });
 
         // When web search is active, response contains multiple content blocks.
         let content: string;
         if (this.webSearchEnabled) {
-            content = extractClaudeTextContent(data.content);
+            content = extractClaudeTextContent(allContentBlocks);
         } else {
-            content = data.content.find(c => c.type === 'text')?.text ?? '';
+            content = allContentBlocks.find(c => c.type === 'text')?.text ?? '';
         }
 
         if (data.stop_reason === 'max_tokens') {
@@ -333,9 +515,9 @@ ${payload}`;
         }
 
         const usage: TokenUsage = {
-            inputTokens: data.usage.input_tokens,
-            outputTokens: data.usage.output_tokens,
-            totalTokens: data.usage.input_tokens + data.usage.output_tokens,
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+            totalTokens: totalInputTokens + totalOutputTokens,
         };
 
         // Release unused tokens to rate limiter
@@ -356,15 +538,16 @@ ${payload}`;
             await this.costBreaker.recordCost(actualCost);
         }
 
-        // Extract web search metadata if active
+        // Extract web search metadata from ALL content blocks (including continuations)
         const synthWebSearchMetadata = this.webSearchEnabled
-            ? extractClaudeSearchMetadata(data.content)
+            ? extractClaudeSearchMetadata(allContentBlocks)
             : undefined;
 
         if (synthWebSearchMetadata && synthWebSearchMetadata.searchRequestCount > 0) {
             logger.info('Claude used web search for synthesis', {
                 searchQueries: synthWebSearchMetadata.searchQueries,
                 sourcesCount: synthWebSearchMetadata.sources.length,
+                continuationsUsed,
             });
         }
 
@@ -373,6 +556,7 @@ ${payload}`;
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
             webSearchUsed: data.usage.server_tool_use?.web_search_requests ?? 0,
+            continuationsUsed,
         });
 
         return { content, usage, webSearchMetadata: synthWebSearchMetadata };

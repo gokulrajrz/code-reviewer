@@ -286,13 +286,13 @@ ${customRules}
 `.trim());
     }
 
-    // ── Always include OUTPUT FORMAT last ──
-    sections.push(OUTPUT_FORMAT_PROMPT);
-
-    // ── Web search module (after output format, instructs LLM to use search) ──
+    // ── Web search module (BEFORE output format so model integrates search into reasoning) ──
     if (webSearchEnabled) {
         sections.push(WEB_SEARCH_PROMPT);
     }
+
+    // ── Always include OUTPUT FORMAT last ──
+    sections.push(OUTPUT_FORMAT_PROMPT);
 
     return sections.join(SECTION_SEPARATOR);
 }

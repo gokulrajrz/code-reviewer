@@ -30,7 +30,15 @@ import { detectTechStack } from '../lib/stack-detector';
 import { composeChunkPrompt, composeSynthesizerPrompt } from '../config/prompts/composer';
 import { fetchRepoConfig, applyConfigOverrides, buildCustomRulesPrompt, shouldIgnore } from '../lib/repo-config';
 import type { TechStackProfile } from '../types/stack';
-import { isWebSearchEnabled, formatSearchSources, type WebSearchMetadata } from '../lib/web-search';
+import {
+    isWebSearchEnabled,
+    shouldEnableWebSearch,
+    formatSearchSources,
+    getCachedSearchSources,
+    cacheSearchSources,
+    formatCachedSourcesContext,
+    type WebSearchMetadata,
+} from '../lib/web-search';
 
 /** Maximum time (ms) to wait for a single LLM call before aborting.
  * Increased to 5 minutes to accommodate rate limit (HTTP 429) retry-after sleep intervals. */
@@ -620,9 +628,35 @@ async function processMessage(
         // ══════════════════════════════════════════════════════════════
         // Step 5: MAP PHASE — Review each chunk, collect JSON findings
         // ══════════════════════════════════════════════════════════════
+
+        // ── Smart web search gating ──
+        // Decide ONCE per PR whether search is warranted based on file composition.
+        // Skips search for docs-only, config-only, and assets-only PRs.
+        const webSearchActive = shouldEnableWebSearch(reviewableFiles, env);
+        let cachedSourcesContext = '';
+
+        if (webSearchActive) {
+            // Fetch cached sources from previous reviews of this repo
+            const cachedSources = await getCachedSearchSources(repoFullName, env.CACHE_KV);
+            cachedSourcesContext = formatCachedSourcesContext(cachedSources);
+
+            logger.info('Web search enabled for this PR', {
+                prNumber,
+                cachedSourcesCount: cachedSources.length,
+                reason: 'PR contains reviewable source code',
+            });
+        } else if (isWebSearchEnabled(env)) {
+            // Search is globally enabled but gated off for this PR
+            logger.info('Web search skipped for this PR (smart gating)', {
+                prNumber,
+                reason: 'PR contains only docs, config, or non-source files',
+            });
+        }
+
         logger.info('Starting MAP phase', {
             prNumber,
             chunkCount: chunks.length,
+            webSearchActive,
         });
 
         const allFindings: ReviewFinding[] = [...pluginFindings];
@@ -676,8 +710,12 @@ async function processMessage(
 
                 // Per-chunk prompt composition: only include rules relevant to THIS chunk's files
                 const chunkFiles = chunkFileMap[i] || [];
-                const webSearchEnabled = isWebSearchEnabled(env);
-                const chunkSystemPrompt = composeChunkPrompt(activeProfile, chunkFiles, customRulesPrompt, webSearchEnabled);
+                let chunkSystemPrompt = composeChunkPrompt(activeProfile, chunkFiles, customRulesPrompt, webSearchActive);
+
+                // Inject cached search sources as context to reduce redundant searches
+                if (webSearchActive && cachedSourcesContext) {
+                    chunkSystemPrompt += '\n\n' + cachedSourcesContext;
+                }
 
                 // Prepend PR description for intent context (if available)
                 const prContext = prDescription
@@ -697,7 +735,7 @@ async function processMessage(
                 try {
                     const result = await withTimeout(
                         (signal) => callChunkReview(
-                            prContext + chunkContent, title, chunkLabel, env, signal, chunkSystemPrompt, reviewableFiles
+                            prContext + chunkContent, title, chunkLabel, env, signal, chunkSystemPrompt, reviewableFiles, webSearchActive
                         ),
                         LLM_TIMEOUT_MS,
                         `Chunk ${chunkLabel}`
@@ -735,7 +773,7 @@ async function processMessage(
                             try {
                                 const result = await withTimeout(
                                     (signal) => callChunkReview(
-                                        prContext + chunkContent, title, chunkLabel, fallbackEnv, signal, chunkSystemPrompt, reviewableFiles
+                                        prContext + chunkContent, title, chunkLabel, fallbackEnv, signal, chunkSystemPrompt, reviewableFiles, webSearchActive
                                     ),
                                     LLM_TIMEOUT_MS,
                                     `Chunk ${chunkLabel} (fallback:${altProvider})`
@@ -978,13 +1016,12 @@ async function processMessage(
 
             try {
                 // Compose synthesizer prompt based on detected stack
-                const webSearchEnabled = isWebSearchEnabled(env);
-                const synthesizerSystemPrompt = composeSynthesizerPrompt(activeProfile, webSearchEnabled);
+                const synthesizerSystemPrompt = composeSynthesizerPrompt(activeProfile, webSearchActive);
 
                 // Tiered fallback: primary → alternate → formatter
                 const result = await withTimeout(
                     (signal) => callSynthesizer(
-                        synthesizerPayload, env, signal, synthesizerSystemPrompt, dynamicMaxTokens
+                        synthesizerPayload, env, signal, synthesizerSystemPrompt, dynamicMaxTokens, webSearchActive
                     ),
                     LLM_TIMEOUT_MS,
                     'Synthesizer'
@@ -1058,7 +1095,7 @@ async function processMessage(
         }
 
         // ── Append web search sources section ──
-        if (isWebSearchEnabled(env)) {
+        if (webSearchActive) {
             // Collect all web search metadata from chunk results
             const allWebSearchSources: WebSearchMetadata = {
                 searchQueries: [],
@@ -1083,6 +1120,12 @@ async function processMessage(
                     totalSearches: allWebSearchSources.searchRequestCount,
                     totalSources: allWebSearchSources.sources.length,
                 });
+            }
+
+            // Cache discovered sources in KV for future PRs (non-blocking)
+            if (allWebSearchSources.sources.length > 0) {
+                cacheSearchSources(repoFullName, allWebSearchSources.sources, env.CACHE_KV)
+                    .catch(e => logger.warn('Failed to cache search sources', { error: String(e) }));
             }
         }
 

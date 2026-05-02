@@ -6,7 +6,7 @@ import type { TokenUsage } from '../../../types/usage';
 import { DistributedRateLimiter } from '../distributed-rate-limiter';
 import { CostCircuitBreaker } from '../../cost-circuit-breaker';
 import type { Env } from '../../../types/env';
-import { extractGeminiGroundingMetadata, type GeminiGroundingMetadata } from '../../web-search';
+import { extractGeminiGroundingMetadata, type GeminiGroundingMetadata, SEARCH_TOKEN_BUDGET_MULTIPLIER } from '../../web-search';
 
 /**
  * Google Gemini LLM Provider Adapter
@@ -111,10 +111,14 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         }
 
         // Check cost budget if available
+        // When web search is active, inflate estimates to account for search result tokens
         if (this.costBreaker) {
+            const adjustedInputTokens = this.webSearchEnabled
+                ? Math.ceil(estimatedInputTokens * SEARCH_TOKEN_BUDGET_MULTIPLIER)
+                : estimatedInputTokens;
             const estimatedCost = (this.costBreaker.constructor as any).estimateCost(
                 'gemini',
-                estimatedInputTokens,
+                adjustedInputTokens,
                 estimatedOutputTokens
             );
 
@@ -125,6 +129,17 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         }
 
         // Build request body — conditionally add google_search grounding tool
+        // IMPORTANT: When web search is enabled, we CANNOT use responseMimeType: 'application/json'
+        // because the JSON constraint prevents the model from using the google_search tool.
+        // Without it, the model produces JSON naturally and parseFindings handles extraction.
+        const generationConfig: Record<string, unknown> = {
+            maxOutputTokens: estimatedOutputTokens,
+            temperature: this.temperature,
+        };
+        if (!this.webSearchEnabled) {
+            generationConfig.responseMimeType = 'application/json';
+        }
+
         const requestBody: Record<string, unknown> = {
             systemInstruction: {
                 parts: [{ text: request.systemPrompt }],
@@ -132,16 +147,12 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             contents: [
                 { role: 'user', parts: [{ text: userPrompt }] },
             ],
-            generationConfig: {
-                maxOutputTokens: estimatedOutputTokens,
-                temperature: this.temperature,
-                responseMimeType: 'application/json',
-            },
+            generationConfig,
         };
 
         if (this.webSearchEnabled) {
             requestBody.tools = [{ google_search: {} }];
-            logger.debug('Gemini web search grounding enabled for chunk review', { chunkLabel });
+            logger.debug('Gemini web search grounding enabled for chunk review (responseMimeType disabled for tool compatibility)', { chunkLabel });
         }
 
         // Use x-goog-api-key header instead of URL query param to avoid key in logs
@@ -263,10 +274,14 @@ ${payload}`;
         }
 
         // Check cost budget if available
+        // P1-3: Apply search token budget multiplier when web search is active
         if (this.costBreaker) {
+            const adjustedInputTokens = this.webSearchEnabled
+                ? Math.ceil(estimatedInputTokens * SEARCH_TOKEN_BUDGET_MULTIPLIER)
+                : estimatedInputTokens;
             const estimatedCost = (this.costBreaker.constructor as any).estimateCost(
                 'gemini',
-                estimatedInputTokens,
+                adjustedInputTokens,
                 estimatedOutputTokens
             );
 

@@ -13,7 +13,9 @@ export const MAX_CHUNK_CHARS = 100_000;
 /**
  * Hard limit on how many LLM chunks to process to prevent hitting 
  * the Cloudflare Worker subrequests limit. 
- * Increased from 10 to 50 on Paid Plan (1000 subrequests ceiling).
+ * Workers Paid Plan: 10,000 default (configurable up to 10M via wrangler.jsonc).
+ * Workers Free Plan: 50 external subrequests.
+ * Note: with web search continuations, each chunk may consume up to 3 subrequests.
  */
 export const MAX_LLM_CHUNKS = 50;
 

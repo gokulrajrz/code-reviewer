@@ -6,7 +6,7 @@ import { parseFindings } from './parse-findings';
 import { retryWithBackoff, circuitBreakers } from '../retry';
 import { RateLimitError } from '../errors';
 import { logger } from '../logger';
-import { isWebSearchEnabled, type WebSearchMetadata } from '../web-search';
+import { type WebSearchMetadata } from '../web-search';
 
 // Import adapters (registers them with the factory)
 import './adapters/claude';
@@ -69,7 +69,8 @@ export async function callChunkReview(
     env: Env,
     signal?: AbortSignal,
     systemPrompt?: string,
-    changedFiles?: string[]
+    changedFiles?: string[],
+    webSearchEnabled?: boolean
 ): Promise<ChunkReviewResult> {
     const provider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
@@ -81,7 +82,7 @@ export async function callChunkReview(
 
     const config: LLMProviderConfig = {
         apiKey: getApiKey(provider, env),
-        webSearchEnabled: isWebSearchEnabled(env),
+        webSearchEnabled: webSearchEnabled ?? false,
     };
     const adapter = LLMProviderFactory.createProvider(provider, config);
 
@@ -153,14 +154,15 @@ export async function callSynthesizer(
     env: Env,
     signal?: AbortSignal,
     systemPrompt?: string,
-    maxTokens?: number
+    maxTokens?: number,
+    webSearchEnabled?: boolean
 ): Promise<SynthesisResult> {
     const primaryProvider: AIProvider = (env.AI_PROVIDER ?? DEFAULT_AI_PROVIDER) as AIProvider;
 
     // Try primary provider first
     try {
         return await callSynthesizerWithProvider(
-            primaryProvider, synthesizerPayload, env, signal, systemPrompt, maxTokens
+            primaryProvider, synthesizerPayload, env, signal, systemPrompt, maxTokens, webSearchEnabled
         );
     } catch (primaryError) {
         const errMsg = primaryError instanceof Error ? primaryError.message : String(primaryError);
@@ -174,7 +176,7 @@ export async function callSynthesizer(
             try {
                 logger.info(`Falling back to alternate synthesizer: ${altProvider}`);
                 return await callSynthesizerWithProvider(
-                    altProvider, synthesizerPayload, env, signal, systemPrompt, maxTokens
+                    altProvider, synthesizerPayload, env, signal, systemPrompt, maxTokens, webSearchEnabled
                 );
             } catch (altError) {
                 const altErrMsg = altError instanceof Error ? altError.message : String(altError);
@@ -201,7 +203,8 @@ async function callSynthesizerWithProvider(
     env: Env,
     signal?: AbortSignal,
     systemPrompt?: string,
-    maxTokens?: number
+    maxTokens?: number,
+    webSearchEnabled?: boolean
 ): Promise<SynthesisResult> {
     const breaker = getSynthBreaker(provider);
     if (!breaker.canExecute()) {
@@ -210,7 +213,7 @@ async function callSynthesizerWithProvider(
 
     const config: LLMProviderConfig = {
         apiKey: getApiKey(provider, env),
-        webSearchEnabled: isWebSearchEnabled(env),
+        webSearchEnabled: webSearchEnabled ?? false,
     };
     const adapter = LLMProviderFactory.createProvider(provider, config);
 
