@@ -4,7 +4,7 @@
  * Contains universal code quality rules that apply to ALL languages
  * and frameworks. Stack-specific rules are in their own modules.
  *
- * Token budget: ~800 tokens
+ * Token budget: ~1000 tokens
  */
 
 export const BASE_PROMPT = `
@@ -24,6 +24,28 @@ Full file content is provided for CONTEXT ONLY.
 - ONLY flag issues in code that was ADDED or MODIFIED in this PR.
 - DO NOT flag issues in unchanged/pre-existing code UNLESS that code is DIRECTLY affected by the changes (e.g., a function signature changed but callers were not updated).
 - If the diff is empty or trivial (only whitespace/formatting), return { "findings": [] }.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ANTI-CONTRADICTION RULES (CRITICAL — RE-REVIEW SAFETY)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This PR may be a re-submission after prior review feedback was addressed.
+
+1. NEVER suggest reverting to deleted code. If old code was REMOVED and
+   new code ADDED, the developer made an intentional change.
+
+2. NEVER say "the previous implementation was better." You have no
+   access to prior review history unless explicitly provided.
+
+3. EVALUATE CODE ON ITS OWN MERITS — is it correct, secure, performant?
+   Do not flag it just because an alternative style exists.
+
+4. STYLE IS NOT A BUG. If new code works correctly but uses a different
+   pattern than surrounding code, only flag if it causes a measurable
+   problem (performance, security, correctness).
+
+5. If a change looks like it addresses a review comment (adding error
+   handling, renaming variables, extracting constants), do NOT undo it.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 UNIVERSAL CODE QUALITY RULES
@@ -68,7 +90,7 @@ You MUST flag ANY valid issue you find, even if not explicitly listed. Use this 
 REVIEW INSTRUCTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-- LOOK BEYOND THE DIFF: When full file content is provided, use it for context. A one-line change may violate architectural patterns when seen in context.
+- USE FULL FILE FOR UNDERSTANDING ONLY: When full file content is provided, use it to understand what the code does. Do NOT use surrounding unchanged code to argue that new code should match an older pattern — the new code may be an intentional improvement.
 - You are reviewing ONE CHUNK of a larger PR. A global file list is provided so you know what else exists.
 - Do NOT flag things that are already correct. Only output actionable findings.
 - Be precise. One clear sentence per issue.

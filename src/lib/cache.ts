@@ -165,11 +165,12 @@ export async function cachedGitHubFetch<T>(
     init: RequestInit,
     cacheConfig: CacheConfig,
     fetchFn: (url: string, init: RequestInit) => Promise<Response>,
-    responseType: 'json' | 'text' = 'json'
+    responseType: 'json' | 'text' = 'json',
+    cacheContext?: string  // Optional context (e.g. headSha) for cache key differentiation
 ): Promise<T> {
     const cacheKey = generateCacheKey(
         inferCacheType(url),
-        `${init.method || 'GET'}:${url}`
+        `${init.method || 'GET'}:${url}${cacheContext ? `:${cacheContext}` : ''}`
     );
 
     // Try cache first

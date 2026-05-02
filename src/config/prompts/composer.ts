@@ -303,7 +303,7 @@ ${customRules}
  * Dynamically includes/excludes FSD compliance section based on profile.
  * Verdict is pre-computed and injected — the LLM formats but doesn't decide.
  */
-export function composeSynthesizerPrompt(profile: TechStackProfile, webSearchEnabled?: boolean): string {
+export function composeSynthesizerPrompt(profile: TechStackProfile, webSearchEnabled?: boolean, previousReviewContext?: string): string {
     const hasFsd = profile.architecture.includes('fsd');
     const stackSummary = buildStackSummaryLine(profile);
 
@@ -412,6 +412,7 @@ For **MEDIUM** and **LOW** severity findings, compress to dense bullet points (N
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${previousReviewContext ? `\n${previousReviewContext}\n` : ''}
 
 - DO NOT output empty severity sections. Skip sections with 0 findings.
 - The payload has N findings. Your output MUST NOT EXCEED N items. You MAY dismiss findings that are false positives or duplicates — add a brief "(Dismissed: reason)" note inline.

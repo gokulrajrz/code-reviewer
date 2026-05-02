@@ -83,7 +83,8 @@ export async function fetchChangedFiles(
     repoFullName: string,
     prNumber: number,
     token: string,
-    env: Env
+    env: Env,
+    headSha?: string
 ): Promise<GitHubPRFile[]> {
     // Check circuit breaker before attempting
     if (!circuitBreakers.github.canExecute()) {
@@ -102,8 +103,10 @@ export async function fetchChangedFiles(
                 env,
                 url,
                 { headers: githubHeaders(token) },
-                { ttlSeconds: CACHE_TTLS.PR_FILES, staleWhileRevalidate: true },
-                async (u, i) => fetch(u, i)
+                { ttlSeconds: CACHE_TTLS.PR_FILES, staleWhileRevalidate: false },
+                async (u, i) => fetch(u, i),
+                'json',
+                headSha  // SHA-keyed cache: different commits produce different cache keys
             );
 
             if (files.length === 0) break; // No more pages

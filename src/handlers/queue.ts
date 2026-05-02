@@ -29,6 +29,8 @@ import { formatFindingsAsMarkdown } from '../lib/review-formatter';
 import { detectTechStack } from '../lib/stack-detector';
 import { composeChunkPrompt, composeSynthesizerPrompt } from '../config/prompts/composer';
 import { fetchRepoConfig, applyConfigOverrides, buildCustomRulesPrompt, shouldIgnore } from '../lib/repo-config';
+import { fetchPreviousReviewFindings, formatPreviousReviewContext, type PreviousReviewSummary } from '../lib/previous-review';
+import { filterPreviouslyRaisedFindings } from '../lib/review-delta';
 import type { TechStackProfile } from '../types/stack';
 import {
     isWebSearchEnabled,
@@ -477,14 +479,14 @@ async function processMessage(
     logger.info('Fetching changed files', { prNumber });
     let allFiles;
     try {
-        allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+        allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env, headSha);
     } catch (fetchError) {
         const errMsg = fetchError instanceof Error ? fetchError.message : String(fetchError);
         if (errMsg.includes('401')) {
             logger.warn('GitHub API returned 401, retrying token', { prNumber });
             await invalidateInstallationToken(env);
             token = await getInstallationToken(env);
-            allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env);
+            allFiles = await fetchChangedFiles(repoFullName, prNumber, token, env, headSha);
         } else {
             throw fetchError;
         }
@@ -538,6 +540,20 @@ async function processMessage(
         if (checkRunId) await updateCheckRun(repoFullName, checkRunId, token, 'neutral', `## All Files Ignored\n\nAll ${allFiles.length} files are ignored by \`.codereview.yml\`.`);
         message.ack();
         return;
+    }
+
+    // ── Fetch previous review context (anti-circular review) ──
+    const previousReview: PreviousReviewSummary = await fetchPreviousReviewFindings(
+        repoFullName, prNumber, token
+    );
+
+    if (previousReview.reviewCount > 0) {
+        logger.info('Previous review context loaded', {
+            prNumber,
+            reviewCount: previousReview.reviewCount,
+            findingsCount: previousReview.findings.length,
+            lastVerdict: previousReview.lastVerdict,
+        });
     }
 
     // ── Container Pre-processing (AST/SAST) ──
@@ -717,6 +733,16 @@ async function processMessage(
                     chunkSystemPrompt += '\n\n' + cachedSourcesContext;
                 }
 
+                // Inject chunk-scoped previous review context (anti-circular review)
+                if (previousReview.findings.length > 0) {
+                    const chunkPreviousContext = formatPreviousReviewContext(
+                        previousReview, chunkFiles
+                    );
+                    if (chunkPreviousContext) {
+                        chunkSystemPrompt += '\n\n' + chunkPreviousContext;
+                    }
+                }
+
                 // Prepend PR description for intent context (if available)
                 const prContext = prDescription
                     ? `PR Description:\n${prDescription}\n\n`
@@ -891,12 +917,31 @@ async function processMessage(
         }
 
         // ══════════════════════════════════════════════════════════════
+        // Step 6.5: Filter previously-raised findings (anti-circular review)
+        // ══════════════════════════════════════════════════════════════
+        const modifiedFileSet = new Set([
+            ...classified.tier1.map(f => f.filename),
+            ...classified.tier2.map(f => f.filename),
+        ]);
+
+        const { filtered: deltaFiltered, suppressed: suppressedCount } =
+            filterPreviouslyRaisedFindings(deduplicated, previousReview, modifiedFileSet);
+
+        if (suppressedCount > 0) {
+            logger.info('Delta filter suppressed previously-raised findings', {
+                prNumber,
+                suppressed: suppressedCount,
+                remaining: deltaFiltered.length,
+            });
+        }
+
+        // ══════════════════════════════════════════════════════════════
         // Step 7: Cluster findings (category, similarity)
         // ══════════════════════════════════════════════════════════════
-        const clusters = clusterFindings(deduplicated);
+        const clusters = clusterFindings(deltaFiltered);
         logger.info('Clustered findings', {
             prNumber,
-            findingsCount: deduplicated.length,
+            findingsCount: deltaFiltered.length,
             clusterCount: clusters.length,
         });
 
@@ -906,13 +951,13 @@ async function processMessage(
         const allChunksFailed = failedChunks === chunks.length && chunks.length > 0;
 
         // Derive verdict from data BEFORE synthesis — this is deterministic
-        const verdict = deriveVerdict(deduplicated, allChunksFailed);
+        const verdict = deriveVerdict(deltaFiltered, allChunksFailed);
         const conclusion = verdictToConclusion(verdict);
-        const severityCounts = countBySeverity(deduplicated);
+        const severityCounts = countBySeverity(deltaFiltered);
 
         logger.info('Starting REDUCE phase', {
             prNumber,
-            findingsCount: deduplicated.length,
+            findingsCount: deltaFiltered.length,
             clusterCount: clusters.length,
             verdict,
         });
@@ -921,7 +966,7 @@ async function processMessage(
         let isFallback = false;
 
         // Guard: all chunks failed with no findings → skip synthesizer entirely
-        if (allChunksFailed && deduplicated.length === 0) {
+        if (allChunksFailed && deltaFiltered.length === 0) {
             logger.warn('All chunks failed with no findings, using error review', {
                 prNumber,
                 errors: chunkErrors,
@@ -951,9 +996,9 @@ async function processMessage(
                 `> - Check Cloudflare Worker logs for detailed stack traces\n` +
                 `> - You can trigger another review by closing and reopening this PR.\n\n` +
                 `Overall verdict: **Request Changes**`;
-        } else if (deduplicated.length === 0) {
+        } else if (deltaFiltered.length === 0) {
             // No findings from successful chunks — clean approval, skip LLM call
-            logger.info('Zero findings from successful chunks, producing direct approval', { prNumber });
+            logger.info('Zero findings from successful chunks, producing direct approval', { prNumber, suppressedCount });
             finalReview = formatFindingsAsMarkdown(clusters, {
                 allFiles: reviewableFiles,
                 prTitle: title,
@@ -963,6 +1008,13 @@ async function processMessage(
                 failedChunkFiles,
                 isFallback: false,
             });
+
+            // Acknowledge resolved findings when this is a re-review
+            if (suppressedCount > 0) {
+                const reReviewNote =
+                    `> ♻️ **Re-review:** All ${suppressedCount} previously-flagged issue(s) appear to be resolved. Nice work!\n\n`;
+                finalReview = reReviewNote + finalReview;
+            }
         } else if (chunkConfig.skipSynthesis) {
             // Service level degradation: skip synthesis, use formatter
             logger.warn('Service level degradation: skipping synthesis', {
@@ -1016,7 +1068,8 @@ async function processMessage(
 
             try {
                 // Compose synthesizer prompt based on detected stack
-                const synthesizerSystemPrompt = composeSynthesizerPrompt(activeProfile, webSearchActive);
+                const synthPreviousContext = formatPreviousReviewContext(previousReview);
+                const synthesizerSystemPrompt = composeSynthesizerPrompt(activeProfile, webSearchActive, synthPreviousContext);
 
                 // Tiered fallback: primary → alternate → formatter
                 const result = await withTimeout(
@@ -1083,12 +1136,17 @@ async function processMessage(
         if ((chunks.length > 1 || failedChunks > 0) && !isFallback) {
             let banner = `> ℹ️ **Review Pipeline:** ${chunks.length} chunks processed` +
                 `${failedChunks > 0 ? ` (${failedChunks} failed)` : ''}, ` +
-                `${deduplicated.length} findings in ${clusters.length} clusters from ` +
+                `${deltaFiltered.length} findings in ${clusters.length} clusters from ` +
                 `${classified.tier1.length} full-context + ${classified.tier2.length} diff-only files.\n\n`;
 
             // Surface chunk failure reasons in partial failure cases
             if (failedChunks > 0 && chunkErrors.length > 0) {
                 banner += `> ⚠️ **Failed chunk errors:** ${chunkErrors.map(e => `\`${e}\``).join(', ')}\n\n`;
+            }
+
+            // Surface delta filter suppressions for transparency
+            if (suppressedCount > 0) {
+                banner += `> ♻️ **Re-review:** ${suppressedCount} previously-addressed finding(s) suppressed.\n\n`;
             }
 
             finalReview = banner + finalReview;
@@ -1148,7 +1206,7 @@ async function processMessage(
         }
 
         // Only inline critical and high severity findings with valid file+line
-        for (const finding of deduplicated) {
+        for (const finding of deltaFiltered) {
             if (
                 (finding.severity === 'critical' || finding.severity === 'high') &&
                 finding.file &&
