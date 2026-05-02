@@ -6,6 +6,7 @@ import { parseFindings } from './parse-findings';
 import { retryWithBackoff, circuitBreakers } from '../retry';
 import { RateLimitError } from '../errors';
 import { logger } from '../logger';
+import { isWebSearchEnabled, type WebSearchMetadata } from '../web-search';
 
 // Import adapters (registers them with the factory)
 import './adapters/claude';
@@ -50,6 +51,8 @@ function isAlternateAvailable(provider: AIProvider, env: Env): boolean {
 export interface ChunkReviewResult {
     findings: ReviewFinding[];
     usage: TokenUsage;
+    /** Web search metadata when grounding was active. */
+    webSearchMetadata?: WebSearchMetadata;
 }
 
 /**
@@ -78,6 +81,7 @@ export async function callChunkReview(
 
     const config: LLMProviderConfig = {
         apiKey: getApiKey(provider, env),
+        webSearchEnabled: isWebSearchEnabled(env),
     };
     const adapter = LLMProviderFactory.createProvider(provider, config);
 
@@ -87,7 +91,7 @@ export async function callChunkReview(
             signal
         );
         const findings = parseFindings(result.content, changedFiles);
-        return { findings, usage: result.usage };
+        return { findings, usage: result.usage, webSearchMetadata: result.webSearchMetadata };
     };
 
     try {
@@ -132,6 +136,8 @@ export async function callChunkReview(
 export interface SynthesisResult {
     review: string;
     usage: TokenUsage;
+    /** Web search metadata when grounding was active. */
+    webSearchMetadata?: WebSearchMetadata;
 }
 
 /**
@@ -204,6 +210,7 @@ async function callSynthesizerWithProvider(
 
     const config: LLMProviderConfig = {
         apiKey: getApiKey(provider, env),
+        webSearchEnabled: isWebSearchEnabled(env),
     };
     const adapter = LLMProviderFactory.createProvider(provider, config);
 
@@ -212,7 +219,7 @@ async function callSynthesizerWithProvider(
             { payload: synthesizerPayload, systemPrompt, maxTokens },
             signal
         );
-        return { review: result.content, usage: result.usage };
+        return { review: result.content, usage: result.usage, webSearchMetadata: result.webSearchMetadata };
     };
 
     try {

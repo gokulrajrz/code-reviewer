@@ -30,7 +30,8 @@
 		"CLIQ_CHANNEL_ID": "prweb",
 		"CLIQ_DB_NAME": "githubusermap",
 		"DASHBOARD_USERNAME": "admin",
-		"DASHBOARD_PASSWORD": "admin123"
+		"DASHBOARD_PASSWORD": "admin123",
+		"ENABLE_WEB_SEARCH": "true"
 	},
 	/**
 	 * Queues

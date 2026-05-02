@@ -1,4 +1,5 @@
 import type { TokenUsage } from '../../types/usage';
+import type { WebSearchMetadata } from '../web-search';
 
 /**
  * LLM Provider Adapter Interface
@@ -11,11 +12,15 @@ export interface LLMProviderConfig {
     model?: string;
     maxTokens?: number;
     temperature?: number;
+    /** Enable web search grounding (Gemini: google_search, Claude: web_search). */
+    webSearchEnabled?: boolean;
 }
 
 export interface LLMResponse {
     content: string;
     usage: TokenUsage;
+    /** Web search metadata when grounding was active. */
+    webSearchMetadata?: WebSearchMetadata;
 }
 
 export interface ChunkReviewRequest {

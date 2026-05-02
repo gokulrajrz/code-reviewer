@@ -53,6 +53,8 @@ export interface Env {
   HONEYCOMB_API_KEY?: string;
   /** OpenTelemetry exporter URL (alternative to Honeycomb) */
   OTEL_EXPORTER_URL?: string;
+  /** Enable web search grounding for LLM reviews ("true" to enable). Default: "false". */
+  ENABLE_WEB_SEARCH?: string;
 
   // --- Queues ---
   /** The Queue responsible for processing reviews in the background */

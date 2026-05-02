@@ -6,6 +6,7 @@ import type { TokenUsage } from '../../../types/usage';
 import { DistributedRateLimiter } from '../distributed-rate-limiter';
 import { CostCircuitBreaker } from '../../cost-circuit-breaker';
 import type { Env } from '../../../types/env';
+import { extractGeminiGroundingMetadata, type GeminiGroundingMetadata } from '../../web-search';
 
 /**
  * Google Gemini LLM Provider Adapter
@@ -21,12 +22,14 @@ export class GeminiAdapter extends LLMProviderAdapter {
     private readonly temperature: number;
     private readonly rateLimiter?: DistributedRateLimiter;
     private readonly costBreaker?: CostCircuitBreaker;
+    private readonly webSearchEnabled: boolean;
 
     constructor(config: LLMProviderConfig) {
         super(config);
         this.model = config.model ?? MODELS.gemini;
         this.maxTokens = config.maxTokens ?? 4096;
         this.temperature = config.temperature ?? 0.1;
+        this.webSearchEnabled = config.webSearchEnabled ?? false;
         
         // Initialize rate limiter if binding available
         if ((config as any).env?.RATE_LIMITER) {
@@ -121,6 +124,26 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             }
         }
 
+        // Build request body — conditionally add google_search grounding tool
+        const requestBody: Record<string, unknown> = {
+            systemInstruction: {
+                parts: [{ text: request.systemPrompt }],
+            },
+            contents: [
+                { role: 'user', parts: [{ text: userPrompt }] },
+            ],
+            generationConfig: {
+                maxOutputTokens: estimatedOutputTokens,
+                temperature: this.temperature,
+                responseMimeType: 'application/json',
+            },
+        };
+
+        if (this.webSearchEnabled) {
+            requestBody.tools = [{ google_search: {} }];
+            logger.debug('Gemini web search grounding enabled for chunk review', { chunkLabel });
+        }
+
         // Use x-goog-api-key header instead of URL query param to avoid key in logs
         const response = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`,
@@ -130,19 +153,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                     'content-type': 'application/json',
                     'x-goog-api-key': this.config.apiKey,
                 },
-                body: JSON.stringify({
-                    systemInstruction: {
-                        parts: [{ text: request.systemPrompt }],
-                    },
-                    contents: [
-                        { role: 'user', parts: [{ text: userPrompt }] },
-                    ],
-                    generationConfig: {
-                        maxOutputTokens: estimatedOutputTokens,
-                        temperature: this.temperature,
-                        responseMimeType: 'application/json',
-                    },
-                }),
+                body: JSON.stringify(requestBody),
                 signal,
             }
         );
@@ -159,6 +170,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             candidates: Array<{
                 content: { parts: Array<{ text: string }> };
                 finishReason?: string;
+                groundingMetadata?: GeminiGroundingMetadata;
             }>;
             usageMetadata: { promptTokenCount: number; candidatesTokenCount: number };
         };
@@ -193,14 +205,28 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             await this.costBreaker.recordCost(actualCost);
         }
 
+        // Extract web search grounding metadata if available
+        const webSearchMetadata = this.webSearchEnabled
+            ? extractGeminiGroundingMetadata(data.candidates[0]?.groundingMetadata)
+            : undefined;
+
+        if (webSearchMetadata && webSearchMetadata.searchRequestCount > 0) {
+            logger.info('Gemini used web search grounding for chunk review', {
+                chunkLabel,
+                searchQueries: webSearchMetadata.searchQueries,
+                sourcesCount: webSearchMetadata.sources.length,
+            });
+        }
+
         logger.debug('Gemini chunk review completed', {
             model: this.model,
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
             chunkLabel,
+            webSearchUsed: webSearchMetadata?.searchRequestCount ?? 0,
         });
 
-        return { content, usage };
+        return { content, usage, webSearchMetadata };
     }
 
     async synthesize(request: SynthesisRequest, signal?: AbortSignal): Promise<LLMResponse> {
@@ -250,6 +276,25 @@ ${payload}`;
             }
         }
 
+        // Build request body — conditionally add google_search grounding tool
+        const synthRequestBody: Record<string, unknown> = {
+            systemInstruction: {
+                parts: [{ text: request.systemPrompt }],
+            },
+            contents: [
+                { role: 'user', parts: [{ text: userPrompt }] },
+            ],
+            generationConfig: {
+                maxOutputTokens: outputBudget,
+                temperature: this.temperature,
+            },
+        };
+
+        if (this.webSearchEnabled) {
+            synthRequestBody.tools = [{ google_search: {} }];
+            logger.debug('Gemini web search grounding enabled for synthesis');
+        }
+
         const response = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`,
             {
@@ -258,18 +303,7 @@ ${payload}`;
                     'content-type': 'application/json',
                     'x-goog-api-key': this.config.apiKey,
                 },
-                body: JSON.stringify({
-                    systemInstruction: {
-                        parts: [{ text: request.systemPrompt }],
-                    },
-                    contents: [
-                        { role: 'user', parts: [{ text: userPrompt }] },
-                    ],
-                    generationConfig: {
-                        maxOutputTokens: outputBudget,
-                        temperature: this.temperature,
-                    },
-                }),
+                body: JSON.stringify(synthRequestBody),
                 signal,
             }
         );
@@ -286,6 +320,7 @@ ${payload}`;
             candidates: Array<{
                 content: { parts: Array<{ text: string }> };
                 finishReason?: string;
+                groundingMetadata?: GeminiGroundingMetadata;
             }>;
             usageMetadata: { promptTokenCount: number; candidatesTokenCount: number };
         };
@@ -322,13 +357,26 @@ ${payload}`;
             await this.costBreaker.recordCost(actualCost);
         }
 
+        // Extract web search grounding metadata if available
+        const synthWebSearchMetadata = this.webSearchEnabled
+            ? extractGeminiGroundingMetadata(data.candidates[0]?.groundingMetadata)
+            : undefined;
+
+        if (synthWebSearchMetadata && synthWebSearchMetadata.searchRequestCount > 0) {
+            logger.info('Gemini used web search grounding for synthesis', {
+                searchQueries: synthWebSearchMetadata.searchQueries,
+                sourcesCount: synthWebSearchMetadata.sources.length,
+            });
+        }
+
         logger.debug('Gemini synthesis completed', {
             model: this.model,
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
+            webSearchUsed: synthWebSearchMetadata?.searchRequestCount ?? 0,
         });
 
-        return { content, usage };
+        return { content, usage, webSearchMetadata: synthWebSearchMetadata };
     }
 }
 

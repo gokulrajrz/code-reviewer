@@ -30,6 +30,7 @@ import { detectTechStack } from '../lib/stack-detector';
 import { composeChunkPrompt, composeSynthesizerPrompt } from '../config/prompts/composer';
 import { fetchRepoConfig, applyConfigOverrides, buildCustomRulesPrompt, shouldIgnore } from '../lib/repo-config';
 import type { TechStackProfile } from '../types/stack';
+import { isWebSearchEnabled, formatSearchSources, type WebSearchMetadata } from '../lib/web-search';
 
 /** Maximum time (ms) to wait for a single LLM call before aborting.
  * Increased to 5 minutes to accommodate rate limit (HTTP 429) retry-after sleep intervals. */
@@ -675,7 +676,8 @@ async function processMessage(
 
                 // Per-chunk prompt composition: only include rules relevant to THIS chunk's files
                 const chunkFiles = chunkFileMap[i] || [];
-                const chunkSystemPrompt = composeChunkPrompt(activeProfile, chunkFiles, customRulesPrompt);
+                const webSearchEnabled = isWebSearchEnabled(env);
+                const chunkSystemPrompt = composeChunkPrompt(activeProfile, chunkFiles, customRulesPrompt, webSearchEnabled);
 
                 // Prepend PR description for intent context (if available)
                 const prContext = prDescription
@@ -976,7 +978,8 @@ async function processMessage(
 
             try {
                 // Compose synthesizer prompt based on detected stack
-                const synthesizerSystemPrompt = composeSynthesizerPrompt(activeProfile);
+                const webSearchEnabled = isWebSearchEnabled(env);
+                const synthesizerSystemPrompt = composeSynthesizerPrompt(activeProfile, webSearchEnabled);
 
                 // Tiered fallback: primary → alternate → formatter
                 const result = await withTimeout(
@@ -1052,6 +1055,35 @@ async function processMessage(
             }
 
             finalReview = banner + finalReview;
+        }
+
+        // ── Append web search sources section ──
+        if (isWebSearchEnabled(env)) {
+            // Collect all web search metadata from chunk results
+            const allWebSearchSources: WebSearchMetadata = {
+                searchQueries: [],
+                sources: [],
+                searchRequestCount: 0,
+            };
+
+            for (const outcome of chunkResults) {
+                if (outcome && !(outcome instanceof Error) && !(outcome as any).error && (outcome as any).result?.webSearchMetadata) {
+                    const meta = (outcome as any).result.webSearchMetadata as WebSearchMetadata;
+                    allWebSearchSources.searchQueries.push(...meta.searchQueries);
+                    allWebSearchSources.sources.push(...meta.sources);
+                    allWebSearchSources.searchRequestCount += meta.searchRequestCount;
+                }
+            }
+
+            const sourcesSection = formatSearchSources(allWebSearchSources);
+            if (sourcesSection) {
+                finalReview += sourcesSection;
+                logger.info('Web search sources appended to review', {
+                    prNumber,
+                    totalSearches: allWebSearchSources.searchRequestCount,
+                    totalSources: allWebSearchSources.sources.length,
+                });
+            }
         }
 
         logger.info('Final review ready, posting to PR', {

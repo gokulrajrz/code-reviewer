@@ -7,6 +7,13 @@ import { DistributedRateLimiter } from '../distributed-rate-limiter';
 import { CostCircuitBreaker } from '../../cost-circuit-breaker';
 import { retryWithBackoff } from '../../retry-with-backoff';
 import type { Env } from '../../../types/env';
+import {
+    extractClaudeSearchMetadata,
+    extractClaudeTextContent,
+    type ClaudeContentBlock,
+    CLAUDE_WEB_SEARCH_TOOL_VERSION,
+    CLAUDE_WEB_SEARCH_MAX_USES,
+} from '../../web-search';
 
 /**
  * Anthropic Claude LLM Provider Adapter
@@ -19,12 +26,14 @@ export class ClaudeAdapter extends LLMProviderAdapter {
     private readonly temperature: number;
     private readonly rateLimiter?: DistributedRateLimiter;
     private readonly costBreaker?: CostCircuitBreaker;
+    private readonly webSearchEnabled: boolean;
 
     constructor(config: LLMProviderConfig) {
         super(config);
         this.model = config.model ?? MODELS.claude;
         this.maxTokens = config.maxTokens ?? 4096;
         this.temperature = config.temperature ?? 0.1;
+        this.webSearchEnabled = config.webSearchEnabled ?? false;
         
         // Initialize rate limiter if binding available
         if ((config as any).env?.RATE_LIMITER) {
@@ -119,6 +128,15 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             }
         }
 
+        // Build tools array — conditionally include web_search server tool
+        const tools: unknown[] | undefined = this.webSearchEnabled
+            ? [{ type: CLAUDE_WEB_SEARCH_TOOL_VERSION, name: 'web_search', max_uses: CLAUDE_WEB_SEARCH_MAX_USES }]
+            : undefined;
+
+        if (this.webSearchEnabled) {
+            logger.debug('Claude web search enabled for chunk review', { chunkLabel });
+        }
+
         const response = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -132,6 +150,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                 temperature: this.temperature,
                 system: request.systemPrompt,
                 messages: [{ role: 'user', content: userPrompt }],
+                ...(tools ? { tools } : {}),
             }),
             signal,
         });
@@ -145,12 +164,19 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
         }
 
         const data = await response.json() as {
-            content: Array<{ type: string; text: string }>;
-            usage: { input_tokens: number; output_tokens: number };
+            content: ClaudeContentBlock[];
+            usage: { input_tokens: number; output_tokens: number; server_tool_use?: { web_search_requests?: number } };
             stop_reason?: string;
         };
 
-        let content = data.content.find(c => c.type === 'text')?.text ?? '';
+        // When web search is active, response contains multiple content blocks
+        // (text, server_tool_use, web_search_tool_result). Extract text content.
+        let content: string;
+        if (this.webSearchEnabled) {
+            content = extractClaudeTextContent(data.content);
+        } else {
+            content = data.content.find(c => c.type === 'text')?.text ?? '';
+        }
 
         if (data.stop_reason === 'max_tokens') {
             logger.warn('Claude MAP chunk generation truncated by max_tokens', { chunkLabel });
@@ -180,14 +206,28 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
             await this.costBreaker.recordCost(actualCost);
         }
 
+        // Extract web search metadata if active
+        const webSearchMetadata = this.webSearchEnabled
+            ? extractClaudeSearchMetadata(data.content)
+            : undefined;
+
+        if (webSearchMetadata && webSearchMetadata.searchRequestCount > 0) {
+            logger.info('Claude used web search for chunk review', {
+                chunkLabel,
+                searchQueries: webSearchMetadata.searchQueries,
+                sourcesCount: webSearchMetadata.sources.length,
+            });
+        }
+
         logger.debug('Claude chunk review completed', {
             model: this.model,
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
             chunkLabel,
+            webSearchUsed: data.usage.server_tool_use?.web_search_requests ?? 0,
         });
 
-        return { content, usage };
+        return { content, usage, webSearchMetadata };
     }
 
     async synthesize(request: SynthesisRequest, signal?: AbortSignal): Promise<LLMResponse> {
@@ -237,6 +277,15 @@ ${payload}`;
             }
         }
 
+        // Build tools array — conditionally include web_search server tool
+        const synthTools: unknown[] | undefined = this.webSearchEnabled
+            ? [{ type: CLAUDE_WEB_SEARCH_TOOL_VERSION, name: 'web_search', max_uses: CLAUDE_WEB_SEARCH_MAX_USES }]
+            : undefined;
+
+        if (this.webSearchEnabled) {
+            logger.debug('Claude web search enabled for synthesis');
+        }
+
         const response = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -250,6 +299,7 @@ ${payload}`;
                 temperature: this.temperature,
                 system: request.systemPrompt,
                 messages: [{ role: 'user', content: userPrompt }],
+                ...(synthTools ? { tools: synthTools } : {}),
             }),
             signal,
         });
@@ -263,12 +313,18 @@ ${payload}`;
         }
 
         const data = await response.json() as {
-            content: Array<{ type: string; text: string }>;
-            usage: { input_tokens: number; output_tokens: number };
+            content: ClaudeContentBlock[];
+            usage: { input_tokens: number; output_tokens: number; server_tool_use?: { web_search_requests?: number } };
             stop_reason?: string;
         };
 
-        let content = data.content.find(c => c.type === 'text')?.text ?? '';
+        // When web search is active, response contains multiple content blocks.
+        let content: string;
+        if (this.webSearchEnabled) {
+            content = extractClaudeTextContent(data.content);
+        } else {
+            content = data.content.find(c => c.type === 'text')?.text ?? '';
+        }
 
         if (data.stop_reason === 'max_tokens') {
             const openFences = (content.match(/```/g) || []).length;
@@ -300,13 +356,26 @@ ${payload}`;
             await this.costBreaker.recordCost(actualCost);
         }
 
+        // Extract web search metadata if active
+        const synthWebSearchMetadata = this.webSearchEnabled
+            ? extractClaudeSearchMetadata(data.content)
+            : undefined;
+
+        if (synthWebSearchMetadata && synthWebSearchMetadata.searchRequestCount > 0) {
+            logger.info('Claude used web search for synthesis', {
+                searchQueries: synthWebSearchMetadata.searchQueries,
+                sourcesCount: synthWebSearchMetadata.sources.length,
+            });
+        }
+
         logger.debug('Claude synthesis completed', {
             model: this.model,
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
+            webSearchUsed: data.usage.server_tool_use?.web_search_requests ?? 0,
         });
 
-        return { content, usage };
+        return { content, usage, webSearchMetadata: synthWebSearchMetadata };
     }
 }
 

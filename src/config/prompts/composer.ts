@@ -38,6 +38,9 @@ import { REACT_HOOK_FORM_PROMPT } from './ecosystem/react-hook-form';
 // Architecture
 import { FSD_PROMPT } from './architecture/fsd';
 
+// Web Search
+import { WEB_SEARCH_PROMPT, WEB_SEARCH_SYNTHESIZER_PROMPT } from './web-search';
+
 // ---------------------------------------------------------------------------
 // Module Registries — Maps detected values to prompt strings
 // ---------------------------------------------------------------------------
@@ -185,7 +188,8 @@ function isEcosystemRelevantToChunk(chunkFiles: readonly string[]): boolean {
 export function composeChunkPrompt(
     profile: TechStackProfile,
     chunkFileNames: readonly string[],
-    customRules?: string
+    customRules?: string,
+    webSearchEnabled?: boolean
 ): string {
     const sections: string[] = [];
 
@@ -285,6 +289,11 @@ ${customRules}
     // ── Always include OUTPUT FORMAT last ──
     sections.push(OUTPUT_FORMAT_PROMPT);
 
+    // ── Web search module (after output format, instructs LLM to use search) ──
+    if (webSearchEnabled) {
+        sections.push(WEB_SEARCH_PROMPT);
+    }
+
     return sections.join(SECTION_SEPARATOR);
 }
 
@@ -294,7 +303,7 @@ ${customRules}
  * Dynamically includes/excludes FSD compliance section based on profile.
  * Verdict is pre-computed and injected — the LLM formats but doesn't decide.
  */
-export function composeSynthesizerPrompt(profile: TechStackProfile): string {
+export function composeSynthesizerPrompt(profile: TechStackProfile, webSearchEnabled?: boolean): string {
     const hasFsd = profile.architecture.includes('fsd');
     const stackSummary = buildStackSummaryLine(profile);
 
@@ -411,6 +420,7 @@ RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 - Severity sections must be in order: 🔴 Critical → 🟠 High → 🟡 Medium → 🟢 Low.
 - If zero findings were reported, write a short approval message following the Summary table.
 - If some chunks failed, note it in Coverage Notes but do NOT penalize the PR.
+${webSearchEnabled ? '\n' + WEB_SEARCH_SYNTHESIZER_PROMPT : ''}
 `.trim();
 }
 
