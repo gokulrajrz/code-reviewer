@@ -103,9 +103,11 @@ async function resolveCliqUser(
     const encDb = encodeURIComponent(dbName);
 
     // Try exact match first, then case-insensitive fallback.
+    // Criteria MUST be wrapped in parentheses per Cliq REST API v2 spec:
+    // GET /api/v2/storages/{name}/records?criteria=(field_name==value)
     const criteriaVariants = [
-        `github_username==${githubUsername}`,
-        `github_username==${githubUsername.toLowerCase()}`,
+        `(github_username==${githubUsername})`,
+        `(github_username==${githubUsername.toLowerCase()})`,
     ];
 
     for (const criteria of criteriaVariants) {
@@ -234,10 +236,15 @@ export async function postToCliq(
     }
 
     let mentionTag = `@${prAuthor}`; // Fallback: plain GitHub username (no Cliq notification)
+    let slideMentionTag = prAuthor; // Fallback for slides (plain text, no mention syntax)
     if (dbName) {
         const cliqZuid = await resolveCliqUser(accessToken, dbName, prAuthor);
         if (cliqZuid) {
+            // `{@ZUID}` works in the `text` key to notify the user (Cliq REST API v2 Mentions)
             mentionTag = `{@${cliqZuid}}`;
+            // `[Name](zohoid:ZUID)` works in slides/labels for silent mention rendering
+            // Ref: https://www.zoho.com/cliq/help/restapi/v2/#user-mentions
+            slideMentionTag = `[${prAuthor}](zohoid:${cliqZuid})`;
         }
     }
 
@@ -259,7 +266,7 @@ export async function postToCliq(
                 type: 'label',
                 data: [
                     { 'Repository': repoFullName },
-                    { 'Author': `@${prAuthor}` },
+                    { 'Author': slideMentionTag },
                     { 'Verdict': verdictLabel },
                     { 'Total Findings': String(totalFindings) },
                 ],
