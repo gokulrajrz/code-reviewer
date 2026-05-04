@@ -67,14 +67,26 @@ async function getZohoAccessToken(clientId: string, clientSecret: string, refres
 
 /**
  * Response shape from the Cliq Database Records API.
- * We only need the `values` of each record.
+ * Records may wrap field values under a `values` key.
  */
 interface CliqDBRecordResponse {
-    list: Array<Record<string, string>>;
+    list?: Array<Record<string, unknown> & { values?: Record<string, unknown> }>;
+    data?: Array<Record<string, unknown> & { values?: Record<string, unknown> }>;
 }
 
 /**
- * Resolves a GitHub username to a Zoho Cliq email address by querying
+ * Extracts the first record from a Cliq DB response, normalising both
+ * `list` and `data` root keys and optional `values` nesting.
+ */
+function getFirstRecord(result: CliqDBRecordResponse): Record<string, unknown> | null {
+    const records = result.list ?? result.data ?? [];
+    if (records.length === 0) return null;
+    const first = records[0];
+    return (first.values ?? first) as Record<string, unknown>;
+}
+
+/**
+ * Resolves a GitHub username to a Zoho Cliq ZUID by querying
  * the Cliq Database REST API.
  *
  * Returns `null` if no mapping exists or any error occurs (graceful degradation).
@@ -89,56 +101,72 @@ async function resolveCliqUser(
 ): Promise<string | null> {
     const zohoApiBase = 'https://cliq.zoho.in/api/v2';
     const encDb = encodeURIComponent(dbName);
-    const criteria = encodeURIComponent(`github_username==${githubUsername}`);
-    const endpoint = `${zohoApiBase}/storages/${encDb}/records?criteria=${criteria}&limit=1`;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    // Try exact match first, then case-insensitive fallback.
+    const criteriaVariants = [
+        `github_username==${githubUsername}`,
+        `github_username==${githubUsername.toLowerCase()}`,
+    ];
 
-    try {
-        const response = await fetch(endpoint, {
-            method: 'GET',
-            headers: {
-                'Authorization': `Zoho-oauthtoken ${accessToken}`,
-            },
-            signal: controller.signal,
-        });
+    for (const criteria of criteriaVariants) {
+        const encCriteria = encodeURIComponent(criteria);
+        const endpoint = `${zohoApiBase}/storages/${encDb}/records?criteria=${encCriteria}&limit=1`;
 
-        clearTimeout(timeoutId);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-        if (!response.ok) {
-            logger.warn('Cliq DB lookup failed', {
-                status: response.status,
-                githubUsername,
-                dbName,
+        try {
+            const response = await fetch(endpoint, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Zoho-oauthtoken ${accessToken}`,
+                },
+                signal: controller.signal,
             });
-            return null;
-        }
 
-        const result = await response.json() as CliqDBRecordResponse;
+            clearTimeout(timeoutId);
 
-        if (!result.list || result.list.length === 0) {
-            logger.info('No Cliq mapping found for GitHub user', { githubUsername });
-            return null;
-        }
+            if (!response.ok) {
+                logger.warn('Cliq DB lookup failed', {
+                    status: response.status,
+                    githubUsername,
+                    dbName,
+                    criteria,
+                });
+                continue;
+            }
 
-        const cliqZuid = result.list[0].cliq_zuid;
-        if (!cliqZuid) {
-            logger.warn('Cliq DB record missing cliqzuid field', { githubUsername, dbName });
-            return null;
-        }
+            const result = (await response.json()) as CliqDBRecordResponse;
+            logger.debug('Cliq DB lookup raw response', { githubUsername, criteria, result });
 
-        logger.info('Resolved GitHub user to Cliq ZUID', { githubUsername, cliqZuid });
-        return cliqZuid;
-    } catch (error) {
-        clearTimeout(timeoutId);
-        if (error instanceof Error && error.name === 'AbortError') {
-            logger.warn('Cliq DB lookup timed out (5s)', { githubUsername });
-        } else {
-            logger.warn('Cliq DB lookup error', { githubUsername, error: error instanceof Error ? error.message : String(error) });
+            const record = getFirstRecord(result);
+            if (!record) {
+                logger.info('No Cliq mapping found for GitHub user', { githubUsername, criteria });
+                continue;
+            }
+
+            // ZUID may be returned as string or number.
+            const rawZuid = record.cliq_zuid ?? record.zuid;
+            const cliqZuid = rawZuid !== undefined && rawZuid !== null ? String(rawZuid) : null;
+            if (!cliqZuid || cliqZuid.trim().length === 0) {
+                logger.warn('Cliq DB record missing cliq_zuid field', { githubUsername, dbName, record });
+                continue;
+            }
+
+            logger.info('Resolved GitHub user to Cliq ZUID', { githubUsername, cliqZuid, criteria });
+            return cliqZuid;
+        } catch (error) {
+            clearTimeout(timeoutId);
+            if (error instanceof Error && error.name === 'AbortError') {
+                logger.warn('Cliq DB lookup timed out (5s)', { githubUsername, criteria });
+            } else {
+                logger.warn('Cliq DB lookup error', { githubUsername, criteria, error: error instanceof Error ? error.message : String(error) });
+            }
+            continue;
         }
-        return null;
     }
+
+    return null;
 }
 
 /**
