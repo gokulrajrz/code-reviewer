@@ -169,6 +169,7 @@ Analyze this code chunk for issues. Return findings as JSON array.`;
                 name: 'web_search',
                 max_uses: CLAUDE_WEB_SEARCH_MAX_USES,
                 allowed_domains: CLAUDE_WEB_SEARCH_ALLOWED_DOMAINS,
+                allowed_callers: ['direct'],
             }]
             : undefined;
 
@@ -453,6 +454,7 @@ ${payload}`;
                 name: 'web_search',
                 max_uses: CLAUDE_WEB_SEARCH_MAX_USES,
                 allowed_domains: CLAUDE_WEB_SEARCH_ALLOWED_DOMAINS,
+                allowed_callers: ['direct'],
             }]
             : undefined;
 
