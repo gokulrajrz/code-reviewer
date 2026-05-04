@@ -3,8 +3,8 @@ import type { AIProvider } from '../types/env';
 export const DEFAULT_AI_PROVIDER: AIProvider = 'claude';
 
 export const MODELS = {
-    claude: 'claude-sonnet-4-6',
-    gemini: 'gemini-2.5-flash-preview-04-17',
+    claude: 'claude-haiku-4-5',
+    gemini: 'gemini-2.5-flash',
 } as const satisfies Record<AIProvider, string>;
 
 /** Maximum characters per LLM chunk. Guards against massive PR context windows. */
@@ -12,9 +12,12 @@ export const MAX_CHUNK_CHARS = 100_000;
 
 /**
  * Hard limit on how many LLM chunks to process to prevent hitting 
- * the Cloudflare Worker 50 subrequests limit. (32 chunks = 32 requests = crash)
+ * the Cloudflare Worker subrequests limit. 
+ * Workers Paid Plan: 10,000 default (configurable up to 10M via wrangler.jsonc).
+ * Workers Free Plan: 50 external subrequests.
+ * Note: with web search continuations, each chunk may consume up to 3 subrequests.
  */
-export const MAX_LLM_CHUNKS = 10;
+export const MAX_LLM_CHUNKS = 50;
 
 /**
  * Maximum number of findings a single chunk reviewer can report.
@@ -37,9 +40,9 @@ export const GLOBAL_CONTEXT_BUDGET_CHARS = 8_000;
 
 /**
  * Tier 1: Maximum files that get FULL content fetched (patch + raw file).
- * Each file costs 1 subrequest, so this is bounded by Cloudflare's limit.
+ * Increased from 15 to 100 on Cloudflare Workers Paid Plan (1000 subrequests ceiling).
  */
-export const TIER1_MAX_FILES = 15;
+export const TIER1_MAX_FILES = 100;
 
 /**
  * Maximum total files we consider from the PR at all.

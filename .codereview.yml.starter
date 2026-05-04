@@ -1,0 +1,37 @@
+# .codereview.yml - Starter Template
+# Minimal configuration to get started quickly
+
+# Tech Stack (optional - will auto-detect if not specified)
+stack:
+  language: typescript
+  framework: nextjs
+
+# Custom Rules (add your team's specific requirements)
+rules:
+  - category: security
+    title: "No hardcoded secrets"
+    description: "Use environment variables for API keys and secrets"
+    severity: critical
+
+  - category: clean-code
+    title: "Use TypeScript strict mode"
+    description: "Avoid 'any' types, use proper type definitions"
+    severity: high
+
+# Files to ignore
+ignore:
+  - "dist/**"
+  - "build/**"
+  - "node_modules/**"
+  - "**/*.generated.ts"
+
+# Severity overrides (optional)
+severity:
+  "console.log usage": high
+  "Missing error handling": critical
+
+# Review preferences
+preferences:
+  verbosity: normal
+  include_suggestions: true
+  max_findings_per_file: 10

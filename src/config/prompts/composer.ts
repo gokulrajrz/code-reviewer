@@ -38,6 +38,9 @@ import { REACT_HOOK_FORM_PROMPT } from './ecosystem/react-hook-form';
 // Architecture
 import { FSD_PROMPT } from './architecture/fsd';
 
+// Web Search
+import { WEB_SEARCH_PROMPT, WEB_SEARCH_SYNTHESIZER_PROMPT } from './web-search';
+
 // ---------------------------------------------------------------------------
 // Module Registries — Maps detected values to prompt strings
 // ---------------------------------------------------------------------------
@@ -185,7 +188,8 @@ function isEcosystemRelevantToChunk(chunkFiles: readonly string[]): boolean {
 export function composeChunkPrompt(
     profile: TechStackProfile,
     chunkFileNames: readonly string[],
-    customRules?: string
+    customRules?: string,
+    webSearchEnabled?: boolean
 ): string {
     const sections: string[] = [];
 
@@ -282,6 +286,11 @@ ${customRules}
 `.trim());
     }
 
+    // ── Web search module (BEFORE output format so model integrates search into reasoning) ──
+    if (webSearchEnabled) {
+        sections.push(WEB_SEARCH_PROMPT);
+    }
+
     // ── Always include OUTPUT FORMAT last ──
     sections.push(OUTPUT_FORMAT_PROMPT);
 
@@ -294,7 +303,7 @@ ${customRules}
  * Dynamically includes/excludes FSD compliance section based on profile.
  * Verdict is pre-computed and injected — the LLM formats but doesn't decide.
  */
-export function composeSynthesizerPrompt(profile: TechStackProfile): string {
+export function composeSynthesizerPrompt(profile: TechStackProfile, webSearchEnabled?: boolean, previousReviewContext?: string): string {
     const hasFsd = profile.architecture.includes('fsd');
     const stackSummary = buildStackSummaryLine(profile);
 
@@ -403,6 +412,7 @@ For **MEDIUM** and **LOW** severity findings, compress to dense bullet points (N
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${previousReviewContext ? `\n${previousReviewContext}\n` : ''}
 
 - DO NOT output empty severity sections. Skip sections with 0 findings.
 - The payload has N findings. Your output MUST NOT EXCEED N items. You MAY dismiss findings that are false positives or duplicates — add a brief "(Dismissed: reason)" note inline.
@@ -411,6 +421,7 @@ RULES (STRICT — VIOLATIONS WILL BE REJECTED)
 - Severity sections must be in order: 🔴 Critical → 🟠 High → 🟡 Medium → 🟢 Low.
 - If zero findings were reported, write a short approval message following the Summary table.
 - If some chunks failed, note it in Coverage Notes but do NOT penalize the PR.
+${webSearchEnabled ? '\n' + WEB_SEARCH_SYNTHESIZER_PROMPT : ''}
 `.trim();
 }
 

@@ -1,0 +1,338 @@
+# .codereview.yml - Repository-specific Code Review Configuration
+# Place this file in the root of your repository to customize AI code reviews
+
+# ============================================================================
+# TECH STACK CONFIGURATION
+# ============================================================================
+# Override automatic tech stack detection with explicit configuration
+# The AI will use these settings to provide more accurate, context-aware reviews
+
+stack:
+  # Primary programming language
+  language: typescript
+  
+  # Framework being used
+  framework: nextjs
+  
+  # Architecture pattern
+  architecture: fsd  # Feature-Sliced Design
+  
+  # Ecosystem libraries (multiple allowed)
+  ecosystem:
+    - react-hook-form
+    - tanstack-query
+    - zustand
+    - tailwind
+
+# ============================================================================
+# CUSTOM RULES
+# ============================================================================
+# Define project-specific rules that the AI should enforce
+# These are in addition to the standard best practices
+
+rules:
+  # Security rules
+  - category: security
+    title: "No hardcoded API keys"
+    description: "API keys must be stored in environment variables, never hardcoded"
+    severity: critical
+    pattern: "Check for strings that look like API keys (long alphanumeric strings)"
+    
+  - category: security
+    title: "Validate all user inputs"
+    description: "All user inputs must be validated before processing"
+    severity: high
+    
+  # Performance rules
+  - category: performance
+    title: "Optimize database queries"
+    description: "Use indexes, avoid N+1 queries, use pagination for large datasets"
+    severity: medium
+    
+  - category: performance
+    title: "Lazy load heavy components"
+    description: "Components over 100KB should use React.lazy() or dynamic imports"
+    severity: medium
+    
+  # Code quality rules
+  - category: clean-code
+    title: "Functions should be under 50 lines"
+    description: "Break down large functions into smaller, reusable pieces"
+    severity: low
+    
+  - category: clean-code
+    title: "Use TypeScript strict mode"
+    description: "All files must have proper TypeScript types, no 'any' types"
+    severity: high
+    
+  # Testing rules
+  - category: testing
+    title: "Critical paths must have tests"
+    description: "Authentication, payment, and data mutation logic must have unit tests"
+    severity: high
+    
+  # Documentation rules
+  - category: documentation
+    title: "Public APIs must be documented"
+    description: "All exported functions and classes must have JSDoc comments"
+    severity: medium
+
+# ============================================================================
+# SEVERITY OVERRIDES
+# ============================================================================
+# Override the default severity levels for specific issue types
+# Useful for adjusting priorities based on your team's standards
+
+severity:
+  # Make console.log statements critical (should use proper logging)
+  "console.log usage": critical
+  
+  # Downgrade TODO comments to low (we track them in Jira)
+  "Untracked TODO comment": low
+  
+  # Make missing error handling critical
+  "Missing error handling": critical
+  
+  # Make accessibility issues high priority
+  "Missing alt text": high
+  "Missing ARIA labels": high
+
+# ============================================================================
+# IGNORE PATTERNS
+# ============================================================================
+# Files and directories to exclude from code review
+# Use glob patterns for flexible matching
+
+ignore:
+  # Generated files
+  - "**/*.generated.ts"
+  - "**/*.generated.js"
+  - "**/generated/**"
+  
+  # Build outputs
+  - "dist/**"
+  - "build/**"
+  - ".next/**"
+  - "out/**"
+  
+  # Dependencies
+  - "node_modules/**"
+  - "vendor/**"
+  
+  # Test fixtures and mocks
+  - "**/__fixtures__/**"
+  - "**/__mocks__/**"
+  - "**/*.mock.ts"
+  
+  # Configuration files (usually don't need review)
+  - "*.config.js"
+  - "*.config.ts"
+  - ".eslintrc.*"
+  - ".prettierrc.*"
+  
+  # Documentation (focus on code)
+  - "docs/**"
+  - "*.md"
+  
+  # Legacy code (not actively maintained)
+  - "legacy/**"
+  - "deprecated/**"
+  
+  # Third-party integrations (external code)
+  - "src/integrations/external/**"
+
+# ============================================================================
+# FOCUS AREAS
+# ============================================================================
+# Specific areas the AI should pay extra attention to
+# Useful for highlighting critical parts of your codebase
+
+focus:
+  # Security-critical files
+  - path: "src/auth/**"
+    reason: "Authentication logic - security critical"
+    severity: critical
+    
+  - path: "src/api/payment/**"
+    reason: "Payment processing - must be thoroughly reviewed"
+    severity: critical
+    
+  # Performance-critical files
+  - path: "src/components/DataTable/**"
+    reason: "Handles large datasets - performance critical"
+    severity: high
+    
+  # Core business logic
+  - path: "src/lib/calculations/**"
+    reason: "Core business logic - accuracy critical"
+    severity: high
+
+# ============================================================================
+# REVIEW PREFERENCES
+# ============================================================================
+# Customize how the AI conducts reviews
+
+preferences:
+  # Verbosity level: concise, normal, detailed
+  verbosity: normal
+  
+  # Include code suggestions in review
+  include_suggestions: true
+  
+  # Include examples in explanations
+  include_examples: true
+  
+  # Focus on specific aspects (comment out to review all)
+  # aspects:
+  #   - security
+  #   - performance
+  #   - clean-code
+  
+  # Maximum findings per file (prevents overwhelming reviews)
+  max_findings_per_file: 10
+  
+  # Minimum severity to report (low, medium, high, critical)
+  min_severity: low
+
+# ============================================================================
+# TEAM STANDARDS
+# ============================================================================
+# Document your team's coding standards for the AI to enforce
+
+standards:
+  # Naming conventions
+  naming:
+    - "Use camelCase for variables and functions"
+    - "Use PascalCase for classes and React components"
+    - "Use UPPER_SNAKE_CASE for constants"
+    - "Prefix private methods with underscore (_privateMethod)"
+    - "Prefix boolean variables with is/has/should (isActive, hasPermission)"
+    
+  # Code organization
+  organization:
+    - "Group imports: external libraries, internal modules, types"
+    - "Order methods: constructor, lifecycle, event handlers, helpers"
+    - "Keep related code together (colocation principle)"
+    
+  # Error handling
+  error_handling:
+    - "Always use try-catch for async operations"
+    - "Log errors with context (user ID, request ID, etc.)"
+    - "Never swallow errors silently"
+    - "Use custom error classes for domain errors"
+    
+  # Testing
+  testing:
+    - "Write tests before fixing bugs (TDD for bug fixes)"
+    - "Use descriptive test names: 'should do X when Y'"
+    - "Follow AAA pattern: Arrange, Act, Assert"
+    - "Mock external dependencies"
+
+# ============================================================================
+# INTEGRATION SETTINGS
+# ============================================================================
+# Configure how the review integrates with your workflow
+
+integration:
+  # Auto-approve PRs that only touch specific files
+  auto_approve:
+    - "**/*.md"
+    - "docs/**"
+    - "*.config.js"
+  
+  # Block merge if critical issues found
+  block_on_critical: true
+  
+  # Block merge if high severity issues exceed threshold
+  block_threshold:
+    high: 5
+    critical: 1
+  
+  # Post inline comments for these severities
+  inline_comments:
+    - critical
+    - high
+
+# ============================================================================
+# EXAMPLES
+# ============================================================================
+# Provide examples of good and bad code for the AI to learn from
+
+examples:
+  good:
+    - description: "Proper error handling with context"
+      code: |
+        try {
+          await processPayment(orderId);
+        } catch (error) {
+          logger.error('Payment processing failed', {
+            orderId,
+            userId: user.id,
+            error: error.message,
+          });
+          throw new PaymentError('Failed to process payment', { cause: error });
+        }
+    
+    - description: "Well-structured React component"
+      code: |
+        export function UserProfile({ userId }: UserProfileProps) {
+          const { data, isLoading, error } = useUser(userId);
+          
+          if (isLoading) return <Spinner />;
+          if (error) return <ErrorMessage error={error} />;
+          if (!data) return <NotFound />;
+          
+          return <ProfileCard user={data} />;
+        }
+  
+  bad:
+    - description: "Poor error handling"
+      code: |
+        try {
+          await processPayment(orderId);
+        } catch (error) {
+          console.log(error); // Don't use console.log
+          // Error swallowed - user doesn't know what happened
+        }
+    
+    - description: "Hardcoded credentials"
+      code: |
+        const API_KEY = "sk_live_abc123xyz"; // Never hardcode keys!
+        const response = await fetch(url, {
+          headers: { 'Authorization': `Bearer ${API_KEY}` }
+        });
+
+# ============================================================================
+# NOTES
+# ============================================================================
+# Additional context for the AI reviewer
+
+notes: |
+  This is a Next.js application using the App Router.
+  We follow Feature-Sliced Design architecture.
+  
+  Key conventions:
+  - All API routes use tRPC
+  - Database queries use Prisma
+  - State management uses Zustand
+  - Forms use React Hook Form + Zod validation
+  - Styling uses Tailwind CSS with custom design system
+  
+  Critical areas:
+  - Authentication uses NextAuth.js
+  - Payments use Stripe
+  - File uploads use AWS S3
+  
+  Please pay special attention to:
+  - Type safety (no 'any' types)
+  - Error boundaries around async operations
+  - Accessibility (WCAG 2.1 AA compliance)
+  - Performance (Core Web Vitals)
+
+# ============================================================================
+# VERSION
+# ============================================================================
+# Track configuration version for auditing
+
+version: "1.0.0"
+last_updated: "2026-04-20"

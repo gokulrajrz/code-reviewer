@@ -4,9 +4,9 @@
 	"description": "AI-powered GitHub PR reviewer using Cloudflare Workers + Queues with Claude/Gemini LLMs",
 	"private": true,
 	"scripts": {
-		"deploy": "wrangler deploy",
-		"dev": "wrangler dev",
-		"start": "wrangler dev",
+		"deploy": "DOCKER_API_VERSION=1.44 wrangler deploy",
+		"dev": "DOCKER_API_VERSION=1.44 wrangler dev",
+		"start": "DOCKER_API_VERSION=1.44 wrangler dev",
 		"test": "vitest",
 		"cf-typegen": "wrangler types",
 		"usage-report": "tsx scripts/usage-client.ts"
@@ -19,5 +19,9 @@
 		"typescript": "^5.5.2",
 		"vitest": "~3.2.0",
 		"wrangler": "^4.74.0"
+	},
+	"dependencies": {
+		"@cloudflare/containers": "^0.3.2",
+		"@opentelemetry/api": "^1.9.1"
 	}
 }
